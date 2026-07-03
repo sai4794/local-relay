@@ -65,15 +65,17 @@ func (i *TorInstance) GetRequests() int64 {
 
 // TorLifecycle manages the lifecycle of multiple Tor daemon processes.
 type TorLifecycle struct {
-	binary    string
-	dataDir   string
-	basePort  int
-	controlBase int
+	binary       string
+	dataDir      string
+	basePort     int
+	controlBase  int
 	maxInstances int
 	rotateAfter  int
 	instances    []*TorInstance
 	mu           sync.RWMutex
 	logf         func(string, ...interface{})
+	cookieCache  map[int][]byte // instance ID -> cached control cookie
+	cookieMu     sync.RWMutex
 }
 
 // TorLifecycleConfig configures the Tor lifecycle manager.
@@ -100,6 +102,7 @@ func NewTorLifecycle(cfg TorLifecycleConfig) *TorLifecycle {
 		maxInstances: cfg.MaxInstances,
 		rotateAfter:  cfg.RotateAfter,
 		logf:         cfg.Logf,
+		cookieCache:  make(map[int][]byte),
 	}
 }
 
@@ -318,6 +321,10 @@ func (tl *TorLifecycle) killInstance(inst *TorInstance) {
 	for i, existing := range tl.instances {
 		if existing.ID == inst.ID {
 			tl.instances = append(tl.instances[:i], tl.instances[i+1:]...)
+			// Invalidate cached cookie for this instance
+			tl.cookieMu.Lock()
+			delete(tl.cookieCache, inst.ID)
+			tl.cookieMu.Unlock()
 			return
 		}
 	}
@@ -348,13 +355,27 @@ func (tl *TorLifecycle) RequestNewCircuit(inst *TorInstance) error {
 
 	reader := bufio.NewReader(conn)
 
-	// Try to read control_auth_cookie from data directory
+	// Try to read control_auth_cookie from cache or data directory
 	cookiePath := filepath.Join(inst.DataDir, "control_auth_cookie")
 	authSent := false
-	if cookie, err := os.ReadFile(cookiePath); err == nil && len(cookie) == 32 {
+
+	// Check cache first
+	tl.cookieMu.RLock()
+	cachedCookie, cacheHit := tl.cookieCache[inst.ID]
+	tl.cookieMu.RUnlock()
+
+	if cacheHit && len(cachedCookie) == 32 {
+		hexCookie := hex.EncodeToString(cachedCookie)
+		fmt.Fprintf(conn, "AUTHENTICATE %s\r\n", hexCookie)
+		authSent = true
+	} else if cookie, err := os.ReadFile(cookiePath); err == nil && len(cookie) == 32 {
 		hexCookie := hex.EncodeToString(cookie)
 		fmt.Fprintf(conn, "AUTHENTICATE %s\r\n", hexCookie)
 		authSent = true
+		// Cache for next time
+		tl.cookieMu.Lock()
+		tl.cookieCache[inst.ID] = cookie
+		tl.cookieMu.Unlock()
 	}
 
 	if !authSent {

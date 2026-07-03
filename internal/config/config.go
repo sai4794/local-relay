@@ -66,14 +66,11 @@ type AuthConfig struct {
 type SecurityConfig struct {
 	BlockedNetworks []string `yaml:"blocked_networks"`
 	MaxBodySize     int64    `yaml:"max_body_size"`
-	RequestTimeout  int      `yaml:"request_timeout"`
 }
 
 type LoggingConfig struct {
-	Level          string   `yaml:"level"`
-	Format         string   `yaml:"format"`
-	RedactHeaders  []string `yaml:"redact_headers"`
-	MaxBodyLogSize int      `yaml:"max_body_log_size"`
+	Level  string `yaml:"level"`
+	Format string `yaml:"format"`
 }
 
 type HealthConfig struct {
@@ -127,13 +124,10 @@ var defaultConfig = &Config{
 			"fe80::/10",
 		},
 		MaxBodySize:    32 << 20, // 32MB
-		RequestTimeout: 300,
 	},
 	Logging: LoggingConfig{
-		Level:          "info",
-		Format:         "json",
-		RedactHeaders:  []string{"Authorization", "X-Api-Key", "Cookie", "Proxy-Authorization", "Set-Cookie"},
-		MaxBodyLogSize: 200,
+		Level:  "info",
+		Format: "json",
 	},
 	Health: HealthConfig{
 		Enabled: true,

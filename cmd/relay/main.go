@@ -236,6 +236,11 @@ func main() {
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Panic in HTTP proxy", "error", r)
+			}
+		}()
 		if err := httpProxy.Start(cfg.Server.HTTP); err != nil {
 			logger.Error("HTTP proxy failed", "error", err)
 			stop()
@@ -243,6 +248,11 @@ func main() {
 	}()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Panic in SOCKS5 proxy", "error", r)
+			}
+		}()
 		if err := socks5Proxy.Start(cfg.Server.SOCKS5); err != nil {
 			logger.Error("SOCKS5 proxy failed", "error", err)
 			stop()
@@ -312,6 +322,11 @@ func main() {
 		)
 		healthSrv := health.NewHealthServer(cfg.Health.Address, checker, logger)
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("Panic in health server", "error", r)
+				}
+			}()
 			if err := healthSrv.Start(); err != nil {
 				logger.Error("Health server failed", "error", err)
 			}
@@ -322,6 +337,11 @@ func main() {
 	// Prometheus metrics
 	if cfg.Metrics.Enabled {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("Panic in metrics server", "error", r)
+				}
+			}()
 			mux := http.NewServeMux()
 			mux.HandleFunc(cfg.Metrics.Path, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/plain")

@@ -19,23 +19,21 @@ import (
 type AuthCheck func(username, password string) bool
 
 type SOCKS5Proxy struct {
-	router       *backend.Router
-	firewall     *security.Firewall
-	rotator      *rotate.Rotator
-	ssrf         *security.SSRFBlocker
-	bodyLimit    int64
-	logger       *slog.Logger
-	listener     net.Listener
-	authCheck    AuthCheck
+	router    *backend.Router
+	firewall  *security.Firewall
+	rotator   *rotate.Rotator
+	ssrf      *security.SSRFBlocker
+	logger    *slog.Logger
+	listener  net.Listener
+	authCheck AuthCheck
 }
 
-func NewSOCKS5Proxy(router *backend.Router, fw *security.Firewall, rotator *rotate.Rotator, logger *slog.Logger, authCheck AuthCheck, ssrf *security.SSRFBlocker, bodyLimit int64) *SOCKS5Proxy {
+func NewSOCKS5Proxy(router *backend.Router, fw *security.Firewall, rotator *rotate.Rotator, logger *slog.Logger, authCheck AuthCheck, ssrf *security.SSRFBlocker, _ int64) *SOCKS5Proxy {
 	return &SOCKS5Proxy{
 		router:    router,
 		firewall:  fw,
 		rotator:   rotator,
 		ssrf:      ssrf,
-		bodyLimit: bodyLimit,
 		logger:    logger,
 		authCheck: authCheck,
 	}
@@ -213,10 +211,7 @@ func (p *SOCKS5Proxy) readRequest(conn net.Conn) (string, byte, error) {
 		if _, err := io.ReadFull(conn, port); err != nil {
 			return "", 0, err
 		}
-		target = fmt.Sprintf("[%x:%x:%x:%x:%x:%x:%x:%x]:%d",
-			addr[0:2], addr[2:4], addr[4:6], addr[6:8],
-			addr[8:10], addr[10:12], addr[12:14], addr[14:16],
-			uint16(port[0])<<8|uint16(port[1]))
+		target = fmt.Sprintf("[%s]:%d", net.IP(addr).String(), uint16(port[0])<<8|uint16(port[1]))
 
 	default:
 		return "", 0, fmt.Errorf("unsupported address type: %d", header[3])
@@ -234,6 +229,13 @@ func (p *SOCKS5Proxy) handleConnect(conn net.Conn, target string) {
 
 	if p.firewall != nil && !p.firewall.AllowHost(host) {
 		p.logger.Warn("blocked SOCKS5 connection to private/internal IP", "host", host)
+		p.sendReply(conn, 0x02, nil)
+		return
+	}
+
+	// SSRF protection for SOCKS5
+	if p.ssrf != nil && p.ssrf.IsBlocked(host) {
+		p.logger.Warn("blocked SOCKS5 connection via SSRF", "host", host)
 		p.sendReply(conn, 0x02, nil)
 		return
 	}

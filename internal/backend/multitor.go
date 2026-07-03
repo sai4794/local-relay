@@ -17,7 +17,6 @@ type MultiTorBackend struct {
 	lifecycle *TorLifecycle
 	dialer    *net.Dialer
 	counter   atomic.Int64
-	current   int
 	mu        sync.RWMutex
 	logf      func(string, ...interface{})
 	OnRotate  func() // called after NEWNYM to clear connection pools
@@ -191,21 +190,19 @@ func (m *MultiTorBackend) Status() map[string]interface{} {
 // Implements the AnomalyReporter interface so the router can signal anomalies.
 func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
 	m.logf("multi-tor: anomaly reported (slot %d), triggering circuit rotation", slotIdx)
-	// Rotate all instances' circuits
+	// Rotate all instances' circuits sequentially to avoid goroutine explosion
 	for _, inst := range m.lifecycle.GetInstances() {
-		go func(inst *TorInstance) {
-			if err := m.lifecycle.RequestNewCircuit(inst); err != nil {
-				m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
-			} else {
-				m.logf("multi-tor: instance %d circuit rotated", inst.ID)
-				inst.mu.Lock()
-				inst.Requests = 0
-				inst.mu.Unlock()
-			}
-		}(inst)
+		if err := m.lifecycle.RequestNewCircuit(inst); err != nil {
+			m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
+		} else {
+			m.logf("multi-tor: instance %d circuit rotated", inst.ID)
+			inst.mu.Lock()
+			inst.Requests = 0
+			inst.mu.Unlock()
+		}
 	}
 	// Clear connection pool so new connections use new circuits
 	if m.OnRotate != nil {
-		go m.OnRotate()
+		m.OnRotate()
 	}
 }

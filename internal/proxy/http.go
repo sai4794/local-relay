@@ -143,9 +143,14 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Track short tunnels as potential errors
+	// Add overall timeout to prevent goroutine leak on stalled connections
+	relayTimeout := 30 * time.Minute
+	relayCtx, relayCancel := context.WithTimeout(r.Context(), relayTimeout)
+	defer relayCancel()
+
 	done := make(chan struct{})
 	go func() {
-		stream.Relay(r.Context(), destConn, clientConn)
+		stream.Relay(relayCtx, destConn, clientConn)
 		close(done)
 	}()
 
@@ -271,7 +276,11 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		bufPtr := copyBufPool.Get().(*[]byte)
+		bufPtr, ok := copyBufPool.Get().(*[]byte)
+		if !ok {
+			buf := make([]byte, 32*1024)
+			bufPtr = &buf
+		}
 		defer copyBufPool.Put(bufPtr)
 		io.CopyBuffer(w, resp.Body, *bufPtr)
 	}

@@ -14,6 +14,7 @@ type Rotator struct {
 	logger    *slog.Logger
 	lastTrade atomic.Int64
 	wg        sync.WaitGroup
+	mu        sync.Mutex
 }
 
 func NewRotator(interval int, onRotate func(), logger *slog.Logger) *Rotator {
@@ -38,13 +39,7 @@ func (r *Rotator) ShouldRotate() bool {
 			"interval", interval,
 		)
 
-		if r.onRotate != nil {
-			r.wg.Add(1)
-			go func() {
-				defer r.wg.Done()
-				r.onRotate()
-			}()
-		}
+		r.triggerRotation()
 
 		r.lastTrade.Store(time.Now().UnixNano())
 		return true
@@ -68,6 +63,12 @@ func (r *Rotator) SetInterval(interval int) {
 // ForceRotate triggers an immediate rotation regardless of request count.
 func (r *Rotator) ForceRotate() {
 	r.logger.Info("Forced IP rotation")
+	r.triggerRotation()
+	r.lastTrade.Store(time.Now().UnixNano())
+}
+
+// triggerRotation launches the rotation callback in a goroutine with WaitGroup tracking.
+func (r *Rotator) triggerRotation() {
 	if r.onRotate != nil {
 		r.wg.Add(1)
 		go func() {
@@ -75,7 +76,6 @@ func (r *Rotator) ForceRotate() {
 			r.onRotate()
 		}()
 	}
-	r.lastTrade.Store(time.Now().UnixNano())
 }
 
 // Wait blocks until all in-flight rotation goroutines complete.

@@ -47,18 +47,10 @@ security:
     - "fc00::/7"
     - "fe80::/10"
   max_body_size: 33554432  # 32MB
-  request_timeout: 300
 
 logging:
   level: info
   format: json
-  redact_headers:
-    - "Authorization"
-    - "X-Api-Key"
-    - "Cookie"
-    - "Proxy-Authorization"
-    - "Set-Cookie"
-  max_body_log_size: 200
 
 health:
   enabled: true
