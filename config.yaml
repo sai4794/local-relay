@@ -8,8 +8,8 @@ multi_tor:
   enabled: true
   binary: "tor"
   data_dir: "/tmp/local-relay-tor"
-  base_port: 9050
-  control_base: 9051
+  base_port: 9150          # Avoid conflict with old Tor (9050/9051)
+  control_base: 9160
   max_instances: 3
   rotate_after: 50  # Rotate circuit after N requests per instance
 

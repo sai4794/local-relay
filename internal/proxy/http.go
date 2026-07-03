@@ -43,11 +43,11 @@ type HTTPProxy struct {
 func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *security.Firewall, rotator *rotate.Rotator, logger *slog.Logger, disableKeepAlive bool, ssrf *security.SSRFBlocker, bodyLimit int64) *HTTPProxy {
 	transport := &http.Transport{
 		DialContext:           router.DialContext,
-		MaxIdleConns:          4,
-		MaxIdleConnsPerHost:   2,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:  30 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		TLSHandshakeTimeout:  10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
 		DisableKeepAlives:     disableKeepAlive,
 		ForceAttemptHTTP2:     false,
 	}
@@ -63,7 +63,7 @@ func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *s
 		transport: transport,
 		client: &http.Client{
 			Transport: transport,
-			Timeout:   300 * time.Second,
+			Timeout:   60 * time.Second,
 		},
 	}
 }
