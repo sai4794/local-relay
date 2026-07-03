@@ -1,8 +1,8 @@
 {
   "cmd/relay/main.go": {
-    "mtime": 1783074470.3496,
-    "ast_hash": "5a406309d4b6ab7589a7530b563101b9",
-    "semantic_hash": "5a406309d4b6ab7589a7530b563101b9"
+    "mtime": 1783098289.1585798,
+    "ast_hash": "f70c272f822a1943cdbc93db69b603dc",
+    "semantic_hash": "f70c272f822a1943cdbc93db69b603dc"
   },
   "go.mod": {
     "mtime": 1782214874.883179,
@@ -15,12 +15,12 @@
     "semantic_hash": "f6332ef1d7b66214faa08670ff5a6cf6"
   },
   "internal/backend/multitor.go": {
-    "mtime": 1783074231.406578,
-    "ast_hash": "c4760cfe0705230d039a91637e38db5e",
-    "semantic_hash": "c4760cfe0705230d039a91637e38db5e"
+    "mtime": 1783098639.234503,
+    "ast_hash": "e1cc8ef59051e77a75060e2afb966d32",
+    "semantic_hash": "e1cc8ef59051e77a75060e2afb966d32"
   },
   "internal/backend/pool.go": {
-    "mtime": 1782393349.1271248,
+    "mtime": 1783098340.7838786,
     "ast_hash": "74bc8499fd06518457a889b759f5528e",
     "semantic_hash": "74bc8499fd06518457a889b759f5528e"
   },
@@ -45,14 +45,14 @@
     "semantic_hash": "8bc08b798d52c15175d99926b8657c1f"
   },
   "internal/backend/torlifecycle.go": {
-    "mtime": 1783078218.9594631,
-    "ast_hash": "2a73931af6451993a0809ca61875187a",
-    "semantic_hash": "2a73931af6451993a0809ca61875187a"
+    "mtime": 1783098589.7413096,
+    "ast_hash": "39fea88fa1683c1b83501c103948c389",
+    "semantic_hash": "39fea88fa1683c1b83501c103948c389"
   },
   "internal/config/config.go": {
-    "mtime": 1783074257.8929107,
-    "ast_hash": "de0d1bd66021361753b1042ebbd19b74",
-    "semantic_hash": "de0d1bd66021361753b1042ebbd19b74"
+    "mtime": 1783098720.8058188,
+    "ast_hash": "0874d4acbf5b62a68a29f4788f564310",
+    "semantic_hash": "0874d4acbf5b62a68a29f4788f564310"
   },
   "internal/health/health.go": {
     "mtime": 1782390988.1490145,
@@ -60,9 +60,9 @@
     "semantic_hash": "8da6b74b958c92c7a18b6194574adb10"
   },
   "internal/proxy/http.go": {
-    "mtime": 1783079704.1185076,
-    "ast_hash": "49b5b2331bc3fad85008244b272b22cd",
-    "semantic_hash": "49b5b2331bc3fad85008244b272b22cd"
+    "mtime": 1783101748.7252488,
+    "ast_hash": "84e2c7d77062479aa0c16c5c2b15f369",
+    "semantic_hash": "84e2c7d77062479aa0c16c5c2b15f369"
   },
   "internal/proxy/http_test.go": {
     "mtime": 1782393470.502364,
@@ -70,19 +70,19 @@
     "semantic_hash": "87b23c820aac88fa5013c9bb57bdb47e"
   },
   "internal/proxy/socks5.go": {
-    "mtime": 1783074396.2104938,
-    "ast_hash": "68204c2d2f6b2884ffcbf0be02ba8c84",
-    "semantic_hash": "68204c2d2f6b2884ffcbf0be02ba8c84"
+    "mtime": 1783098623.8834963,
+    "ast_hash": "f66e1a62c3c7b98a8566583a2343d4b4",
+    "semantic_hash": "f66e1a62c3c7b98a8566583a2343d4b4"
   },
   "internal/rotate/rotator.go": {
-    "mtime": 1782392690.1835585,
-    "ast_hash": "aa6bd517b6642561c3fec0ca57b95b93",
-    "semantic_hash": "aa6bd517b6642561c3fec0ca57b95b93"
+    "mtime": 1783098211.1698785,
+    "ast_hash": "a48e3e152a2f847119f783ca063ab724",
+    "semantic_hash": "a48e3e152a2f847119f783ca063ab724"
   },
   "internal/security/firewall.go": {
-    "mtime": 1782392228.5472436,
-    "ast_hash": "a26d94aca4592441b04281887f9a31df",
-    "semantic_hash": "a26d94aca4592441b04281887f9a31df"
+    "mtime": 1783098128.785562,
+    "ast_hash": "939545ad2d6a292c16eb91bd8c8df652",
+    "semantic_hash": "939545ad2d6a292c16eb91bd8c8df652"
   },
   "internal/security/ssrf.go": {
     "mtime": 1783074313.3307972,
@@ -93,5 +93,75 @@
     "mtime": 1782389127.7726502,
     "ast_hash": "f5627096cfb532eaee69f0e42a9cb9eb",
     "semantic_hash": "f5627096cfb532eaee69f0e42a9cb9eb"
+  },
+  "internal/proxy/clear.go": {
+    "mtime": 1783092683.1510875,
+    "ast_hash": "4fb82218332ba7fced17a36544054753",
+    "semantic_hash": "4fb82218332ba7fced17a36544054753"
+  },
+  "ANALYST_01_SECURITY.md": {
+    "mtime": 1782325471.248696,
+    "ast_hash": "e0784448e6a4e395d682d9c245768400",
+    "semantic_hash": ""
+  },
+  "ANALYST_02_GO_QUALITY.md": {
+    "mtime": 1782325478.8358717,
+    "ast_hash": "22357d14ff8f1b9949d133bb22437253",
+    "semantic_hash": ""
+  },
+  "ANALYST_03_INFRA.md": {
+    "mtime": 1782325490.7536943,
+    "ast_hash": "4bfd7739705c41905f6ede93aae61a53",
+    "semantic_hash": ""
+  },
+  "ANALYST_04_PROTOCOL.md": {
+    "mtime": 1782325482.5109296,
+    "ast_hash": "c94dadefbfc748940a1f6bdee2548c06",
+    "semantic_hash": ""
+  },
+  "ANALYST_05_PRIVACY.md": {
+    "mtime": 1782325514.138814,
+    "ast_hash": "5c4a6d10d47257a6b50daaa09f3f46bb",
+    "semantic_hash": ""
+  },
+  "ANALYST_06_PERFORMANCE.md": {
+    "mtime": 1782325501.1920428,
+    "ast_hash": "106a0991a7183afe8c86959840b7029b",
+    "semantic_hash": ""
+  },
+  "ROUNDTABLE_01_NETWORK.md": {
+    "mtime": 1782325886.7081382,
+    "ast_hash": "4b0aaaff9b25f07095ad0e485f8b6bd9",
+    "semantic_hash": ""
+  },
+  "ROUNDTABLE_02_RATE_LIMIT.md": {
+    "mtime": 1782325938.0549033,
+    "ast_hash": "5cea8f07b1426008e77949da66c64a22",
+    "semantic_hash": ""
+  },
+  "ROUNDTABLE_03_ARCHITECTURE.md": {
+    "mtime": 1782325933.1353261,
+    "ast_hash": "ad7eb0b8343b328a8328d652263366ff",
+    "semantic_hash": ""
+  },
+  "ROUNDTABLE_04_OPS.md": {
+    "mtime": 1782325910.9821277,
+    "ast_hash": "2d7cb8deb52bb2a9cab15f6061bf5dc8",
+    "semantic_hash": "2d7cb8deb52bb2a9cab15f6061bf5dc8"
+  },
+  "ROUNDTABLE_05_MODEL_ROUTING.md": {
+    "mtime": 1782326030.0787675,
+    "ast_hash": "2796891991dfe3ecc07c50746c167845",
+    "semantic_hash": "2796891991dfe3ecc07c50746c167845"
+  },
+  "config-test.yaml": {
+    "mtime": 1782215814.1233876,
+    "ast_hash": "3c3ab26c5692f980eecad46103cd6412",
+    "semantic_hash": ""
+  },
+  "config.yaml": {
+    "mtime": 1783090523.9963279,
+    "ast_hash": "49e4c3710b11739860c7e16ba4f3ca6c",
+    "semantic_hash": ""
   }
 }

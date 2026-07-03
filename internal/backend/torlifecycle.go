@@ -275,6 +275,18 @@ func (tl *TorLifecycle) GetReadyCount() int {
 	return count
 }
 
+// GetInstance returns a specific instance by ID.
+func (tl *TorLifecycle) GetInstance(id int) (*TorInstance, bool) {
+	tl.mu.RLock()
+	defer tl.mu.RUnlock()
+	for _, inst := range tl.instances {
+		if inst.ID == id {
+			return inst, true
+		}
+	}
+	return nil, false
+}
+
 // CheckHealth verifies all instances are alive and restarts dead ones.
 func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 	tl.mu.RLock()

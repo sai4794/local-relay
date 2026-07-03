@@ -14,12 +14,13 @@ import (
 // connections across them. Each instance runs on a separate SOCKS port,
 // giving a different outbound IP address.
 type MultiTorBackend struct {
-	lifecycle *TorLifecycle
-	dialer    *net.Dialer
-	counter   atomic.Int64
-	mu        sync.RWMutex
-	logf      func(string, ...interface{})
-	OnRotate  func() // called after NEWNYM to clear connection pools
+	lifecycle    *TorLifecycle
+	dialer       *net.Dialer
+	counter      atomic.Int64
+	lastInstance int32 // tracks which instance served the last request
+	mu           sync.RWMutex
+	logf         func(string, ...interface{})
+	OnRotate     func() // called after NEWNYM to clear connection pools
 }
 
 // NewMultiTorBackend creates a backend that routes through multiple Tor instances.
@@ -74,6 +75,7 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	}
 
 	TuneTCP(conn)
+	m.lastInstance = int32(inst.ID)
 
 	if err := m.socks5Handshake(conn, addr); err != nil {
 		conn.Close()
@@ -186,22 +188,51 @@ func (m *MultiTorBackend) Status() map[string]interface{} {
 	}
 }
 
-// ReportAnomaly triggers circuit rotation when a 429 or network error occurs.
-// Implements the AnomalyReporter interface so the router can signal anomalies.
+// ReportAnomaly triggers circuit rotation for the specific instance that
+// received the 429/503 error. Only rotates that instance, leaving others
+// untouched since they are working fine.
 func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
-	m.logf("multi-tor: anomaly reported (slot %d), triggering circuit rotation", slotIdx)
-	// Rotate all instances' circuits sequentially to avoid goroutine explosion
+	// Get the instance that served the request
+	lastID := int(atomic.LoadInt32(&m.lastInstance))
+	if lastID == 0 {
+		m.logf("multi-tor: anomaly reported but no instance tracked, rotating all")
+		m.rotateAll()
+		return
+	}
+
+	inst, ok := m.lifecycle.GetInstance(lastID)
+	if !ok {
+		m.logf("multi-tor: instance %d not found, rotating all", lastID)
+		m.rotateAll()
+		return
+	}
+
+	m.logf("multi-tor: 429 on instance %d (port %d), rotating only this instance", inst.ID, inst.SocksPort)
+	if err := m.lifecycle.RequestNewCircuit(
+		&TorInstance{ID: inst.ID, SocksPort: inst.SocksPort},
+	); err != nil {
+		m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
+	} else {
+		m.logf("multi-tor: instance %d circuit rotated", inst.ID)
+	}
+
+	// Clear connection pool so next request uses new circuit
+	if m.OnRotate != nil {
+		m.OnRotate()
+	}
+}
+
+// rotateAll rotates all instances (used when no specific instance is tracked).
+func (m *MultiTorBackend) rotateAll() {
 	for _, inst := range m.lifecycle.GetInstances() {
-		if err := m.lifecycle.RequestNewCircuit(inst); err != nil {
+		if err := m.lifecycle.RequestNewCircuit(
+			&TorInstance{ID: inst.ID, SocksPort: inst.SocksPort},
+		); err != nil {
 			m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
 		} else {
 			m.logf("multi-tor: instance %d circuit rotated", inst.ID)
-			inst.mu.Lock()
-			inst.Requests = 0
-			inst.mu.Unlock()
 		}
 	}
-	// Clear connection pool so new connections use new circuits
 	if m.OnRotate != nil {
 		m.OnRotate()
 	}
