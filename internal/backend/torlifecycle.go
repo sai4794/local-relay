@@ -3,6 +3,7 @@ package backend
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -308,6 +309,7 @@ func (tl *TorLifecycle) ShutdownAll() {
 }
 
 // RequestNewCircuit sends SIGNAL NEWNYM to a specific instance.
+// It reads the control_auth_cookie from the instance's data directory for authentication.
 func (tl *TorLifecycle) RequestNewCircuit(inst *TorInstance) error {
 	controlAddr := fmt.Sprintf("127.0.0.1:%d", inst.ControlPort)
 	conn, err := net.DialTimeout("tcp", controlAddr, 5*time.Second)
@@ -317,7 +319,21 @@ func (tl *TorLifecycle) RequestNewCircuit(inst *TorInstance) error {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
-	fmt.Fprintf(conn, "AUTHENTICATE\r\n")
+
+	// Try to read control_auth_cookie from data directory
+	cookiePath := filepath.Join(inst.DataDir, "control_auth_cookie")
+	authSent := false
+	if cookie, err := os.ReadFile(cookiePath); err == nil && len(cookie) == 32 {
+		hexCookie := hex.EncodeToString(cookie)
+		fmt.Fprintf(conn, "AUTHENTICATE %s\r\n", hexCookie)
+		authSent = true
+	}
+
+	if !authSent {
+		// Fallback: try empty auth (works if ControlPort is configured without auth)
+		fmt.Fprintf(conn, "AUTHENTICATE\r\n")
+	}
+
 	resp, err := reader.ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("auth failed: %w", err)

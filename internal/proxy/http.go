@@ -175,12 +175,15 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SSRF protection
+	// SSRF protection — check scheme from raw request URI
 	if p.ssrf != nil {
-		if p.ssrf.IsSchemeBlocked(r.URL.Scheme) {
-			p.logger.Warn("blocked request with disallowed scheme", "scheme", r.URL.Scheme)
-			http.Error(w, "scheme not allowed", http.StatusForbidden)
-			return
+		uri := r.RequestURI
+		for _, scheme := range []string{"file://", "gopher://", "javascript:", "data:"} {
+			if len(uri) >= len(scheme) && uri[:len(scheme)] == scheme {
+				p.logger.Warn("blocked request with disallowed scheme", "scheme", scheme)
+				http.Error(w, "scheme not allowed", http.StatusForbidden)
+				return
+			}
 		}
 		if p.ssrf.IsBlocked(r.URL.Host) {
 			p.logger.Warn("blocked request to private/internal IP", "host", r.URL.Host)
@@ -189,6 +192,7 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Firewall rate limit (bypass hosts handled by Router)
 	if p.firewall != nil && !p.firewall.AllowHost(r.URL.Host) {
 		p.logger.Warn("blocked request to private/internal IP", "host", r.URL.Host)
 		http.Error(w, "request blocked", http.StatusForbidden)
