@@ -227,6 +227,14 @@ func main() {
 	httpProxy := proxy.NewHTTPProxy(router, authMiddleware, firewall, rotator, logger, usePool, ssrfBlocker, bodyLimit)
 	socks5Proxy := proxy.NewSOCKS5Proxy(router, firewall, rotator, logger, socks5Auth, ssrfBlocker, bodyLimit)
 
+	// Wire connection pool clearing after rotation (for instant IP change)
+	if multiTor != nil {
+		multiTor.OnRotate = func() {
+			httpProxy.ClearIdleConns()
+			logger.Info("Connection pool cleared after rotation")
+		}
+	}
+
 	go func() {
 		if err := httpProxy.Start(cfg.Server.HTTP); err != nil {
 			logger.Error("HTTP proxy failed", "error", err)

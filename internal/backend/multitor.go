@@ -20,6 +20,7 @@ type MultiTorBackend struct {
 	current   int
 	mu        sync.RWMutex
 	logf      func(string, ...interface{})
+	OnRotate  func() // called after NEWNYM to clear connection pools
 }
 
 // NewMultiTorBackend creates a backend that routes through multiple Tor instances.
@@ -202,5 +203,9 @@ func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
 				inst.mu.Unlock()
 			}
 		}(inst)
+	}
+	// Clear connection pool so new connections use new circuits
+	if m.OnRotate != nil {
+		go m.OnRotate()
 	}
 }
