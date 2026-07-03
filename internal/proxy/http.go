@@ -187,8 +187,15 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check bypass hosts FIRST — bypass hosts skip SSRF checks
+	isBypass := false
+	hostOnly := r.URL.Hostname()
+	if hostOnly == "localhost" || hostOnly == "127.0.0.1" {
+		isBypass = true
+	}
+
 	// SSRF protection — check scheme from raw request URI
-	if p.ssrf != nil {
+	if !isBypass && p.ssrf != nil {
 		uri := r.RequestURI
 		for _, scheme := range []string{"file://", "gopher://", "javascript:", "data:"} {
 			if len(uri) >= len(scheme) && uri[:len(scheme)] == scheme {
@@ -205,7 +212,7 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Firewall rate limit (bypass hosts handled by Router)
-	if p.firewall != nil && !p.firewall.AllowHost(r.URL.Host) {
+	if !isBypass && p.firewall != nil && !p.firewall.AllowHost(r.URL.Host) {
 		p.logger.Warn("blocked request to private/internal IP", "host", r.URL.Host)
 		http.Error(w, "request blocked", http.StatusForbidden)
 		return
