@@ -185,3 +185,22 @@ func (m *MultiTorBackend) Status() map[string]interface{} {
 		"total":     len(instances),
 	}
 }
+
+// ReportAnomaly triggers circuit rotation when a 429 or network error occurs.
+// Implements the AnomalyReporter interface so the router can signal anomalies.
+func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
+	m.logf("multi-tor: anomaly reported (slot %d), triggering circuit rotation", slotIdx)
+	// Rotate all instances' circuits
+	for _, inst := range m.lifecycle.GetInstances() {
+		go func(inst *TorInstance) {
+			if err := m.lifecycle.RequestNewCircuit(inst); err != nil {
+				m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
+			} else {
+				m.logf("multi-tor: instance %d circuit rotated", inst.ID)
+				inst.mu.Lock()
+				inst.Requests = 0
+				inst.mu.Unlock()
+			}
+		}(inst)
+	}
+}
