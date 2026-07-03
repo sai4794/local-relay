@@ -41,14 +41,21 @@ type HTTPProxy struct {
 }
 
 func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *security.Firewall, rotator *rotate.Rotator, logger *slog.Logger, disableKeepAlive bool, ssrf *security.SSRFBlocker, bodyLimit int64) *HTTPProxy {
+	// When using multi-tor, force new connections per request so round-robin
+	// actually distributes across instances. Without this, the transport's
+	// connection pool reuses the same connection, defeating round-robin.
+	// Always disable keep-alives for the relay. Each request creates a new
+	// connection through DialContext(), ensuring round-robin distributes
+	// across Tor instances. Keep-alives would reuse the same connection,
+	// defeating IP rotation.
 	transport := &http.Transport{
 		DialContext:           router.DialContext,
 		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
+		MaxIdleConnsPerHost:   0,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:  10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
-		DisableKeepAlives:     disableKeepAlive,
+		DisableKeepAlives:     true,
 		ForceAttemptHTTP2:     false,
 	}
 
