@@ -32,13 +32,15 @@ type HTTPProxy struct {
 	auth      *auth.APIKeyAuth
 	firewall  *security.Firewall
 	rotator   *rotate.Rotator
+	ssrf      *security.SSRFBlocker
+	bodyLimit int64
 	logger    *slog.Logger
 	transport *http.Transport
 	client    *http.Client
 	server    *http.Server
 }
 
-func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *security.Firewall, rotator *rotate.Rotator, logger *slog.Logger, disableKeepAlive bool) *HTTPProxy {
+func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *security.Firewall, rotator *rotate.Rotator, logger *slog.Logger, disableKeepAlive bool, ssrf *security.SSRFBlocker, bodyLimit int64) *HTTPProxy {
 	transport := &http.Transport{
 		DialContext:           router.DialContext,
 		MaxIdleConns:          4,
@@ -55,6 +57,8 @@ func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *s
 		auth:      authMiddleware,
 		firewall:  fw,
 		rotator:   rotator,
+		ssrf:      ssrf,
+		bodyLimit: bodyLimit,
 		logger:    logger,
 		transport: transport,
 		client: &http.Client{
@@ -92,6 +96,13 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	if p.firewall != nil && !p.firewall.AllowHost(hostOnly) {
 		p.logger.Warn("blocked connection to private/internal IP", "host", hostOnly)
+		http.Error(w, "connection blocked", http.StatusForbidden)
+		return
+	}
+
+	// SSRF protection for CONNECT
+	if p.ssrf != nil && p.ssrf.IsBlocked(host) {
+		p.logger.Warn("blocked CONNECT to private/internal IP", "host", host)
 		http.Error(w, "connection blocked", http.StatusForbidden)
 		return
 	}
@@ -162,6 +173,20 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Host == "" {
 		http.Error(w, "missing host", http.StatusBadRequest)
 		return
+	}
+
+	// SSRF protection
+	if p.ssrf != nil {
+		if p.ssrf.IsSchemeBlocked(r.URL.Scheme) {
+			p.logger.Warn("blocked request with disallowed scheme", "scheme", r.URL.Scheme)
+			http.Error(w, "scheme not allowed", http.StatusForbidden)
+			return
+		}
+		if p.ssrf.IsBlocked(r.URL.Host) {
+			p.logger.Warn("blocked request to private/internal IP", "host", r.URL.Host)
+			http.Error(w, "request blocked", http.StatusForbidden)
+			return
+		}
 	}
 
 	if p.firewall != nil && !p.firewall.AllowHost(r.URL.Host) {

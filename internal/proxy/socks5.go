@@ -22,16 +22,20 @@ type SOCKS5Proxy struct {
 	router       *backend.Router
 	firewall     *security.Firewall
 	rotator      *rotate.Rotator
+	ssrf         *security.SSRFBlocker
+	bodyLimit    int64
 	logger       *slog.Logger
 	listener     net.Listener
 	authCheck    AuthCheck
 }
 
-func NewSOCKS5Proxy(router *backend.Router, fw *security.Firewall, rotator *rotate.Rotator, logger *slog.Logger, authCheck AuthCheck) *SOCKS5Proxy {
+func NewSOCKS5Proxy(router *backend.Router, fw *security.Firewall, rotator *rotate.Rotator, logger *slog.Logger, authCheck AuthCheck, ssrf *security.SSRFBlocker, bodyLimit int64) *SOCKS5Proxy {
 	return &SOCKS5Proxy{
 		router:    router,
 		firewall:  fw,
 		rotator:   rotator,
+		ssrf:      ssrf,
+		bodyLimit: bodyLimit,
 		logger:    logger,
 		authCheck: authCheck,
 	}

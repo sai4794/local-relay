@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -66,31 +68,57 @@ func main() {
 		"http", cfg.Server.HTTP,
 		"socks5", cfg.Server.SOCKS5,
 		"backend", cfg.Backend.Type,
-		"backend_addr", cfg.Backend.Address,
-		"circuit_count", cfg.CircuitCount(),
-		"max_circuit_age", cfg.MaxCircuitAgeVal(),
+		"multi_tor", cfg.MultiTor.Enabled,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Backend setup — use circuit pool when circuit_count > 1, else single Tor
+	// Backend setup
 	var pool *backend.CircuitPoolBackend
 	var torBackend *backend.TorBackend
+	var multiTor *backend.MultiTorBackend
+	var torLifecycle *backend.TorLifecycle
 	usePool := false
 
-	if cfg.IsPool() {
+	if cfg.IsMultiTor() {
+		// Multi-Tor mode: spawn N Tor daemons
+		torLifecycle = backend.NewTorLifecycle(backend.TorLifecycleConfig{
+			Binary:       cfg.MultiTor.Binary,
+			DataDir:      cfg.MultiTor.DataDir,
+			BasePort:     cfg.MultiTor.BasePort,
+			ControlBase:  cfg.MultiTor.ControlBase,
+			MaxInstances: cfg.MultiTor.MaxInstances,
+			RotateAfter:  cfg.MultiTor.RotateAfter,
+			Logf: func(format string, args ...interface{}) {
+				logger.Debug("[tor-lifecycle] "+format, args...)
+			},
+		})
+
+		if err := torLifecycle.Start(ctx); err != nil {
+			logger.Error("Failed to start Tor instances", "error", err)
+			logger.Warn("Continuing with direct connections only")
+			torLifecycle = nil
+		} else {
+			multiTor = backend.NewMultiTorBackend(torLifecycle, cfg.ConnectionTimeout(), func(format string, args ...interface{}) {
+				logger.Debug("[multi-tor] "+format, args...)
+			})
+			logger.Info("Multi-Tor backend ready",
+				"instances", torLifecycle.GetReadyCount(),
+			)
+		}
+	} else if cfg.IsPool() {
 		usePool = true
 		pool = backend.NewCircuitPoolBackend(backend.PoolConfig{
 			TorAddress:        cfg.Backend.Address,
 			ControlAddr:       "127.0.0.1:9051",
 			ControlPass:       "",
 			ControlCookiePath: "/home/stb/tor/data/control_auth_cookie",
-			CircuitCount:  cfg.CircuitCount(),
-			MaxCircuitAge: cfg.MaxCircuitAgeVal(),
-			MaxFails:      3,
-			MaxAnomaly:    2,
-			Timeout:       cfg.ConnectionTimeout(),
+			CircuitCount:      cfg.CircuitCount(),
+			MaxCircuitAge:     cfg.MaxCircuitAgeVal(),
+			MaxFails:          3,
+			MaxAnomaly:        2,
+			Timeout:           cfg.ConnectionTimeout(),
 			Logf: func(format string, args ...interface{}) {
 				logger.Debug("[circuit-pool] "+format, args...)
 			},
@@ -121,7 +149,9 @@ func main() {
 	directBackend := backend.NewDirectBackend(cfg.ConnectionTimeout())
 
 	var router *backend.Router
-	if pool != nil {
+	if multiTor != nil {
+		router = backend.NewRouter(directBackend, multiTor)
+	} else if pool != nil {
 		router = backend.NewRouter(directBackend, pool)
 	} else if torBackend != nil {
 		router = backend.NewRouter(directBackend, torBackend)
@@ -134,6 +164,14 @@ func main() {
 		logger.Info("Bypass hosts configured", "hosts", cfg.Bypass.Hosts)
 	}
 
+	// SSRF protection
+	var ssrfBlocker *security.SSRFBlocker
+	if len(cfg.Security.BlockedNetworks) > 0 {
+		ssrfBlocker = security.NewSSRFBlocker(cfg.Security.BlockedNetworks)
+		logger.Info("SSRF protection enabled", "blocked_networks", len(cfg.Security.BlockedNetworks))
+	}
+
+	// Auth
 	var authMiddleware *auth.APIKeyAuth
 	if cfg.Auth.Enabled {
 		authMiddleware = auth.NewAPIKeyAuth(cfg.Auth.APIKey)
@@ -147,15 +185,12 @@ func main() {
 	firewall.StartCleanup(ctx, 5*time.Minute)
 	defer firewall.StopCleanup()
 
-	// Rotator setup
+	// Rotator
 	var rotator *rotate.Rotator
 	if cfg.Rotation.Enabled {
 		rotator = rotate.NewRotator(cfg.Rotation.Interval, func() {
 			if pool != nil {
 				logger.Info("Rotation triggered — rotating circuit pool")
-				// RotateRandomSlot marks one slot unhealthy so new requests
-				// shift to different slots; ForceRotate sends rate-limited NEWNYM
-				// and resets all slots.
 				pool.RotateRandomSlot()
 				if err := pool.ForceRotate(); err != nil {
 					logger.Error("Failed to force rotate circuit pool", "error", err)
@@ -165,24 +200,32 @@ func main() {
 				if err := torBackend.RequestNewCircuit(); err != nil {
 					logger.Error("Failed to request new Tor circuit", "error", err)
 				}
+			} else if torLifecycle != nil {
+				logger.Info("Rotation triggered — rotating Tor instances")
+				for _, inst := range torLifecycle.GetInstances() {
+					if err := torLifecycle.RequestNewCircuit(inst); err != nil {
+						logger.Error("Failed to rotate instance", "id", inst.ID, "error", err)
+					}
+				}
 			}
 		}, logger)
 	}
 
-	// Disable keepalives when using circuit pool so every request
-	// opens a fresh TCP connection through Tor → new circuit after rotation
-	// Wire SOCKS5 auth if configured
+	// SOCKS5 auth
 	var socks5Auth proxy.AuthCheck
 	if cfg.Auth.Enabled && cfg.Auth.APIKey != "" {
 		apiKey := cfg.Auth.APIKey
 		socks5Auth = func(username, password string) bool {
-			// Accept the API key as either username or password
 			return username == apiKey || password == apiKey
 		}
 		logger.Info("SOCKS5 authentication enabled")
 	}
-	httpProxy := proxy.NewHTTPProxy(router, authMiddleware, firewall, rotator, logger, usePool)
-	socks5Proxy := proxy.NewSOCKS5Proxy(router, firewall, rotator, logger, socks5Auth)
+
+	// Body size limit
+	bodyLimit := cfg.MaxBodySizeBytes()
+
+	httpProxy := proxy.NewHTTPProxy(router, authMiddleware, firewall, rotator, logger, usePool, ssrfBlocker, bodyLimit)
+	socks5Proxy := proxy.NewSOCKS5Proxy(router, firewall, rotator, logger, socks5Auth, ssrfBlocker, bodyLimit)
 
 	go func() {
 		if err := httpProxy.Start(cfg.Server.HTTP); err != nil {
@@ -198,9 +241,32 @@ func main() {
 		}
 	}()
 
+	// Tor health monitor (for multi-tor mode)
+	if torLifecycle != nil {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					restarted := torLifecycle.CheckHealth(ctx)
+					if restarted > 0 {
+						logger.Info("Restarted dead Tor instances", "count", restarted)
+					}
+				}
+			}
+		}()
+	}
+
+	// Health endpoint
 	if cfg.Health.Enabled {
 		checker := health.NewSimpleHealthChecker(
 			func() bool {
+				if multiTor != nil {
+					return multiTor.IsHealthy()
+				}
 				if pool != nil {
 					return pool.IsHealthy()
 				}
@@ -213,8 +279,9 @@ func main() {
 				info := map[string]interface{}{
 					"type": cfg.Backend.Type,
 				}
-
-				if pool != nil {
+				if multiTor != nil {
+					info["backend"] = multiTor.Status()
+				} else if pool != nil {
 					info["backend"] = pool.Status()
 				} else if torBackend != nil {
 					info["backend"] = map[string]interface{}{
@@ -224,15 +291,13 @@ func main() {
 						"circuits": 1,
 					}
 				}
-
 				if rotator != nil {
 					info["rotation"] = map[string]interface{}{
-						"request_count":   rotator.GetCount(),
-						"interval":        cfg.Rotation.Interval,
-						"enabled":         true,
+						"request_count": rotator.GetCount(),
+						"interval":      cfg.Rotation.Interval,
+						"enabled":       true,
 					}
 				}
-
 				info["uptime"] = time.Since(startTime).String()
 				return info
 			},
@@ -246,13 +311,31 @@ func main() {
 		defer healthSrv.Stop()
 	}
 
+	// Prometheus metrics
+	if cfg.Metrics.Enabled {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc(cfg.Metrics.Path, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/plain")
+				fmt.Fprintf(w, "# LANO local-relay metrics\n")
+				fmt.Fprintf(w, "lano_up 1\n")
+				if multiTor != nil {
+					fmt.Fprintf(w, "lano_tor_instances %d\n", torLifecycle.GetReadyCount())
+				}
+			})
+			metricsAddr := net.JoinHostPort("127.0.0.1", "9090")
+			logger.Info("Prometheus metrics enabled", "path", cfg.Metrics.Path, "addr", metricsAddr)
+			if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+				logger.Error("Metrics server failed", "error", err)
+			}
+		}()
+	}
+
 	logger.Info("Local relay is ready")
 
 	<-ctx.Done()
 
 	logger.Info("Shutting down...")
-
-	// Wait for in-flight rotation goroutines to complete
 	if rotator != nil {
 		rotator.Wait()
 	}
@@ -263,6 +346,11 @@ func main() {
 	socks5Proxy.Stop()
 	if err := httpProxy.Stop(shutdownCtx); err != nil {
 		logger.Error("HTTP proxy shutdown error", "error", err)
+	}
+
+	// Shutdown Tor instances
+	if torLifecycle != nil {
+		torLifecycle.ShutdownAll()
 	}
 
 	logger.Info("Local relay stopped")

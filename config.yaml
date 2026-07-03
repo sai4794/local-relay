@@ -2,12 +2,23 @@ server:
   http: "127.0.0.1:18080"
   socks5: "127.0.0.1:11080"
 
+# Multi-Tor mode: spawns N Tor daemons for real IP rotation
+# Set multi_tor.enabled: true to use this instead of single Tor
+multi_tor:
+  enabled: true
+  binary: "tor"
+  data_dir: "/tmp/local-relay-tor"
+  base_port: 9050
+  control_base: 9051
+  max_instances: 3
+  rotate_after: 50  # Rotate circuit after N requests per instance
+
+# Single Tor / circuit pool mode (used when multi_tor.enabled: false)
 backend:
-  type: tor
+  type: "tor"
   address: "127.0.0.1:9050"
   circuit_count: 3
   max_circuit_age: 50
-  options: {}
 
 bypass:
   hosts:
@@ -25,17 +36,34 @@ auth:
   enabled: false
   api_key: ""
 
+security:
+  blocked_networks:
+    - "127.0.0.0/8"
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+    - "169.254.0.0/16"
+    - "::1/128"
+    - "fc00::/7"
+    - "fe80::/10"
+  max_body_size: 33554432  # 32MB
+  request_timeout: 300
+
 logging:
   level: info
   format: json
   redact_headers:
-    - Authorization
-    - X-Api-Key
-    - Cookie
-    - Proxy-Authorization
-    - Set-Cookie
+    - "Authorization"
+    - "X-Api-Key"
+    - "Cookie"
+    - "Proxy-Authorization"
+    - "Set-Cookie"
   max_body_log_size: 200
 
 health:
   enabled: true
   address: "127.0.0.1:18888"
+
+metrics:
+  enabled: true
+  path: "/_/metrics"
