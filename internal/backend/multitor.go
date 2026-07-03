@@ -10,17 +10,21 @@ import (
 	"time"
 )
 
-// MultiTorBackend manages multiple Tor daemon instances and round-robins
-// connections across them. Each instance runs on a separate SOCKS port,
-// giving a different outbound IP address.
+// MultiTorBackend manages multiple Tor daemon instances with sticky+failover
+// routing. All requests go to one instance until it gets a 429, then failover
+// to the next instance while the blocked one rotates in the background.
 type MultiTorBackend struct {
 	lifecycle    *TorLifecycle
 	dialer       *net.Dialer
 	counter      atomic.Int64
-	lastInstance int32 // tracks which instance served the last request
 	mu           sync.RWMutex
 	logf         func(string, ...interface{})
 	OnRotate     func() // called after NEWNYM to clear connection pools
+
+	// Sticky+failover state
+	primaryIdx   int   // index into instances slice for current primary
+	failedIDs    map[int]bool // instances that got 429, pending rotation
+	failedMu     sync.Mutex
 }
 
 // NewMultiTorBackend creates a backend that routes through multiple Tor instances.
@@ -35,47 +39,58 @@ func NewMultiTorBackend(lifecycle *TorLifecycle, timeout time.Duration, logf fun
 		lifecycle: lifecycle,
 		dialer:    &net.Dialer{Timeout: timeout},
 		logf:      logf,
+		failedIDs: make(map[int]bool),
 	}
 }
 
-// DialContext picks the next Tor instance round-robin and dials through its SOCKS port.
+// DialContext sends the request to the PRIMARY instance.
+// If primary is failed, picks the next healthy instance.
 func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	instances := m.lifecycle.GetInstances()
-	ready := make([]*TorInstance, 0)
-	for _, inst := range instances {
-		if inst.IsReady() {
-			ready = append(ready, inst)
+	if len(instances) == 0 {
+		return nil, fmt.Errorf("no Tor instances available")
+	}
+
+	// Find a healthy instance starting from primary
+	m.failedMu.Lock()
+	failed := make(map[int]bool)
+	for k, v := range m.failedIDs {
+		failed[k] = v
+	}
+	m.failedMu.Unlock()
+
+	var inst *TorInstance
+	for i := 0; i < len(instances); i++ {
+		idx := (m.primaryIdx + i) % len(instances)
+		candidate := instances[idx]
+		if candidate.IsReady() && !failed[candidate.ID] {
+			inst = candidate
+			m.primaryIdx = idx
+			break
 		}
 	}
 
-	if len(ready) == 0 {
-		return nil, fmt.Errorf("no ready Tor instances")
+	if inst == nil {
+		// All instances failed — try any ready one
+		for _, candidate := range instances {
+			if candidate.IsReady() {
+				inst = candidate
+				break
+			}
+		}
 	}
 
-	// Round-robin across ready instances
-	idx := int(m.counter.Add(1)-1) % len(ready)
-	inst := ready[idx]
+	if inst == nil {
+		return nil, fmt.Errorf("no healthy Tor instances available")
+	}
 
 	conn, err := m.dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort()))
 	if err != nil {
 		m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
-		// Try next instance
-		for i := 1; i < len(ready); i++ {
-			nextIdx := (idx + i) % len(ready)
-			inst = ready[nextIdx]
-			conn, err = m.dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort()))
-			if err == nil {
-				break
-			}
-			m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("all Tor instances failed: %w", err)
-		}
+		return nil, fmt.Errorf("tor dial failed: %w", err)
 	}
 
 	TuneTCP(conn)
-	m.lastInstance = int32(inst.ID)
 
 	if err := m.socks5Handshake(conn, addr); err != nil {
 		conn.Close()
@@ -83,20 +98,6 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	}
 
 	inst.IncRequests()
-
-	// Check if this instance needs rotation
-	if m.lifecycle.rotateAfter > 0 && inst.GetRequests() >= int64(m.lifecycle.rotateAfter) {
-		m.logf("multi-tor: instance %d reached %d requests, rotating circuit", inst.ID, inst.GetRequests())
-		go func() {
-			if err := m.lifecycle.RequestNewCircuit(inst); err != nil {
-				m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
-			}
-			inst.mu.Lock()
-			inst.Requests = 0
-			inst.mu.Unlock()
-		}()
-	}
-
 	return conn, nil
 }
 
@@ -174,55 +175,90 @@ func (m *MultiTorBackend) Status() map[string]interface{} {
 	statuses := make([]map[string]interface{}, len(instances))
 	for i, inst := range instances {
 		statuses[i] = map[string]interface{}{
-			"id":        inst.ID,
-			"socks":     inst.GetSocksPort(),
-			"ready":     inst.IsReady(),
-			"requests":  inst.GetRequests(),
+			"id":       inst.ID,
+			"socks":    inst.GetSocksPort(),
+			"ready":    inst.IsReady(),
+			"requests": inst.GetRequests(),
 		}
 	}
+	m.failedMu.Lock()
+	failedCount := len(m.failedIDs)
+	m.failedMu.Unlock()
 	return map[string]interface{}{
 		"type":      "multi-tor",
 		"instances": statuses,
 		"ready":     m.lifecycle.GetReadyCount(),
 		"total":     len(instances),
+		"failed":    failedCount,
+		"primary":   m.primaryIdx,
 	}
 }
 
-// ReportAnomaly triggers circuit rotation for the specific instance that
-// received the 429/503 error. Only rotates that instance, leaving others
-// untouched since they are working fine.
+// ReportAnomaly handles 429/503 by marking the current primary as failed
+// and failover to the next healthy instance. The failed instance rotates
+// its circuit in the background.
 func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
-	// Get the instance that served the request
-	lastID := int(atomic.LoadInt32(&m.lastInstance))
-	if lastID == 0 {
-		m.logf("multi-tor: anomaly reported but no instance tracked, rotating all")
-		m.rotateAll()
+	instances := m.lifecycle.GetInstances()
+	if len(instances) == 0 {
 		return
 	}
 
-	inst, ok := m.lifecycle.GetInstance(lastID)
-	if !ok {
-		m.logf("multi-tor: instance %d not found, rotating all", lastID)
-		m.rotateAll()
-		return
-	}
+	// Mark current primary as failed
+	m.failedMu.Lock()
+	currentIdx := m.primaryIdx % len(instances)
+	currentInst := instances[currentIdx]
+	m.failedIDs[currentInst.ID] = true
+	m.failedMu.Unlock()
 
-	m.logf("multi-tor: 429 on instance %d (port %d), rotating only this instance", inst.ID, inst.SocksPort)
-	if err := m.lifecycle.RequestNewCircuit(
-		&TorInstance{ID: inst.ID, SocksPort: inst.SocksPort},
-	); err != nil {
-		m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
-	} else {
-		m.logf("multi-tor: instance %d circuit rotated", inst.ID)
-	}
+	m.logf("multi-tor: 429 on instance %d (port %d), failover to next", currentInst.ID, currentInst.GetSocksPort())
 
-	// Clear connection pool so next request uses new circuit
+	// Rotate the failed instance in background
+	go func(inst *TorInstance) {
+		m.logf("multi-tor: rotating instance %d in background", inst.ID)
+		if err := m.lifecycle.RequestNewCircuit(
+			&TorInstance{ID: inst.ID, SocksPort: inst.SocksPort},
+		); err != nil {
+			m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
+		} else {
+			m.logf("multi-tor: instance %d circuit rotated", inst.ID)
+			// Clear from failed list after rotation
+			m.failedMu.Lock()
+			delete(m.failedIDs, inst.ID)
+			m.failedMu.Unlock()
+		}
+	}(currentInst)
+
+	// Advance primary to next healthy instance
+	m.advancePrimary(instances)
+
+	// Clear connection pool
 	if m.OnRotate != nil {
 		m.OnRotate()
 	}
 }
 
-// rotateAll rotates all instances (used when no specific instance is tracked).
+// advancePrimary moves primary to the next healthy instance.
+func (m *MultiTorBackend) advancePrimary(instances []*TorInstance) {
+	m.failedMu.Lock()
+	failed := make(map[int]bool)
+	for k, v := range m.failedIDs {
+		failed[k] = v
+	}
+	m.failedMu.Unlock()
+
+	for i := 1; i <= len(instances); i++ {
+		idx := (m.primaryIdx + i) % len(instances)
+		inst := instances[idx]
+		if inst.IsReady() && !failed[inst.ID] {
+			m.logf("multi-tor: failover from instance %d to %d", m.primaryIdx, idx)
+			m.primaryIdx = idx
+			return
+		}
+	}
+	m.logf("multi-tor: all instances failed, will retry primary")
+}
+
+// rotateAll rotates all instances (fallback when no specific instance tracked).
 func (m *MultiTorBackend) rotateAll() {
 	for _, inst := range m.lifecycle.GetInstances() {
 		if err := m.lifecycle.RequestNewCircuit(
