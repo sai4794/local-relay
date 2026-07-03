@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -155,14 +156,41 @@ func (tl *TorLifecycle) Start(ctx context.Context) error {
 		}
 	}
 }
-
+// isSocksPortReady checks if a SOCKS port is actually routing traffic
+// by performing a full SOCKS5 handshake and connecting to a known host.
 func (tl *TorLifecycle) isSocksPortReady(port int) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 1*time.Second)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 3*time.Second)
 	if err != nil {
 		return false
 	}
-	conn.Close()
-	return true
+	defer conn.Close()
+
+	// SOCKS5 greeting
+	conn.Write([]byte{0x05, 0x01, 0x00})
+	resp := make([]byte, 2)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return false
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		return false
+	}
+
+	// SOCKS5 connect to a known reachable host
+	// api.ipify.org = 172.67.149.29
+	target := []byte{0x05, 0x01, 0x00, 0x03, 13}
+	target = append(target, []byte("api.ipify.org")...)
+	target = append(target, 0x00, 0x50) // port 80
+	conn.Write(target)
+
+	reply := make([]byte, 10)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		return false
+	}
+
+	// reply[1] == 0x00 means success
+	return reply[1] == 0x00
 }
 
 func (tl *TorLifecycle) spawnInstance() (*TorInstance, error) {
