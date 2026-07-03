@@ -1,0 +1,41 @@
+server:
+  http: "127.0.0.1:18080"
+  socks5: "127.0.0.1:11080"
+
+backend:
+  type: tor
+  address: "127.0.0.1:9050"
+  circuit_count: 3
+  max_circuit_age: 50
+  options: {}
+
+bypass:
+  hosts:
+    - "localhost"
+    - "127.0.0.1"
+    - "codebuff.com"
+    - "www.codebuff.com"
+    - "api.codebuff.com"
+
+rotation:
+  enabled: true
+  interval: 10
+
+auth:
+  enabled: false
+  api_key: ""
+
+logging:
+  level: info
+  format: json
+  redact_headers:
+    - Authorization
+    - X-Api-Key
+    - Cookie
+    - Proxy-Authorization
+    - Set-Cookie
+  max_body_log_size: 200
+
+health:
+  enabled: true
+  address: "127.0.0.1:18888"

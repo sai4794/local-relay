@@ -1,0 +1,18 @@
+[Unit]
+Description=Tor anonymity network
+Documentation=https://www.torproject.org/docs/
+After=network.target
+
+[Service]
+Type=simple
+User=stb
+Group=stb
+WorkingDirectory=/home/stb/tor
+ExecStart=/home/stb/tor/tor/tor -f /home/stb/tor/torrc
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

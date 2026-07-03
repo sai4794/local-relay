@@ -1,0 +1,26 @@
+server:
+  http: "127.0.0.1:8080"
+  socks5: "127.0.0.1:1080"
+
+backend:
+  type: http
+  address: "1.1.1.1:53"
+
+rotation:
+  enabled: false
+
+auth:
+  enabled: false
+
+logging:
+  level: info
+  format: json
+  redact_headers:
+    - Authorization
+    - X-Api-Key
+    - Cookie
+  max_body_log_size: 200
+
+health:
+  enabled: true
+  address: "127.0.0.1:8888"

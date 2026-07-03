@@ -1,0 +1,156 @@
+package backend
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+type Backend interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+	IsHealthy() bool
+	Close() error
+}
+
+type Router struct {
+	backends      []Backend
+	directBackend Backend
+	bypassHosts   []string
+	bypassMu      sync.RWMutex
+	current       atomic.Int64
+}
+
+// NewRouter creates a router with an explicit direct (bypass) backend
+// and one or more proxied backends.
+func NewRouter(direct Backend, backends ...Backend) *Router {
+	return &Router{
+		backends:      backends,
+		directBackend: direct,
+	}
+}
+
+func (r *Router) SetBypassHosts(hosts []string) {
+	r.bypassMu.Lock()
+	r.bypassHosts = make([]string, len(hosts))
+	for i, h := range hosts {
+		r.bypassHosts[i] = strings.ToLower(h)
+	}
+	r.bypassMu.Unlock()
+}
+
+func (r *Router) isBypassHost(host string) bool {
+	host = strings.ToLower(host)
+	r.bypassMu.RLock()
+	defer r.bypassMu.RUnlock()
+	for _, bypassHost := range r.bypassHosts {
+		// Exact match or ".domain" suffix match
+		if host == bypassHost || strings.HasSuffix(host, "."+bypassHost) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Router) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if len(r.backends) == 0 && r.directBackend == nil {
+		return nil, fmt.Errorf("no backends available")
+	}
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+
+	// Bypass hosts MUST go through direct backend — no fallback to Tor
+	if r.isBypassHost(host) {
+		if r.directBackend != nil {
+			conn, err := r.directBackend.DialContext(ctx, network, addr)
+			if err == nil {
+				return conn, nil
+			}
+			return nil, fmt.Errorf("bypass host dial failed (no Tor fallback): %w", err)
+		}
+		// No direct backend configured — block bypass host to prevent leak
+		return nil, fmt.Errorf("bypass host blocked: no direct backend configured")
+	}
+
+	total := int64(len(r.backends))
+	if total == 0 {
+		// No proxy backends — use direct
+		if r.directBackend != nil {
+			return r.directBackend.DialContext(ctx, network, addr)
+		}
+		return nil, fmt.Errorf("no backends available")
+	}
+
+	cur := r.current.Load()
+
+	for i := int64(0); i < total; i++ {
+		idx := (cur + i) % total
+		backend := r.backends[idx]
+
+		if !backend.IsHealthy() {
+			continue
+		}
+
+		conn, err := backend.DialContext(ctx, network, addr)
+		if err == nil {
+			r.current.Store((idx + 1) % total)
+			return conn, nil
+		}
+	}
+
+	// FAIL CLOSED: all proxy backends failed, do NOT fall back to direct.
+	// This prevents silent traffic leaks outside Tor when the circuit
+	// pool is exhausted or Tor is unavailable.
+	return nil, fmt.Errorf("no healthy proxy backends — connection blocked (fail-closed)")
+}
+
+func (r *Router) IsHealthy() bool {
+	for _, b := range r.backends {
+		if b.IsHealthy() {
+			return true
+		}
+	}
+	if r.directBackend != nil && r.directBackend.IsHealthy() {
+		return true
+	}
+	return false
+}
+
+func (r *Router) Close() error {
+	for _, b := range r.backends {
+		b.Close()
+	}
+	return nil
+}
+
+// AnomalyReporter is an optional interface backends can implement to
+// receive rate-limit and anomaly signals from the proxy layer.
+type AnomalyReporter interface {
+	ReportAnomaly(slotIdx int)
+}
+
+// ReportAnomaly signals an anomaly (e.g. rate-limit) to the backend
+// that served the last request.
+func (r *Router) ReportAnomaly(idx int) {
+	if idx < 0 || idx >= len(r.backends) {
+		if len(r.backends) > 0 {
+			if ar, ok := r.backends[0].(AnomalyReporter); ok {
+				ar.ReportAnomaly(-1)
+			}
+		}
+		return
+	}
+	if ar, ok := r.backends[idx].(AnomalyReporter); ok {
+		ar.ReportAnomaly(idx)
+	}
+}
+
+// Backends returns all proxied backends for inspection.
+func (r *Router) Backends() []Backend {
+	return r.backends
+}

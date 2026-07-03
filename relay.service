@@ -1,0 +1,19 @@
+[Unit]
+Description=Local Relay
+Documentation=https://github.com/local-relay/proxy
+After=network.target tor-local.service
+Requires=tor-local.service
+
+[Service]
+Type=simple
+User=stb
+Group=stb
+WorkingDirectory=/home/stb/local-relay
+ExecStart=/home/stb/local-relay/relay -c /home/stb/local-relay/config.yaml
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5; do nc -z 127.0.0.1 9050 && exit 0; sleep 1; done; exit 1'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+/home/stb/tor/tor.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
