@@ -226,10 +226,10 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Rate-limit detection — trigger early rotation on 429/503
-	// (NOT 403 — Forbidden is auth-denied, not rate-limited)
-	if (resp.StatusCode == http.StatusTooManyRequests ||
-		resp.StatusCode == http.StatusServiceUnavailable) && p.rotator != nil {
+	// Rate-limit detection — trigger rotation on 429/503
+	// Works independently of request-count rotation
+	if resp.StatusCode == http.StatusTooManyRequests ||
+		resp.StatusCode == http.StatusServiceUnavailable {
 		p.logger.Warn("rate-limit detected, triggering rotation",
 			"status", resp.StatusCode,
 			"url", sanitizeURL(r.URL),
@@ -244,8 +244,6 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			if retryAfter > 30 {
 				retryAfter = 30
 			}
-			// Use timer instead of time.Sleep so context cancellation
-			// (e.g. server shutdown) can interrupt the wait
 			select {
 			case <-time.After(time.Duration(retryAfter) * time.Second):
 			case <-r.Context().Done():
@@ -253,8 +251,11 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		p.rotator.ForceRotate()
-		// Signal anomaly to the backend pool if it supports it
+		// Trigger rotation through rotator if available
+		if p.rotator != nil {
+			p.rotator.ForceRotate()
+		}
+		// Signal anomaly to the backend pool (works without rotator)
 		p.router.ReportAnomaly(-1)
 	}
 
@@ -280,10 +281,6 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 // IP rotation. This covers timeouts, DNS failures, TLS handshake failures,
 // and connection resets — failures that happen before an HTTP response is received.
 func (p *HTTPProxy) triggerRotateOnError(reason, target string, err error) {
-	if p.rotator == nil {
-		return
-	}
-
 	// Check if it's a network-level error (timeout, DNS, conn refused, reset)
 	errStr := err.Error()
 	isNetworkErr := strings.Contains(errStr, "timeout") ||
@@ -301,7 +298,9 @@ func (p *HTTPProxy) triggerRotateOnError(reason, target string, err error) {
 			"target", target,
 			"error_type", fmt.Sprintf("%T", err),
 		)
-		p.rotator.ForceRotate()
+		if p.rotator != nil {
+			p.rotator.ForceRotate()
+		}
 		p.router.ReportAnomaly(-1)
 	}
 }

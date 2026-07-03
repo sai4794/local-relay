@@ -29,7 +29,7 @@ bypass:
     - "api.codebuff.com"
 
 rotation:
-  enabled: true
+  enabled: false    # Disabled — only rotate on 429/network errors
   interval: 10
 
 auth:
