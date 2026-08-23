@@ -164,9 +164,13 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 // relayConn relays bytes between the hijacked client connection and the
 // upstream tunnel until the tunnel closes, then cleans up. If the tunnel
-// terminates very quickly it was almost certainly a dead pooled connection,
-// so we trigger IP rotation: the pool/next dial will pick a fresh slot instead
-// of reusing the dead tunnel.
+// terminates very quickly AND delivered zero bytes back to the client, it
+// was almost certainly a dead pooled connection, so we trigger IP rotation:
+// the pool/next dial will pick a fresh slot instead of reusing the dead tunnel.
+//
+// The zero-byte guard matters: fast-but-legitimate tunnels (health probes,
+// tiny API calls) also close within the window and previously caused
+// needless NEWNYM churn on healthy circuits.
 //
 // We deliberately relay once via stream.Relay rather than attempting an
 // in-band retry. A bidirectional relay necessarily half-closes the client
@@ -178,8 +182,9 @@ func (p *HTTPProxy) relayConn(host string, destConn, clientConn net.Conn) {
 
 	start := time.Now()
 	done := make(chan struct{})
+	var upstreamToClient, clientToUpstream int64
 	go func() {
-		stream.Relay(relayCtx, destConn, clientConn)
+		upstreamToClient, clientToUpstream = stream.Relay(relayCtx, destConn, clientConn)
 		close(done)
 	}()
 
@@ -189,16 +194,26 @@ func (p *HTTPProxy) relayConn(host string, destConn, clientConn net.Conn) {
 
 	select {
 	case <-done:
-		if elapsed := time.Since(start); elapsed < 2*time.Second {
-			p.logger.Warn("short tunnel detected, triggering rotation",
-				"host", host, "duration", elapsed)
-			p.rotateForDeadTunnel()
+		if elapsed := time.Since(start); elapsed < deadTunnelWindow {
+			if upstreamToClient == 0 {
+				p.logger.Warn("dead tunnel detected (no bytes returned), triggering rotation",
+					"host", host, "duration", elapsed, "client_sent", clientToUpstream)
+				p.rotateForDeadTunnel()
+			} else {
+				p.logger.Debug("short tunnel completed with data — no rotation",
+					"host", host, "duration", elapsed,
+					"upstream_to_client", upstreamToClient, "client_to_upstream", clientToUpstream)
+			}
 		}
 	case <-timer.C:
 		// Tunnel lived long enough — the relay keeps running in the background
 		// and cleans itself up via stream.Relay.
 	}
 }
+
+// deadTunnelWindow bounds how long after tunnel start a zero-byte close is
+// still attributed to a dead pooled connection.
+const deadTunnelWindow = 2 * time.Second
 
 func (p *HTTPProxy) rotateForDeadTunnel() {
 	if p.rotator != nil {

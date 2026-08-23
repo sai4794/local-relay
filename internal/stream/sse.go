@@ -52,7 +52,18 @@ func CopyRaw(w io.Writer, body io.ReadCloser) {
 	io.CopyBuffer(w, body, *buf)
 }
 
-func Relay(ctx context.Context, dst io.ReadWriteCloser, src io.ReadWriteCloser) {
+// Relay copies bidirectionally between dst and src until both directions
+// finish (either side closing or ctx cancellation tears down the pair),
+// then closes both connections.
+//
+// It returns the byte counts per direction:
+//
+//	srcToDst: bytes copied from src into dst
+//	dstToSrc: bytes copied from dst into src
+//
+// The counts are safe to read on return (WaitGroup provides the
+// happens-before edge with the copy goroutines).
+func Relay(ctx context.Context, dst io.ReadWriteCloser, src io.ReadWriteCloser) (srcToDst int64, dstToSrc int64) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -64,7 +75,7 @@ func Relay(ctx context.Context, dst io.ReadWriteCloser, src io.ReadWriteCloser) 
 		defer cancel()
 		buf := bufPool.Get().(*[]byte)
 		defer bufPool.Put(buf)
-		io.CopyBuffer(dst, src, *buf)
+		srcToDst, _ = io.CopyBuffer(dst, src, *buf)
 		if tc, ok := dst.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
 		}
@@ -75,7 +86,7 @@ func Relay(ctx context.Context, dst io.ReadWriteCloser, src io.ReadWriteCloser) 
 		defer cancel()
 		buf := bufPool.Get().(*[]byte)
 		defer bufPool.Put(buf)
-		io.CopyBuffer(src, dst, *buf)
+		dstToSrc, _ = io.CopyBuffer(src, dst, *buf)
 		if tc, ok := src.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
 		}
@@ -84,6 +95,7 @@ func Relay(ctx context.Context, dst io.ReadWriteCloser, src io.ReadWriteCloser) 
 	wg.Wait()
 	dst.Close()
 	src.Close()
+	return srcToDst, dstToSrc
 }
 
 func HasSSEContentType(header http.Header) bool {
