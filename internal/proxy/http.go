@@ -510,24 +510,43 @@ func bodyRetryable(streamed bool) bool { return !streamed }
 // isRetryableConnectError classifies failures that occurred before any
 // response headers arrived — safe to replay the request on a new circuit.
 // Client-side cancellations are never retried.
+//
+// String matching is deliberate here: *url.Error does not satisfy the full
+// net.Error interface (no Temporary), so errors.As misses the wrapped
+// transport errors ("timeout awaiting response headers", TLS handshake
+// timeouts, resets) that are precisely the retryable cases.
 func isRetryableConnectError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// Only a CANCELED context means the client walked away. DeadlineExceeded
+	// must NOT be treated as non-retryable: Go's transport wraps its own
+	// dial/TLS/header timeouts in errors whose cause chain includes
+	// context.DeadlineExceeded — those are precisely the cases we retry.
+	if errors.Is(err, context.Canceled) {
 		return false
-	}
-	var ne net.Error
-	if errors.As(err, &ne) { // timeouts, incl. TLS handshake timeout
-		return true
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() { // dial/TLS timeouts expose net.Error properly
+		return true
+	}
 	s := err.Error()
-	return strings.Contains(s, "connection reset") ||
-		strings.Contains(s, "TLS handshake timeout") ||
-		strings.Contains(s, "EOF")
+	for _, marker := range []string{
+		"timeout awaiting response headers",
+		"TLS handshake timeout",
+		"connection reset",
+		"broken pipe",
+		"use of closed connection",
+		"EOF",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // triggerRotateOnError logs connection-level network errors without destroying Tor circuits.
