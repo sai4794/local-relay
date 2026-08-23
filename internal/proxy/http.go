@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -54,7 +56,7 @@ func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *s
 		MaxIdleConnsPerHost:   0,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 300 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 		DisableKeepAlives:     true,
 		ForceAttemptHTTP2:     false,
 	}
@@ -211,9 +213,18 @@ func (p *HTTPProxy) relayConn(host string, destConn, clientConn net.Conn) {
 	}
 }
 
-// deadTunnelWindow bounds how long after tunnel start a zero-byte close is
-// still attributed to a dead pooled connection.
-const deadTunnelWindow = 2 * time.Second
+const (
+	// deadTunnelWindow bounds how long after tunnel start a zero-byte close is
+	// still attributed to a dead pooled connection.
+	deadTunnelWindow = 2 * time.Second
+
+	// responseHeaderTimeout caps waiting for upstream response headers.
+	// It must sit WELL below typical client timeouts (undici ≈250 s) so a
+	// stalled circuit surfaces as a retryable error — triggering the
+	// fresh-circuit retry — before the caller aborts. Healthy Tor TTFT
+	// observed at ≤~30 s; this leaves >4× headroom for slow LLM upstreams.
+	responseHeaderTimeout = 120 * time.Second
+)
 
 func (p *HTTPProxy) rotateForDeadTunnel() {
 	if p.rotator != nil {
@@ -308,27 +319,75 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, p.bodyLimit)
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
-	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
+	// Buffer small bodies so a connect-phase failure (dead circuit, TLS
+	// handshake timeout) can be transparently retried on a fresh slot.
+	// Oversized bodies stream through single-shot via MultiReader without
+	// changing the effective size limit.
+	targetURL := r.URL.String()
+	headerClone := r.Header.Clone()
+	stripForwardHeaders(headerClone)
+	var bodyHead []byte // full body when small enough to replay
+	bodyOverCap := r.Body != nil
+	if r.Body != nil {
+		head, err := io.ReadAll(io.LimitReader(r.Body, maxRetryBodySize+1))
+		if err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if int64(len(head)) <= maxRetryBodySize {
+			bodyHead = head
+			bodyOverCap = false
+		} else {
+			bodyHead = head[:maxRetryBodySize]
+		}
 	}
-	req.Header = r.Header.Clone()
-	req.Header.Del("Proxy-Connection")
-	req.Header.Del("Proxy-Authorization")
-	// Strip client-identifying headers that would leak to upstream
-	req.Header.Del("X-Forwarded-For")
-	req.Header.Del("X-Real-IP")
-	req.Header.Del("Forwarded")
-	req.Header.Del("Via")
-	req.Header.Del("X-Client-IP")
-	req.Header.Del("CF-Connecting-IP")
-	req.Header.Del("True-Client-IP")
 
-	resp, err := p.client.Do(req)
-	if err != nil {
-		p.logger.Error("upstream request failed", "url", sanitizeURL(r.URL), "error", err)
-		p.triggerRotateOnError("upstream-failure", sanitizeURL(r.URL), err)
+	reqBody := func() io.Reader {
+		switch {
+		case r.Body == nil:
+			return nil
+		case bodyOverCap: // replay buffered prefix, then live-stream the rest
+			return io.MultiReader(bytes.NewReader(bodyHead), r.Body)
+		default:
+			return bytes.NewReader(bodyHead)
+		}
+	}
+
+	var resp *http.Response
+	var lastErr error
+	for attempt := 1; attempt <= maxUpstreamAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, reqBody())
+		if err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		req.Header = headerClone
+
+		resp, lastErr = p.client.Do(req)
+		if lastErr == nil || !bodyRetryable(bodyOverCap) ||
+			attempt == maxUpstreamAttempts || !isRetryableConnectError(lastErr) ||
+			r.Context().Err() != nil {
+			break
+		}
+
+		p.logger.Warn("upstream connect-phase failure, retrying on fresh circuit",
+			"url", sanitizeURL(r.URL),
+			"attempt", attempt,
+			"max_attempts", maxUpstreamAttempts,
+			"error", lastErr,
+		)
+		// Mark the serving instance so rotation/next dial picks a healthy one.
+		p.router.ReportAnomaly(-1)
+
+		select {
+		case <-time.After(retryDelay):
+		case <-r.Context().Done():
+		}
+	}
+
+	if lastErr != nil {
+		p.logger.Error("upstream request failed", "url", sanitizeURL(r.URL), "error", lastErr)
+		p.triggerRotateOnError("upstream-failure", sanitizeURL(r.URL), lastErr)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -411,6 +470,64 @@ func stripHopByHopHeaders(h http.Header) {
 	for _, name := range hopByHopHeaders {
 		h.Del(name)
 	}
+}
+
+// stripForwardHeaders removes hop-by-hop headers plus client-identifying
+// headers that would leak the caller's identity to the upstream.
+func stripForwardHeaders(h http.Header) {
+	stripHopByHopHeaders(h)
+	for _, name := range []string{
+		"Proxy-Connection",
+		"Proxy-Authorization",
+		"X-Forwarded-For",
+		"X-Real-IP",
+		"Forwarded",
+		"Via",
+		"X-Client-IP",
+		"CF-Connecting-IP",
+		"True-Client-IP",
+	} {
+		h.Del(name)
+	}
+}
+
+const (
+	// maxUpstreamAttempts bounds transparent retries for connect-phase
+	// failures (dead circuit, TLS handshake timeout, reset). Each attempt
+	// re-dials; ReportAnomaly steers subsequent dials away from the sick one.
+	maxUpstreamAttempts = 3
+	// retryDelay pauses between upstream attempts so Tor has a beat to
+	// switch circuits.
+	retryDelay = 200 * time.Millisecond
+	// maxRetryBodySize caps how much of a request body is buffered for
+	// replay across attempts. Larger bodies stream single-shot.
+	maxRetryBodySize = 8 << 20 // 8 MB
+)
+
+// bodyRetryable reports whether the buffered body allows another attempt.
+func bodyRetryable(streamed bool) bool { return !streamed }
+
+// isRetryableConnectError classifies failures that occurred before any
+// response headers arrived — safe to replay the request on a new circuit.
+// Client-side cancellations are never retried.
+func isRetryableConnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) { // timeouts, incl. TLS handshake timeout
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "TLS handshake timeout") ||
+		strings.Contains(s, "EOF")
 }
 
 // triggerRotateOnError logs connection-level network errors without destroying Tor circuits.
