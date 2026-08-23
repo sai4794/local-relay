@@ -4,17 +4,14 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type Rotator struct {
-	counter   atomic.Uint64
-	interval  atomic.Uint64
-	onRotate  func()
-	logger    *slog.Logger
-	lastTrade atomic.Int64
-	wg        sync.WaitGroup
-	mu        sync.Mutex
+	counter  atomic.Uint64
+	interval atomic.Uint64
+	onRotate func()
+	logger   *slog.Logger
+	wg       sync.WaitGroup
 }
 
 func NewRotator(interval int, onRotate func(), logger *slog.Logger) *Rotator {
@@ -41,7 +38,6 @@ func (r *Rotator) ShouldRotate() bool {
 
 		r.triggerRotation()
 
-		r.lastTrade.Store(time.Now().UnixNano())
 		return true
 	}
 
@@ -64,7 +60,6 @@ func (r *Rotator) SetInterval(interval int) {
 func (r *Rotator) ForceRotate() {
 	r.logger.Info("Forced IP rotation")
 	r.triggerRotation()
-	r.lastTrade.Store(time.Now().UnixNano())
 }
 
 // triggerRotation launches the rotation callback in a goroutine with WaitGroup tracking.

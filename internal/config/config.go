@@ -4,24 +4,22 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
-	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Server    ServerConfig    `yaml:"server"`
-	Backend   BackendConfig   `yaml:"backend"`
-	MultiTor  MultiTorConfig  `yaml:"multi_tor"`
-	Bypass    BypassConfig    `yaml:"bypass"`
-	Rotation  RotationConfig  `yaml:"rotation"`
-	Auth      AuthConfig      `yaml:"auth"`
-	Security  SecurityConfig  `yaml:"security"`
-	Logging   LoggingConfig   `yaml:"logging"`
-	Health    HealthConfig    `yaml:"health"`
-	Metrics   MetricsConfig   `yaml:"metrics"`
+	Server   ServerConfig   `yaml:"server"`
+	Backend  BackendConfig  `yaml:"backend"`
+	MultiTor MultiTorConfig `yaml:"multi_tor"`
+	Bypass   BypassConfig   `yaml:"bypass"`
+	Rotation RotationConfig `yaml:"rotation"`
+	Auth     AuthConfig     `yaml:"auth"`
+	Security SecurityConfig `yaml:"security"`
+	Logging  LoggingConfig  `yaml:"logging"`
+	Health   HealthConfig   `yaml:"health"`
+	Metrics  MetricsConfig  `yaml:"metrics"`
 }
 
 type ServerConfig struct {
@@ -30,22 +28,24 @@ type ServerConfig struct {
 }
 
 type BackendConfig struct {
-	Type           string            `yaml:"type"`
-	Address        string            `yaml:"address"`
-	Options        map[string]string `yaml:"options"`
-	CircuitCount   int               `yaml:"circuit_count"`
-	MaxCircuitAge  int               `yaml:"max_circuit_age"`
+	Type          string            `yaml:"type"`
+	Address       string            `yaml:"address"`
+	ControlAddr   string            `yaml:"control_addr"`
+	ControlCookie string            `yaml:"control_cookie_path"`
+	Options       map[string]string `yaml:"options"`
+	CircuitCount  int               `yaml:"circuit_count"`
+	MaxCircuitAge int               `yaml:"max_circuit_age"`
 }
 
 // MultiTorConfig configures multiple Tor daemon instances.
 type MultiTorConfig struct {
-	Enabled       bool   `yaml:"enabled"`
-	Binary        string `yaml:"binary"`
-	DataDir       string `yaml:"data_dir"`
-	BasePort      int    `yaml:"base_port"`
-	ControlBase   int    `yaml:"control_base"`
-	MaxInstances  int    `yaml:"max_instances"`
-	RotateAfter   int    `yaml:"rotate_after"`
+	Enabled      bool   `yaml:"enabled"`
+	Binary       string `yaml:"binary"`
+	DataDir      string `yaml:"data_dir"`
+	BasePort     int    `yaml:"base_port"`
+	ControlBase  int    `yaml:"control_base"`
+	MaxInstances int    `yaml:"max_instances"`
+	RotateAfter  int    `yaml:"rotate_after"`
 }
 
 type BypassConfig struct {
@@ -66,6 +66,8 @@ type AuthConfig struct {
 type SecurityConfig struct {
 	BlockedNetworks []string `yaml:"blocked_networks"`
 	MaxBodySize     int64    `yaml:"max_body_size"`
+	RateLimit       int      `yaml:"rate_limit"` // requests/sec per destination host
+	RateBurst       int      `yaml:"rate_burst"`
 }
 
 type LoggingConfig struct {
@@ -82,61 +84,7 @@ type HealthConfig struct {
 type MetricsConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
-}
-
-var defaultConfig = &Config{
-	Server: ServerConfig{
-		HTTP:   "127.0.0.1:18080",
-		SOCKS5: "127.0.0.1:11080",
-	},
-	Backend: BackendConfig{
-		Type:           "tor",
-		Address:        "127.0.0.1:9050",
-		CircuitCount:   3,
-		MaxCircuitAge:  50,
-	},
-	MultiTor: MultiTorConfig{
-		Enabled:      false,
-		Binary:       "tor",
-		DataDir:      "/tmp/local-relay-tor",
-		BasePort:     9050,
-		ControlBase:  9051,
-		MaxInstances: 3,
-		RotateAfter:  50,
-	},
-	Rotation: RotationConfig{
-		Enabled:  true,
-		Interval: 10,
-	},
-	Auth: AuthConfig{
-		Enabled: false,
-		APIKey:  "",
-	},
-	Security: SecurityConfig{
-		BlockedNetworks: []string{
-			"127.0.0.0/8",
-			"10.0.0.0/8",
-			"172.16.0.0/12",
-			"192.168.0.0/16",
-			"169.254.0.0/16",
-			"::1/128",
-			"fc00::/7",
-			"fe80::/10",
-		},
-		MaxBodySize:    32 << 20, // 32MB
-	},
-	Logging: LoggingConfig{
-		Level:  "info",
-		Format: "json",
-	},
-	Health: HealthConfig{
-		Enabled: true,
-		Address: "127.0.0.1:18888",
-	},
-	Metrics: MetricsConfig{
-		Enabled: false,
-		Path:    "/_/metrics",
-	},
+	Address string `yaml:"address"`
 }
 
 func Load(path string) (*Config, error) {
@@ -162,138 +110,6 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
-}
-
-func loadDefaults(cfg *Config) error {
-	data, err := yaml.Marshal(defaultConfig)
-	if err != nil {
-		return err
-	}
-	return yaml.Unmarshal(data, cfg)
-}
-
-func applyEnvOverrides(cfg *Config) {
-	if v := os.Getenv("PROXY_HTTP"); v != "" {
-		cfg.Server.HTTP = v
-	}
-	if v := os.Getenv("PROXY_SOCKS5"); v != "" {
-		cfg.Server.SOCKS5 = v
-	}
-	if v := os.Getenv("PROXY_BACKEND_ADDR"); v != "" {
-		cfg.Backend.Address = v
-	}
-	if v := os.Getenv("PROXY_AUTH_KEY"); v != "" {
-		cfg.Auth.APIKey = v
-		cfg.Auth.Enabled = true
-	}
-	if v := os.Getenv("PROXY_LOG_LEVEL"); v != "" {
-		cfg.Logging.Level = v
-	}
-	if v := os.Getenv("PROXY_HEALTH_ADDR"); v != "" {
-		cfg.Health.Address = v
-	}
-	if v := os.Getenv("TOR_BINARY"); v != "" {
-		cfg.MultiTor.Binary = v
-	}
-}
-
-func Validate(cfg *Config) error {
-	validBackendTypes := map[string]bool{"tor": true, "socks5": true, "http": true}
-	if !validBackendTypes[cfg.Backend.Type] {
-		return fmt.Errorf("backend.type must be one of: tor, socks5, http")
-	}
-
-	if err := validateAddress(cfg.Server.HTTP, "server.http"); err != nil {
-		return err
-	}
-	if err := validateAddress(cfg.Server.SOCKS5, "server.socks5"); err != nil {
-		return err
-	}
-
-	// Validate backend address (not needed for multi-tor mode)
-	if !cfg.MultiTor.Enabled {
-		if err := validateAddress(cfg.Backend.Address, "backend.address"); err != nil {
-			return err
-		}
-		if cfg.Server.HTTP == cfg.Backend.Address {
-			return fmt.Errorf("server.http and backend.address cannot be the same")
-		}
-		if cfg.Server.SOCKS5 == cfg.Backend.Address {
-			return fmt.Errorf("server.socks5 and backend.address cannot be the same")
-		}
-	}
-
-	if cfg.Server.HTTP == cfg.Server.SOCKS5 {
-		return fmt.Errorf("server.http and server.socks5 cannot use the same address")
-	}
-
-	// Validate multi-tor config
-	if cfg.MultiTor.Enabled {
-		if cfg.MultiTor.Binary == "" {
-			return fmt.Errorf("multi_tor.binary must not be empty")
-		}
-		if cfg.MultiTor.MaxInstances < 1 {
-			return fmt.Errorf("multi_tor.max_instances must be >= 1")
-		}
-		if _, err := exec.LookPath(cfg.MultiTor.Binary); err != nil {
-			return fmt.Errorf("multi_tor.binary not found in PATH: %w", err)
-		}
-	}
-
-	// Validate circuit pool config
-	if cfg.Backend.CircuitCount < 1 {
-		return fmt.Errorf("backend.circuit_count must be >= 1")
-	}
-	if cfg.Backend.MaxCircuitAge < 1 {
-		return fmt.Errorf("backend.max_circuit_age must be >= 1")
-	}
-
-	if cfg.Health.Enabled {
-		if err := validateAddress(cfg.Health.Address, "health.address"); err != nil {
-			return err
-		}
-	}
-
-	if cfg.Rotation.Enabled && cfg.Rotation.Interval < 1 {
-		return fmt.Errorf("rotation.interval must be >= 1")
-	}
-
-	if cfg.Auth.Enabled && len(cfg.Auth.APIKey) < 16 {
-		return fmt.Errorf("auth.api_key must be at least 16 characters")
-	}
-
-	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
-	if !validLevels[cfg.Logging.Level] {
-		return fmt.Errorf("logging.level must be one of: debug, info, warn, error")
-	}
-
-	validFormats := map[string]bool{"json": true, "text": true}
-	if !validFormats[cfg.Logging.Format] {
-		return fmt.Errorf("logging.format must be one of: json, text")
-	}
-
-	// Validate blocked networks
-	for _, cidr := range cfg.Security.BlockedNetworks {
-		if _, _, err := net.ParseCIDR(cidr); err != nil {
-			return fmt.Errorf("security.blocked_networks: invalid CIDR %q: %w", cidr, err)
-		}
-	}
-
-	return nil
-}
-
-func validateAddress(addr, field string) error {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("%s: invalid address format: %w", field, err)
-	}
-	if host == "" {
-		return fmt.Errorf("%s: host cannot be empty", field)
-	}
-	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-		return fmt.Errorf("%s: invalid port: %s", field, port)
-	}
-	return nil
 }
 
 func (c *Config) IsTor() bool {

@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +37,7 @@ type HTTPProxy struct {
 	transport *http.Transport
 	client    *http.Client
 	server    *http.Server
+	usePool   bool
 }
 
 func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *security.Firewall, rotator *rotate.Rotator, logger *slog.Logger, disableKeepAlive bool, ssrf *security.SSRFBlocker, bodyLimit int64) *HTTPProxy {
@@ -53,8 +53,8 @@ func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *s
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   0,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:  10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 300 * time.Second,
 		DisableKeepAlives:     true,
 		ForceAttemptHTTP2:     false,
 	}
@@ -68,14 +68,26 @@ func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *s
 		bodyLimit: bodyLimit,
 		logger:    logger,
 		transport: transport,
+		usePool:   disableKeepAlive,
 		client: &http.Client{
 			Transport: transport,
-			Timeout:   60 * time.Second,
+			Timeout:   0, // Uncapped: allows long LLM reasoning chains and 100k+ token streams
 		},
 	}
 }
 
 func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/health" || r.URL.Path == "/healthz" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		mode := "multi_tor"
+		if p.usePool {
+			mode = "circuit_pool"
+		}
+		fmt.Fprintf(w, `{"status":"ok","mode":"%s"}`, mode)
+		return
+	}
+
 	if p.auth != nil && !p.auth.Check(w, r) {
 		return
 	}
@@ -114,11 +126,9 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	start := time.Now()
 	destConn, err := p.router.DialContext(r.Context(), "tcp", host)
 	if err != nil {
 		p.logger.Error("failed to dial upstream", "host", host, "error", err)
-		// Fix 4: CONNECT dial failure triggers rotation
 		p.triggerRotateOnError("connect-dial-failure", host, err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
@@ -149,57 +159,117 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		"upstream", host,
 	)
 
-	// Track short tunnels as potential errors
-	// Add overall timeout to prevent goroutine leak on stalled connections
-	relayTimeout := 30 * time.Minute
-	relayCtx, relayCancel := context.WithTimeout(r.Context(), relayTimeout)
+	p.relayConn(host, destConn, clientConn)
+}
+
+// relayConn relays bytes between the hijacked client connection and the
+// upstream tunnel until the tunnel closes, then cleans up. If the tunnel
+// terminates very quickly it was almost certainly a dead pooled connection,
+// so we trigger IP rotation: the pool/next dial will pick a fresh slot instead
+// of reusing the dead tunnel.
+//
+// We deliberately relay once via stream.Relay rather than attempting an
+// in-band retry. A bidirectional relay necessarily half-closes the client
+// socket the instant the dead upstream is detected (sending FIN to the
+// client), so the client connection cannot be safely reused for a retry.
+func (p *HTTPProxy) relayConn(host string, destConn, clientConn net.Conn) {
+	relayCtx, relayCancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer relayCancel()
 
+	start := time.Now()
 	done := make(chan struct{})
 	go func() {
 		stream.Relay(relayCtx, destConn, clientConn)
 		close(done)
 	}()
 
-	// If the tunnel closes very quickly (< 2s), it likely means an error response
-	// was received inside the tunnel that the client didn't handle.
+	// A tunnel that closes within 2s likely hit a dead pooled connection.
 	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+
 	select {
 	case <-done:
-		timer.Stop()
-		if time.Since(start) < 2*time.Second {
-			p.logger.Warn("short tunnel detected, triggering rotation", "host", host, "duration", time.Since(start))
-			if p.rotator != nil {
-				p.rotator.ForceRotate()
-			}
-			p.router.ReportAnomaly(-1)
+		if elapsed := time.Since(start); elapsed < 2*time.Second {
+			p.logger.Warn("short tunnel detected, triggering rotation",
+				"host", host, "duration", elapsed)
+			p.rotateForDeadTunnel()
 		}
 	case <-timer.C:
-		// Tunnel lived long enough — no action needed
+		// Tunnel lived long enough — the relay keeps running in the background
+		// and cleans itself up via stream.Relay.
 	}
+}
+
+func (p *HTTPProxy) rotateForDeadTunnel() {
+	if p.rotator != nil {
+		p.rotator.ForceRotate()
+	}
+	p.router.ReportAnomaly(-1)
 }
 
 func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	p.recordRotation()
+
+	hasTargetHeader := false
+	if r.URL.Host == "" {
+		targetHeader := r.Header.Get("x-target-url")
+		if targetHeader == "" {
+			targetHeader = r.Header.Get("x-relay-target")
+		}
+		relayPath := r.Header.Get("x-relay-path")
+		if targetHeader != "" {
+			hasTargetHeader = true
+			parsed, err := url.Parse(targetHeader)
+			if err != nil {
+				http.Error(w, "invalid target URL", http.StatusBadRequest)
+				return
+			}
+			// SSRF validation BEFORE rewrite - block private/internal IPs in target header
+			if p.ssrf != nil && p.ssrf.IsBlocked(parsed.Host) {
+				p.logger.Warn("blocked x-target-url to private/internal IP", "host", parsed.Host)
+				http.Error(w, "request blocked", http.StatusForbidden)
+				return
+			}
+			if relayPath != "" {
+				pathParsed, pathErr := url.Parse(relayPath)
+				if pathErr == nil {
+					parsed.Path = pathParsed.Path
+					parsed.RawQuery = pathParsed.RawQuery
+				}
+				r.URL = parsed
+			} else {
+				r.URL = parsed.ResolveReference(r.URL)
+			}
+		} else if r.Host != "" {
+			r.URL.Scheme = "http"
+			r.URL.Host = r.Host
+		}
+	}
+
+	r.Header.Del("x-target-url")
+	r.Header.Del("x-relay-target")
+	r.Header.Del("x-relay-path")
 
 	if r.URL.Host == "" {
 		http.Error(w, "missing host", http.StatusBadRequest)
 		return
 	}
 
-	// Check bypass hosts FIRST — bypass hosts skip SSRF checks
+	// Bypass hosts skip SSRF checks ONLY for direct non-header-rewritten loopback requests
 	isBypass := false
-	hostOnly := r.URL.Hostname()
-	if hostOnly == "localhost" || hostOnly == "127.0.0.1" {
-		isBypass = true
+	if !hasTargetHeader {
+		hostOnly := r.URL.Hostname()
+		if hostOnly == "localhost" || hostOnly == "127.0.0.1" {
+			isBypass = true
+		}
 	}
 
 	// SSRF protection — check scheme from raw request URI
 	if !isBypass && p.ssrf != nil {
 		uri := r.RequestURI
-		for _, scheme := range []string{"file://", "gopher://", "javascript:", "data:"} {
-			if len(uri) >= len(scheme) && uri[:len(scheme)] == scheme {
-				p.logger.Warn("blocked request with disallowed scheme", "scheme", scheme)
+		if idx := strings.Index(uri, ":"); idx > 0 {
+			if p.ssrf.IsSchemeBlocked(uri[:idx]) {
+				p.logger.Warn("blocked request with disallowed scheme", "scheme", uri[:idx])
 				http.Error(w, "scheme not allowed", http.StatusForbidden)
 				return
 			}
@@ -216,6 +286,11 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		p.logger.Warn("blocked request to private/internal IP", "host", r.URL.Host)
 		http.Error(w, "request blocked", http.StatusForbidden)
 		return
+	}
+
+	// Enforce the configured request body limit (if set).
+	if p.bodyLimit > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, p.bodyLimit)
 	}
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
@@ -238,118 +313,129 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := p.client.Do(req)
 	if err != nil {
 		p.logger.Error("upstream request failed", "url", sanitizeURL(r.URL), "error", err)
-		// Fix 2: Connection-level errors (timeout, DNS, TLS, reset) trigger rotation
 		p.triggerRotateOnError("upstream-failure", sanitizeURL(r.URL), err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Rate-limit detection — trigger rotation on 429/503
-	// Works independently of request-count rotation
-	if resp.StatusCode == http.StatusTooManyRequests ||
-		resp.StatusCode == http.StatusServiceUnavailable {
-		p.logger.Warn("rate-limit detected, triggering rotation",
-			"status", resp.StatusCode,
-			"url", sanitizeURL(r.URL),
-		)
-
-		// Parse Retry-After header to respect server backoff
-		retryAfter := parseRetryAfter(resp)
-		if retryAfter > 0 {
-			p.logger.Warn("Retry-After header present, delaying rotation",
-				"seconds", retryAfter,
-			)
-			if retryAfter > 30 {
-				retryAfter = 30
-			}
-			select {
-			case <-time.After(time.Duration(retryAfter) * time.Second):
-			case <-r.Context().Done():
-				return
-			}
-		}
-
-		// Trigger rotation through rotator if available
-		if p.rotator != nil {
-			p.rotator.ForceRotate()
-		}
-		// Signal anomaly to the backend pool (works without rotator)
-		p.router.ReportAnomaly(-1)
-	}
-
 	contentType := resp.Header.Get("Content-Type")
 	isSSE := strings.Contains(contentType, "text/event-stream")
 
-	if isSSE {
-		stream.CopySSE(w, resp.Body, resp.StatusCode)
-	} else {
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		bufPtr, ok := copyBufPool.Get().(*[]byte)
-		if !ok {
-			buf := make([]byte, 32*1024)
-			bufPtr = &buf
-		}
-		defer copyBufPool.Put(bufPtr)
-		io.CopyBuffer(w, resp.Body, *bufPtr)
-	}
-}
-
-// triggerRotateOnError detects connection-level network errors and triggers
-// IP rotation. This covers timeouts, DNS failures, TLS handshake failures,
-// and connection resets — failures that happen before an HTTP response is received.
-func (p *HTTPProxy) triggerRotateOnError(reason, target string, err error) {
-	// Check if it's a network-level error (timeout, DNS, conn refused, reset)
-	errStr := err.Error()
-	isNetworkErr := strings.Contains(errStr, "timeout") ||
-		strings.Contains(errStr, "no such host") ||
-		strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "connection reset") ||
-		strings.Contains(errStr, "TLS handshake") ||
-		strings.Contains(errStr, "certificate") ||
-		strings.Contains(errStr, "i/o timeout") ||
-		strings.Contains(errStr, "deadline exceeded")
-
-	if isNetworkErr {
-		p.logger.Warn("connection error detected, triggering rotation",
-			"reason", reason,
-			"target", target,
-			"error_type", fmt.Sprintf("%T", err),
+	// Rate-limit detection — trigger instant circuit rotation on 429/503
+	// BUT skip for SSE streams: rotating the circuit mid-stream would interrupt the upstream connection
+	if !isSSE && (resp.StatusCode == http.StatusTooManyRequests ||
+		resp.StatusCode == http.StatusServiceUnavailable) {
+		p.logger.Warn("rate-limit detected, triggering instant circuit rotation",
+			"status", resp.StatusCode,
+			"url", sanitizeURL(r.URL),
 		)
-		if p.rotator != nil {
-			p.rotator.ForceRotate()
-		}
 		p.router.ReportAnomaly(-1)
 	}
+
+	p.forwardResponse(w, resp, isSSE)
 }
 
-// parseRetryAfter extracts the Retry-After value from an HTTP response.
-// Returns 0 if the header is missing or unparseable.
-func parseRetryAfter(resp *http.Response) int {
-	header := resp.Header.Get("Retry-After")
-	if header == "" {
-		return 0
-	}
-
-	// Try seconds format first
-	if seconds, err := strconv.Atoi(header); err == nil && seconds > 0 {
-		return seconds
-	}
-
-	// Try HTTP-date format
-	if t, err := http.ParseTime(header); err == nil {
-		delay := int(time.Until(t).Seconds())
-		if delay > 0 {
-			return delay
+// forwardResponse relays an upstream response to the client.
+//
+//   - Hop-by-hop headers are stripped from the forwarded header block
+//     (RFC 9110 §7.6.1) — they describe the upstream hop, not this one.
+//   - SSE responses are flushed after every read so LLM token streams
+//     reach the client immediately instead of being buffered by net/http.
+//   - Everything else is copied through with a pooled buffer.
+func (p *HTTPProxy) forwardResponse(w http.ResponseWriter, resp *http.Response, isSSE bool) {
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
 		}
 	}
+	stripHopByHopHeaders(w.Header())
 
-	return 0
+	w.WriteHeader(resp.StatusCode)
+
+	bufPtr := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	if !isSSE {
+		io.CopyBuffer(w, resp.Body, buf)
+		return
+	}
+
+	flusher, canFlush := w.(http.Flusher)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if _, wErr := w.Write(buf[:n]); wErr != nil {
+				return
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// hopByHopHeaders must not be forwarded across a single proxy hop.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func stripHopByHopHeaders(h http.Header) {
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
+}
+
+// triggerRotateOnError logs connection-level network errors without destroying Tor circuits.
+// Tor's internal circuit manager will automatically rebuild failed circuits in the background.
+func (p *HTTPProxy) triggerRotateOnError(reason, target string, err error) {
+	p.logger.Debug("upstream connection error observed",
+		"reason", reason,
+		"target", target,
+		"error_type", fmt.Sprintf("%T", err),
+	)
+}
+
+// sensitiveParams are query parameter names whose values must never appear
+// in logs. Matching is case-insensitive.
+var sensitiveParams = func() map[string]struct{} {
+	names := []string{"api_key", "apikey", "key", "token", "secret",
+		"passwd", "password", "auth", "signature",
+		"access_token", "refresh_token", "client_secret",
+		"bearer", "jwt", "session", "api-key", "x-api-key",
+		"authorization", "private_key", "code", "state"}
+	m := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		m[strings.ToLower(n)] = struct{}{}
+	}
+	return m
+}()
+
+// sanitizeURL strips sensitive query parameters from URLs before logging.
+func sanitizeURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	q := u.Query()
+	for key := range q {
+		if _, bad := sensitiveParams[strings.ToLower(key)]; bad {
+			q.Set(key, "***")
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func (p *HTTPProxy) Start(addr string) error {
@@ -384,31 +470,4 @@ func (p *HTTPProxy) recordRotation() {
 	if p.rotator != nil && p.rotator.ShouldRotate() {
 		p.logger.Info("IP rotation triggered by request count")
 	}
-}
-
-// sanitizeURL strips sensitive query parameters from URLs before logging.
-// Case-insensitive matching against a list of sensitive parameter names.
-func sanitizeURL(u *url.URL) string {
-	if u == nil {
-		return ""
-	}
-	q := u.Query()
-	sensitive := []string{"api_key", "apikey", "key", "token", "secret",
-		"passwd", "password", "auth", "signature",
-		"access_token", "refresh_token", "client_secret",
-		"bearer", "jwt", "session", "api-key", "x-api-key",
-		"authorization", "private_key", "code", "state"}
-	// Build lowercased set for case-insensitive matching
-	sensLower := make(map[string]bool, len(sensitive))
-	for _, p := range sensitive {
-		sensLower[strings.ToLower(p)] = true
-	}
-	// Iterate over all query keys (preserves original keys)
-	for key := range q {
-		if sensLower[strings.ToLower(key)] {
-			q.Set(key, "***")
-		}
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
 }

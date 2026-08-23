@@ -1,13 +1,16 @@
 package security
 
 import (
+	"context"
 	"net"
 	"strings"
+	"time"
 )
 
 // SSRFBlocker blocks requests to private/internal IP ranges.
 type SSRFBlocker struct {
 	blockedNets []*net.IPNet
+	resolver    *resolver
 }
 
 // NewSSRFBlocker creates a blocker from CIDR strings.
@@ -20,12 +23,16 @@ func NewSSRFBlocker(cidrs []string) *SSRFBlocker {
 		}
 		blocked = append(blocked, ipNet)
 	}
-	return &SSRFBlocker{blockedNets: blocked}
+	return &SSRFBlocker{
+		blockedNets: blocked,
+		resolver:    newResolver(),
+	}
 }
 
 // IsBlocked checks if a host resolves to a blocked network.
 // For domain names, it resolves and checks each IP.
 // For IP addresses, it checks directly.
+// Results are cached to avoid blocking DNS on every request.
 func (s *SSRFBlocker) IsBlocked(host string) bool {
 	if s == nil || len(s.blockedNets) == 0 {
 		return false
@@ -42,13 +49,8 @@ func (s *SSRFBlocker) IsBlocked(host string) bool {
 		return s.isIPBlocked(ip)
 	}
 
-	// Resolve domain
-	ips, err := net.LookupIP(hostname)
-	if err != nil {
-		return false
-	}
-
-	for _, ip := range ips {
+	// Resolve domain with caching
+	for _, ip := range s.resolver.Lookup(hostname) {
 		if s.isIPBlocked(ip) {
 			return true
 		}
@@ -56,7 +58,15 @@ func (s *SSRFBlocker) IsBlocked(host string) bool {
 	return false
 }
 
+// StartCleanup runs a background goroutine that evicts expired DNS cache entries.
+func (s *SSRFBlocker) StartCleanup(ctx context.Context, interval time.Duration) {
+	s.resolver.StartCleanup(ctx, interval)
+}
+
 func (s *SSRFBlocker) isIPBlocked(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
 	for _, blocked := range s.blockedNets {
 		if blocked.Contains(ip) {
 			return true

@@ -70,6 +70,7 @@ func NewHealthServer(addr string, checker HealthChecker, logger *slog.Logger) *H
 
 func (hs *HealthServer) Start() error {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", hs.handleHealth)
 	mux.HandleFunc("/healthz", hs.handleHealth)
 	mux.HandleFunc("/readyz", hs.handleReady)
 	mux.HandleFunc("/metrics", hs.handleMetrics)
@@ -176,7 +177,7 @@ func (hs *HealthServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 							}
 						}
 					}
-					}
+				}
 			}
 		}
 		if rot, ok := info["rotation"]; ok {

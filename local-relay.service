@@ -1,0 +1,20 @@
+[Unit]
+Description=Local Relay Proxy (multi-Tor HTTP/SOCKS5)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stb
+Group=stb
+WorkingDirectory=/home/stb/local-relay
+ExecStart=/home/stb/local-relay/relay -c /home/stb/local-relay/config.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# Light hardening — relay manages tor daemons under $HOME, so no filesystem sandboxing
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

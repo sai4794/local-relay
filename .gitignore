@@ -1,0 +1,15 @@
+# build artifacts
+relay
+local-relay
+*.test
+benchmark/bench/
+
+# local state
+*.log
+*.bak
+
+# graphify working cache
+graphify-out/cache/
+
+# dated graph snapshots
+graphify-out/2????-??-??/

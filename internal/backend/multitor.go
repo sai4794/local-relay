@@ -3,23 +3,25 @@ package backend
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/local-relay/proxy/internal/transport"
 )
 
 // MultiTorBackend manages multiple Tor daemon instances and round-robins
 // connections across them. Each instance runs on a separate SOCKS port,
 // giving a different outbound IP address.
 type MultiTorBackend struct {
-	lifecycle *TorLifecycle
-	dialer    *net.Dialer
-	counter   atomic.Int64
-	mu        sync.RWMutex
-	logf      func(string, ...interface{})
-	OnRotate  func() // called after NEWNYM to clear connection pools
+	lifecycle   *TorLifecycle
+	dialer      *net.Dialer
+	socksClient *transport.SOCKS5Client
+	counter     atomic.Int64
+	mu          sync.RWMutex
+	logf        func(string, ...interface{})
+	OnRotate    func() // called after NEWNYM to clear connection pools
 }
 
 // NewMultiTorBackend creates a backend that routes through multiple Tor instances.
@@ -31,9 +33,10 @@ func NewMultiTorBackend(lifecycle *TorLifecycle, timeout time.Duration, logf fun
 		logf = func(string, ...interface{}) {}
 	}
 	return &MultiTorBackend{
-		lifecycle: lifecycle,
-		dialer:    &net.Dialer{Timeout: timeout},
-		logf:      logf,
+		lifecycle:   lifecycle,
+		dialer:      &net.Dialer{Timeout: timeout},
+		socksClient: transport.NewSOCKS5Client(timeout),
+		logf:        logf,
 	}
 }
 
@@ -51,18 +54,20 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 		return nil, fmt.Errorf("no ready Tor instances")
 	}
 
-	// Round-robin across ready instances
-	idx := int(m.counter.Add(1)-1) % len(ready)
+	// Round-robin across ready instances (mask sign bit to avoid negative index on overflow)
+	idx := int((m.counter.Add(1)-1)&0x7fffffffffffffff) % len(ready)
 	inst := ready[idx]
 
-	conn, err := m.dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort()))
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort())
+	conn, err := m.socksClient.Connect(ctx, socksAddr, addr, "")
 	if err != nil {
 		m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
 		// Try next instance
 		for i := 1; i < len(ready); i++ {
 			nextIdx := (idx + i) % len(ready)
 			inst = ready[nextIdx]
-			conn, err = m.dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort()))
+			socksAddr = fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort())
+			conn, err = m.socksClient.Connect(ctx, socksAddr, addr, "")
 			if err == nil {
 				break
 			}
@@ -73,87 +78,21 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 		}
 	}
 
-	TuneTCP(conn)
-
-	if err := m.socks5Handshake(conn, addr); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("socks5 handshake failed: %w", err)
-	}
-
 	inst.IncRequests()
 
-	// Check if this instance needs rotation
+	// Check if this instance needs rotation (reset counter synchronously to prevent stampedes)
 	if m.lifecycle.rotateAfter > 0 && inst.GetRequests() >= int64(m.lifecycle.rotateAfter) {
-		m.logf("multi-tor: instance %d reached %d requests, rotating circuit", inst.ID, inst.GetRequests())
-		go func() {
-			if err := m.lifecycle.RequestNewCircuit(inst); err != nil {
-				m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
+		inst.ResetRequests()
+
+		m.logf("multi-tor: instance %d reached rotation threshold, rotating circuit", inst.ID)
+		go func(target *TorInstance) {
+			if err := m.lifecycle.RequestNewCircuit(target); err != nil {
+				m.logf("multi-tor: auto-rotate NEWNYM failed for instance %d: %v", target.ID, err)
 			}
-			inst.mu.Lock()
-			inst.Requests = 0
-			inst.mu.Unlock()
-		}()
+		}(inst)
 	}
 
 	return conn, nil
-}
-
-func (m *MultiTorBackend) socks5Handshake(conn net.Conn, targetAddr string) error {
-	var buf [300]byte
-	n := 0
-
-	buf[n], buf[n+1], buf[n+2] = 0x05, 0x01, 0x00
-	n += 3
-
-	if _, err := conn.Write(buf[:n]); err != nil {
-		return err
-	}
-
-	var resp [2]byte
-	if _, err := io.ReadFull(conn, resp[:]); err != nil {
-		return err
-	}
-
-	if resp[0] != 0x05 || resp[1] != 0x00 {
-		return fmt.Errorf("socks5 auth failed: %x", resp)
-	}
-
-	host, portStr, err := net.SplitHostPort(targetAddr)
-	if err != nil {
-		return err
-	}
-
-	port := 0
-	fmt.Sscanf(portStr, "%d", &port)
-
-	n = 0
-	buf[n], buf[n+1], buf[n+2], buf[n+3] = 0x05, 0x01, 0x00, 0x03
-	n += 4
-	hostLen := len(host)
-	if hostLen > 255 {
-		return fmt.Errorf("host too long: %d bytes", hostLen)
-	}
-	buf[n] = byte(hostLen)
-	n++
-	copy(buf[n:], host)
-	n += hostLen
-	buf[n], buf[n+1] = byte(port>>8), byte(port&0xff)
-	n += 2
-
-	if _, err := conn.Write(buf[:n]); err != nil {
-		return err
-	}
-
-	var reply [10]byte
-	if _, err := io.ReadFull(conn, reply[:]); err != nil {
-		return err
-	}
-
-	if reply[1] != 0x00 {
-		return fmt.Errorf("socks5 connect failed: %d", reply[1])
-	}
-
-	return nil
 }
 
 // IsHealthy returns true if at least one Tor instance is ready.
@@ -172,10 +111,10 @@ func (m *MultiTorBackend) Status() map[string]interface{} {
 	statuses := make([]map[string]interface{}, len(instances))
 	for i, inst := range instances {
 		statuses[i] = map[string]interface{}{
-			"id":        inst.ID,
-			"socks":     inst.GetSocksPort(),
-			"ready":     inst.IsReady(),
-			"requests":  inst.GetRequests(),
+			"id":       inst.ID,
+			"socks":    inst.GetSocksPort(),
+			"ready":    inst.IsReady(),
+			"requests": inst.GetRequests(),
 		}
 	}
 	return map[string]interface{}{
@@ -186,21 +125,31 @@ func (m *MultiTorBackend) Status() map[string]interface{} {
 	}
 }
 
-// ReportAnomaly triggers circuit rotation when a 429 or network error occurs.
-// Implements the AnomalyReporter interface so the router can signal anomalies.
+// ReportAnomaly triggers circuit rotation when a 429 or network error occurs on an instance.
+// Only rotates the affected instance to prevent churning healthy circuits.
 func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
-	m.logf("multi-tor: anomaly reported (slot %d), triggering circuit rotation", slotIdx)
-	// Rotate all instances' circuits sequentially to avoid goroutine explosion
-	for _, inst := range m.lifecycle.GetInstances() {
-		if err := m.lifecycle.RequestNewCircuit(inst); err != nil {
-			m.logf("multi-tor: NEWNYM failed for instance %d: %v", inst.ID, err)
-		} else {
-			m.logf("multi-tor: instance %d circuit rotated", inst.ID)
-			inst.mu.Lock()
-			inst.Requests = 0
-			inst.mu.Unlock()
-		}
+	instances := m.lifecycle.GetInstances()
+	if len(instances) == 0 {
+		return
 	}
+
+	var target *TorInstance
+	if slotIdx >= 0 && slotIdx < len(instances) {
+		target = instances[slotIdx]
+	} else {
+		// If slotIdx is unknown (-1), rotate the current round-robin candidate safely
+		idx := int(m.counter.Load()&0x7fffffffffffffff) % len(instances)
+		target = instances[idx]
+	}
+
+	m.logf("multi-tor: anomaly reported (slot %d), triggering circuit rotation on instance %d", slotIdx, target.ID)
+	if err := m.lifecycle.RequestNewCircuit(target); err != nil {
+		m.logf("multi-tor: NEWNYM failed for instance %d: %v", target.ID, err)
+	} else {
+		m.logf("multi-tor: instance %d circuit rotated", target.ID)
+		target.ResetRequests()
+	}
+
 	// Clear connection pool so new connections use new circuits
 	if m.OnRotate != nil {
 		m.OnRotate()

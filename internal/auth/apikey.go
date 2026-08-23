@@ -35,14 +35,19 @@ func (a *APIKeyAuth) Check(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (a *APIKeyAuth) extractKey(r *http.Request) string {
-	if key := r.Header.Get(a.headerName); key != "" {
-		return strings.TrimPrefix(key, "Bearer ")
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		return stripScheme(auth)
 	}
 
+	if key := r.Header.Get(a.headerName); key != "" {
+		return stripScheme(key)
+	}
+
+	// The proxy advertises "Proxy-Authenticate: Basic", so honor
+	// Proxy-Authorization credentials as well. Previously non-Bearer
+	// values were read but silently dropped, making this path unusable.
 	if proxyAuth := r.Header.Get(a.proxyHeader); proxyAuth != "" {
-		if strings.HasPrefix(proxyAuth, "Bearer ") {
-			return strings.TrimPrefix(proxyAuth, "Bearer ")
-		}
+		return stripScheme(proxyAuth)
 	}
 
 	if key := r.URL.Query().Get(a.queryParam); key != "" {
@@ -50,4 +55,15 @@ func (a *APIKeyAuth) extractKey(r *http.Request) string {
 	}
 
 	return ""
+}
+
+// stripScheme removes a leading "Bearer " or "Basic " scheme marker,
+// leaving the raw credential for constant-time comparison.
+func stripScheme(v string) string {
+	for _, scheme := range []string{"Bearer ", "Basic "} {
+		if len(v) > len(scheme) && strings.EqualFold(v[:len(scheme)], scheme) {
+			return v[len(scheme):]
+		}
+	}
+	return v
 }

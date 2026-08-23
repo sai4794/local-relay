@@ -7,16 +7,23 @@ import (
 	"time"
 )
 
+type tokenBucket struct {
+	tokens     float64
+	lastUpdate time.Time
+}
+
+// idleBucketTTL is how long an unused rate-limit bucket survives before
+// eviction by the cleanup loop.
+const idleBucketTTL = 10 * time.Minute
+
 type Firewall struct {
 	blockedRanges []*net.IPNet
 	mu            sync.RWMutex
-	dnsCache      map[string]dnsCacheEntry
-	dnsMu         sync.RWMutex
-}
-
-type dnsCacheEntry struct {
-	ips      []net.IP
-	expires  time.Time
+	resolver      *resolver
+	rateLimit     float64
+	rateBurst     float64
+	limiters      map[string]*tokenBucket
+	limiterMu     sync.Mutex
 }
 
 type FirewallConfig struct {
@@ -27,10 +34,11 @@ type FirewallConfig struct {
 func NewFirewall(cfg FirewallConfig) *Firewall {
 	fw := &Firewall{
 		blockedRanges: getDefaultBlockedRanges(),
-		dnsCache:       make(map[string]dnsCacheEntry),
+		resolver:      newResolver(),
+		rateLimit:     float64(cfg.RateLimit),
+		rateBurst:     float64(cfg.RateBurst),
+		limiters:      make(map[string]*tokenBucket),
 	}
-	_ = cfg.RateLimit
-	_ = cfg.RateBurst
 	return fw
 }
 
@@ -59,16 +67,66 @@ func getDefaultBlockedRanges() []*net.IPNet {
 	return ranges
 }
 
+func (fw *Firewall) allowRateLimit(host string) bool {
+	if fw.rateLimit <= 0 {
+		return true
+	}
+	fw.limiterMu.Lock()
+	defer fw.limiterMu.Unlock()
+
+	now := time.Now()
+	tb, exists := fw.limiters[host]
+	if !exists {
+		burst := fw.rateBurst
+		if burst <= 0 {
+			burst = fw.rateLimit * 2
+		}
+		fw.limiters[host] = &tokenBucket{
+			tokens:     burst - 1,
+			lastUpdate: now,
+		}
+		return true
+	}
+
+	elapsed := now.Sub(tb.lastUpdate).Seconds()
+	tb.lastUpdate = now
+
+	burst := fw.rateBurst
+	if burst <= 0 {
+		burst = fw.rateLimit * 2
+	}
+
+	tb.tokens += elapsed * fw.rateLimit
+	if tb.tokens > burst {
+		tb.tokens = burst
+	}
+
+	if tb.tokens >= 1.0 {
+		tb.tokens -= 1.0
+		return true
+	}
+
+	return false
+}
+
 func (fw *Firewall) AllowHost(host string) bool {
+	if !fw.allowRateLimit(host) {
+		return false
+	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		ips := fw.resolveHost(host)
-		if len(ips) == 0 {
-			return false
-		}
+		ips := fw.resolver.Lookup(host)
+		// If we cannot resolve the host locally, allow it rather than fail-closed.
+		// In the Tor context the destination is resolved by Tor/its exit nodes, so a
+		// local DNS miss (e.g. a restricted resolver) must not make otherwise-routable
+		// domains unreachable. This matches the SSRF blocker, which also allows on
+		// unresolvable hosts. Any IP we CAN see that is private is still blocked below.
 		fw.mu.RLock()
 		defer fw.mu.RUnlock()
 		for _, resolvedIP := range ips {
+			if ip4 := resolvedIP.To4(); ip4 != nil {
+				resolvedIP = ip4
+			}
 			for _, blocked := range fw.blockedRanges {
 				if blocked.Contains(resolvedIP) {
 					return false
@@ -78,6 +136,9 @@ func (fw *Firewall) AllowHost(host string) bool {
 		return true
 	}
 
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
 	fw.mu.RLock()
 	defer fw.mu.RUnlock()
 	for _, blocked := range fw.blockedRanges {
@@ -88,35 +149,12 @@ func (fw *Firewall) AllowHost(host string) bool {
 	return true
 }
 
-// resolveHost returns cached DNS results or performs a fresh lookup.
-// Cache TTL is 5 minutes to balance freshness vs performance.
-func (fw *Firewall) resolveHost(host string) []net.IP {
-	fw.dnsMu.RLock()
-	if entry, ok := fw.dnsCache[host]; ok {
-		if time.Now().Before(entry.expires) {
-			fw.dnsMu.RUnlock()
-			return entry.ips
-		}
-	}
-	fw.dnsMu.RUnlock()
-
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return nil
-	}
-
-	fw.dnsMu.Lock()
-	fw.dnsCache[host] = dnsCacheEntry{
-		ips:     ips,
-		expires: time.Now().Add(5 * time.Minute),
-	}
-	fw.dnsMu.Unlock()
-
-	return ips
-}
-
+// StartCleanup periodically evicts expired DNS entries and idle rate-limit
+// buckets. Without eviction the limiter map grows one bucket per unique
+// destination host for the lifetime of the process.
 func (fw *Firewall) StartCleanup(ctx context.Context, interval time.Duration) {
-	// Periodically clean expired DNS cache entries
+	fw.resolver.StartCleanup(ctx, interval)
+
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -125,24 +163,27 @@ func (fw *Firewall) StartCleanup(ctx context.Context, interval time.Duration) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				fw.cleanupDNSCache()
+				fw.evictIdleLimiters(idleBucketTTL)
 			}
 		}
 	}()
 }
 
-func (fw *Firewall) cleanupDNSCache() {
-	fw.dnsMu.Lock()
-	defer fw.dnsMu.Unlock()
+// Stop halts all background cleanup goroutines.
+func (fw *Firewall) Stop() {
+	fw.resolver.Stop()
+}
+
+func (fw *Firewall) evictIdleLimiters(maxIdle time.Duration) {
+	fw.limiterMu.Lock()
+	defer fw.limiterMu.Unlock()
 	now := time.Now()
-	for host, entry := range fw.dnsCache {
-		if now.After(entry.expires) {
-			delete(fw.dnsCache, host)
+	for host, tb := range fw.limiters {
+		if now.Sub(tb.lastUpdate) > maxIdle {
+			delete(fw.limiters, host)
 		}
 	}
 }
-
-func (fw *Firewall) StopCleanup() {}
 
 func (fw *Firewall) AddBlockedRange(cidr string) error {
 	_, ipNet, err := net.ParseCIDR(cidr)

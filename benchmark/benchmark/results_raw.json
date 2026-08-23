@@ -1,0 +1,75 @@
+[
+  {
+    "Config": {
+      "BaseURL": "http://localhost:20128/v1",
+      "APIKey": "sk-4bbacb838df7c7f2-tqywyx-9fb9e9be",
+      "Model": "oc/deepseek-v4-flash-free(max)",
+      "ProxyURL": "http://127.0.0.1:18080",
+      "Concurrency": 1,
+      "TotalReqs": 3,
+      "Mode": "http_proxy",
+      "TorCount": 3,
+      "Label": "3-tor-http-c1"
+    },
+    "Records": [
+      {
+        "request_id": 0,
+        "timestamp": "2026-07-31T22:01:01.207434921+05:30",
+        "tor_instance": 0,
+        "exit_ip": "185.220.100.254",
+        "http_status": 200,
+        "latency_ms": 2250,
+        "is_429": false,
+        "is_403": false,
+        "is_timeout": false,
+        "is_error": false,
+        "path": "http_proxy"
+      },
+      {
+        "request_id": 1,
+        "timestamp": "2026-07-31T22:01:01.207832392+05:30",
+        "tor_instance": 1,
+        "exit_ip": "185.220.100.254",
+        "http_status": 200,
+        "latency_ms": 2005,
+        "is_429": false,
+        "is_403": false,
+        "is_timeout": false,
+        "is_error": false,
+        "path": "http_proxy"
+      },
+      {
+        "request_id": 2,
+        "timestamp": "2026-07-31T22:01:01.207341851+05:30",
+        "tor_instance": 2,
+        "exit_ip": "185.220.100.254",
+        "http_status": 200,
+        "latency_ms": 1938,
+        "is_429": false,
+        "is_403": false,
+        "is_timeout": false,
+        "is_error": false,
+        "path": "http_proxy"
+      }
+    ],
+    "TotalRequests": 3,
+    "SuccessCount": 3,
+    "Count429": 0,
+    "Count403": 0,
+    "CountTimeout": 0,
+    "CountError": 0,
+    "P50": 2005,
+    "P95": 2250,
+    "P99": 2250,
+    "AvgLatency": 2064.3333333333335,
+    "RPS": 1.3328904564871373,
+    "Duration": 2250747603,
+    "UniqueIPs": [
+      "185.220.100.254"
+    ],
+    "IPCounts": {
+      "185.220.100.254": 3
+    },
+    "IP429Rates": {}
+  }
+]

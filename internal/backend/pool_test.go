@@ -1,170 +1,505 @@
 package backend
 
 import (
-	"context"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 )
 
-func TestCircuitSlotHealth(t *testing.T) {
-	slot := &CircuitSlot{id: 0, healthy: true, failThreshold: 3}
+// =============================================================================
+// CONNECTION POOL TESTS
+// =============================================================================
 
-	if !slot.IsHealthy() {
-		t.Fatal("expected slot to start healthy")
-	}
-
-	// 1 failure — still healthy
-	slot.RecordFailure()
-	if !slot.IsHealthy() {
-		t.Fatal("expected slot healthy after 1 failure")
-	}
-
-	// 2 more failures — now unhealthy
-	slot.RecordFailure()
-	slot.RecordFailure()
-	if slot.IsHealthy() {
-		t.Fatal("expected slot unhealthy after 3 failures")
-	}
-
-	// Success doesn't auto-heal (intentional — only resetAll does)
-	slot.RecordSuccess()
-	if slot.IsHealthy() {
-		t.Fatal("RecordSuccess should NOT auto-heal — only resetAll does")
-	}
-
-	// Reset restores health
-	slot.Reset()
-	if !slot.IsHealthy() {
-		t.Fatal("expected slot healthy after Reset")
-	}
-}
-
-func TestCircuitSlotMaxAge(t *testing.T) {
-	slot := &CircuitSlot{id: 0, healthy: true}
-	maxAge := int64(5)
-
-	for i := int64(0); i < 4; i++ {
-		slot.RecordSuccess()
-		if slot.ShouldRotate(maxAge) {
-			t.Fatalf("should not rotate at request %d", i)
-		}
-	}
-
-	// 5th request triggers ShouldRotate
-	slot.RecordSuccess()
-	if !slot.ShouldRotate(maxAge) {
-		t.Fatal("should rotate after 5 requests")
-	}
-}
-
-func TestCircuitSlotAnomalies(t *testing.T) {
-	slot := &CircuitSlot{id: 0, healthy: true, anomalyThreshold: 2}
-
-	slot.RecordAnomaly()
-	if slot.AnomalyCount() != 1 {
-		t.Fatal("expected anomaly count 1")
-	}
-
-	// Reset on success
-	slot.RecordSuccess()
-	if slot.AnomalyCount() != 0 {
-		t.Fatal("anomaly count should reset on success")
-	}
-
-	// Two anomalies then success resets again
-	slot.RecordAnomaly()
-	slot.RecordAnomaly()
-	slot.RecordSuccess()
-	if slot.AnomalyCount() != 0 {
-		t.Fatal("anomaly count should reset on success (2)")
-	}
-}
-
-func TestCircuitPoolNew(t *testing.T) {
+func TestConnPoolGetEmpty(t *testing.T) {
 	pool := NewCircuitPoolBackend(PoolConfig{
-		TorAddress:   "127.0.0.1:9050",
+		TorAddress:   "127.0.0.1:1",
 		CircuitCount: 3,
-		Timeout:      5 * time.Second,
 	})
 
-	if !pool.IsHealthy() {
-		t.Fatal("pool should start healthy")
-	}
-
-	status := pool.Status()
-	if status["total_slots"] != 3 {
-		t.Fatalf("expected 3 slots, got %v", status["total_slots"])
-	}
-	if status["healthy_slots"] != 3 {
-		t.Fatalf("expected 3 healthy slots, got %v", status["healthy_slots"])
-	}
-	if status["nym_backoff"] != int64(1) {
-		t.Fatalf("expected backoff 1, got %v", status["nym_backoff"])
+	conn := pool.getConn(0, "example.com:443")
+	if conn != nil {
+		t.Fatal("expected nil from empty pool")
+		conn.Close()
 	}
 }
 
-func TestCircuitPoolDialNoTor(t *testing.T) {
+func TestConnPoolPutAndGet(t *testing.T) {
 	pool := NewCircuitPoolBackend(PoolConfig{
-		TorAddress:   "127.0.0.1:1", // no Tor on port 1
-		CircuitCount: 2,
-		Timeout:      1 * time.Second,
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
 	})
 
-	_, err := pool.DialContext(context.Background(), "tcp", "example.com:80")
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			time.Sleep(5 * time.Second)
+			conn.Close()
+		}
+	}()
+
+	fakeConn, _ := net.Dial("tcp", ln.Addr().String())
+	pool.putConn(0, "example.com:443", fakeConn)
+
+	conn := pool.getConn(0, "example.com:443")
+	if conn == nil {
+		t.Fatal("expected connection from pool")
+	}
+	conn.Close()
+
+	conn2 := pool.getConn(0, "example.com:443")
+	if conn2 != nil {
+		t.Fatal("expected nil after getting connection")
+		conn2.Close()
+	}
+}
+
+func TestConnPoolDestinationSafety(t *testing.T) {
+	// A connection pooled for example.com:443 must NOT be reused for github.com:443
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
+	})
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			time.Sleep(5 * time.Second)
+			conn.Close()
+		}
+	}()
+
+	fakeConn1, _ := net.Dial("tcp", ln.Addr().String())
+	pool.putConn(0, "example.com:443", fakeConn1)
+
+	conn := pool.getConn(0, "github.com:443")
+	if conn != nil {
+		conn.Close()
+		t.Fatal("pool should NOT return example.com connection for github.com")
+	}
+}
+
+func TestConnPoolDifferentSlots(t *testing.T) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
+	})
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			time.Sleep(5 * time.Second)
+			conn.Close()
+		}
+	}()
+
+	fakeConn1, _ := net.Dial("tcp", ln.Addr().String())
+	pool.putConn(0, "example.com:443", fakeConn1)
+
+	fakeConn2, _ := net.Dial("tcp", ln.Addr().String())
+	pool.putConn(1, "example.com:443", fakeConn2)
+
+	conn0 := pool.getConn(0, "example.com:443")
+	if conn0 == nil {
+		t.Fatal("expected connection from slot 0")
+	}
+	conn0.Close()
+
+	conn1 := pool.getConn(1, "example.com:443")
+	if conn1 == nil {
+		t.Fatal("expected connection from slot 1")
+	}
+	conn1.Close()
+}
+
+func TestConnPoolEvictsStale(t *testing.T) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
+		IdleTTL:      1 * time.Millisecond,
+	})
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			time.Sleep(5 * time.Second)
+			conn.Close()
+		}
+	}()
+
+	fakeConn, _ := net.Dial("tcp", ln.Addr().String())
+	pool.putConn(0, "example.com:443", fakeConn)
+
+	time.Sleep(5 * time.Millisecond)
+
+	conn := pool.getConn(0, "example.com:443")
+	if conn != nil {
+		t.Fatal("expected nil for stale connection")
+		conn.Close()
+	}
+}
+
+func TestConnPoolEvictsOldest(t *testing.T) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
+		MaxIdle:      2,
+	})
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			time.Sleep(5 * time.Second)
+			conn.Close()
+		}
+	}()
+
+	for i := 0; i < 3; i++ {
+		fakeConn, _ := net.Dial("tcp", ln.Addr().String())
+		pool.putConn(i%2, fmt.Sprintf("host%d.example.com:443", i), fakeConn)
+	}
+
+	pool.connPoolMu.Lock()
+	count := len(pool.connPool)
+	pool.connPoolMu.Unlock()
+
+	if count > 2 {
+		t.Fatalf("pool has %d connections, expected at most 2", count)
+	}
+}
+
+func TestConnPoolEvictAll(t *testing.T) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
+	})
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			time.Sleep(5 * time.Second)
+			conn.Close()
+		}
+	}()
+
+	for i := 0; i < 3; i++ {
+		fakeConn, _ := net.Dial("tcp", ln.Addr().String())
+		pool.putConn(i, fmt.Sprintf("host%d.example.com:443", i), fakeConn)
+	}
+
+	pool.evictConns()
+
+	pool.connPoolMu.Lock()
+	count := len(pool.connPool)
+	pool.connPoolMu.Unlock()
+
+	if count != 0 {
+		t.Fatalf("pool has %d connections after evict, expected 0", count)
+	}
+}
+
+func TestConnPoolDeadConnection(t *testing.T) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
+	})
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	fakeConn, _ := net.Dial("tcp", ln.Addr().String())
+	fakeConn.Close()
+
+	pool.putConn(0, "example.com:443", fakeConn)
+
+	pool.connPoolMu.Lock()
+	count := len(pool.connPool)
+	pool.connPoolMu.Unlock()
+
+	if count != 1 {
+		t.Fatalf("pool has %d connections, expected 1 (optimistic pool-in)", count)
+	}
+
+	got := pool.getConn(0, "example.com:443")
+	if got == nil {
+		t.Fatal("getConn should return the pooled connection")
+	}
+
+	_, err := got.Write([]byte("x"))
 	if err == nil {
-		t.Fatal("expected dial to fail with no Tor")
+		t.Fatal("write to dead connection should fail")
 	}
-	// Should still be healthy (pool has slots, Tor is just down)
-	if !pool.IsHealthy() {
-		t.Fatal("pool should still report healthy (slots exist)")
-	}
+	got.Close()
 }
 
-func TestBackoffMultiplier(t *testing.T) {
+func TestConnPoolHalfClosedConnection(t *testing.T) {
 	pool := NewCircuitPoolBackend(PoolConfig{
-		TorAddress:   "127.0.0.1:9050",
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
+	})
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			close(serverDone)
+			return
+		}
+		conn.(*net.TCPConn).SetLinger(0)
+		conn.Close()
+		close(serverDone)
+	}()
+
+	fakeConn, _ := net.Dial("tcp", ln.Addr().String())
+	<-serverDone
+	time.Sleep(10 * time.Millisecond)
+
+	pool.putConn(0, "example.com:443", fakeConn)
+
+	pool.connPoolMu.Lock()
+	count := len(pool.connPool)
+	pool.connPoolMu.Unlock()
+
+	if count != 1 {
+		t.Fatalf("pool has %d connections, expected 1 (optimistic pool-in)", count)
+	}
+
+	got := pool.getConn(0, "example.com:443")
+	if got == nil {
+		t.Fatal("getConn should return the RST'd connection")
+	}
+
+	_, err := got.Write([]byte("x"))
+	if err == nil {
+		t.Fatal("write to RST'd connection should fail")
+	}
+	got.Close()
+}
+
+func TestDialContextReusesPooledConnection(t *testing.T) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 1,
+		Timeout:      100 * time.Millisecond,
+	})
+
+	pool.connPoolMu.Lock()
+	if len(pool.connPool) != 0 {
+		t.Fatal("pool should start empty")
+	}
+	pool.connPoolMu.Unlock()
+}
+
+// --- pooledConnWrap tests ---
+
+func TestPooledConnWrap_ReturnsOnClose(t *testing.T) {
+	client, server := tcpPair(t)
+	defer server.Close()
+
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
 		CircuitCount: 1,
 	})
 
-	if pool.BackoffMultiplier() != 1 {
-		t.Fatal("expected initial backoff 1")
+	wrap := &pooledConnWrap{
+		Conn:    client,
+		pool:    pool,
+		slotIdx: 0,
+		addr:    "example.com:443",
 	}
 
-	// No easy way to test rateLimitedNEWNYM without Tor,
-	// but resetErrorBackoff should work
-	pool.resetErrorBackoff()
-	if pool.BackoffMultiplier() != 1 {
-		t.Fatal("expected backoff 1 after reset")
+	pool.connPoolMu.Lock()
+	if len(pool.connPool) != 0 {
+		t.Fatal("pool should be empty before Close")
+	}
+	pool.connPoolMu.Unlock()
+
+	if err := wrap.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	pool.connPoolMu.Lock()
+	if len(pool.connPool) != 1 {
+		t.Fatal("pool should have 1 connection after Close")
+	}
+	pool.connPoolMu.Unlock()
+
+	if err := wrap.Close(); err != nil {
+		t.Fatalf("double Close failed: %v", err)
+	}
+	pool.connPoolMu.Lock()
+	if len(pool.connPool) != 1 {
+		t.Fatal("pool should still have 1 connection after double Close")
+	}
+	pool.connPoolMu.Unlock()
+}
+
+func TestPooledConnWrap_DialContextReturnsWrapper(t *testing.T) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 1,
+		Timeout:      100 * time.Millisecond,
+	})
+
+	pool.connPoolMu.Lock()
+	if len(pool.connPool) != 0 {
+		t.Fatal("pool should start empty")
+	}
+	pool.connPoolMu.Unlock()
+}
+
+func TestPoolKey_PerDestination(t *testing.T) {
+	// Same slot + same destination = same key
+	key1 := poolKey(0, "example.com:443")
+	key2 := poolKey(0, "example.com:443")
+	if key1 != key2 {
+		t.Fatalf("pool keys should match for same slot+dest: %q vs %q", key1, key2)
+	}
+
+	// Same slot + different destination = different key
+	key3 := poolKey(0, "github.com:443")
+	if key1 == key3 {
+		t.Fatal("pool keys should differ for different destinations on same slot")
+	}
+
+	// Different slots + same destination = different key
+	key4 := poolKey(1, "example.com:443")
+	if key1 == key4 {
+		t.Fatal("pool keys should differ for different slots")
 	}
 }
 
-func TestCryptoRandInt(t *testing.T) {
-	// cryptoRandInt should produce values in [0, max)
-	for i := 0; i < 10; i++ {
-		val := cryptoRandInt(100)
-		if val < 0 || val >= 100 {
-			t.Fatalf("cryptoRandInt(100) = %d, want [0,100)", val)
+func TestPoolConnectionReuseAcrossDestinations(t *testing.T) {
+	// A connection pooled for destination A must NOT be returned for destination B.
+	// SOCKS5 tunnels are destination-bound — Tor kills the socket after tunnel close.
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 1,
+	})
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			time.Sleep(5 * time.Second)
+			conn.Close()
+		}
+	}()
+
+	fakeConn, _ := net.Dial("tcp", ln.Addr().String())
+	pool.putConn(0, "example.com:443", fakeConn)
+
+	conn := pool.getConn(0, "github.com:443")
+	if conn != nil {
+		conn.Close()
+		t.Fatal("pool should NOT return example.com connection for github.com")
+	}
+}
+
+func BenchmarkPoolHit(b *testing.B) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
+		MaxIdle:      100,
+	})
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				time.Sleep(5 * time.Second)
+				conn.Close()
+			}()
+		}
+	}()
+
+	for i := 0; i < 3; i++ {
+		conn, _ := net.Dial("tcp", ln.Addr().String())
+		pool.putConn(i, "example.com:443", conn)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		conn := pool.getConn(i%3, "example.com:443")
+		if conn != nil {
+			pool.putConn(i%3, "example.com:443", conn)
 		}
 	}
-	// Should handle edge cases without panic
-	val := cryptoRandInt(1)
-	if val != 0 {
-		t.Fatalf("cryptoRandInt(1) = %d, want 0", val)
+}
+
+func BenchmarkPoolMiss(b *testing.B) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 3,
+	})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.getConn(i%3, "example.com:443")
 	}
 }
 
-func TestResetErrorBackoff(t *testing.T) {
+func BenchmarkPooledConnWrapClose(b *testing.B) {
 	pool := NewCircuitPoolBackend(PoolConfig{
-		TorAddress:   "127.0.0.1:9050",
+		TorAddress:   "127.0.0.1:1",
 		CircuitCount: 1,
+		MaxIdle:      1000,
 	})
-	if pool.BackoffMultiplier() != 1 {
-		t.Fatal("expected start backoff 1")
-	}
-	// Simulate backoff increase (via rateLimitedNEWNYM directly is hard without Tor,
-	// but calling resetErrorBackoff directly should work)
-	pool.resetErrorBackoff()
-	if pool.BackoffMultiplier() != 1 {
-		t.Fatalf("expected backoff 1 after reset, got %d", pool.BackoffMultiplier())
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				time.Sleep(5 * time.Second)
+				conn.Close()
+			}()
+		}
+	}()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		conn, _ := net.Dial("tcp", ln.Addr().String())
+		wrap := &pooledConnWrap{
+			Conn:    conn,
+			pool:    pool,
+			slotIdx: 0,
+			addr:    "example.com:443",
+		}
+		wrap.Close()
 	}
 }

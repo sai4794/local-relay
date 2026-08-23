@@ -2,18 +2,17 @@ server:
   http: "127.0.0.1:18080"
   socks5: "127.0.0.1:11080"
 
-# Multi-Tor mode: spawns N Tor daemons for real IP rotation
-# Set multi_tor.enabled: true to use this instead of single Tor
+# Multi-Tor mode: manages 3 isolated Tor instances with per-instance rotation
 multi_tor:
   enabled: true
-  binary: "tor"
-  data_dir: "/tmp/local-relay-tor"
-  base_port: 9150          # Avoid conflict with old Tor (9050/9051)
+  binary: "/home/stb/tor/tor/tor"
+  data_dir: "/home/stb/tor/data_multi"
+  base_port: 9150
   control_base: 9160
   max_instances: 3
-  rotate_after: 50  # Rotate circuit after N requests per instance
+  rotate_after: 200  # Rotate individual instance after 200 requests (was 50)
 
-# Single Tor / circuit pool mode (used when multi_tor.enabled: false)
+# Single Tor / fallback
 backend:
   type: "tor"
   address: "127.0.0.1:9050"
@@ -28,9 +27,10 @@ bypass:
     - "www.codebuff.com"
     - "api.codebuff.com"
 
+# Disable global batch rotation to prevent conflicting churn loops
 rotation:
-  enabled: false    # Disabled — only rotate on 429/network errors
-  interval: 10
+  enabled: false
+  interval: 50
 
 auth:
   enabled: false
@@ -50,12 +50,12 @@ security:
 
 logging:
   level: info
-  format: json
+  format: text
 
 health:
   enabled: true
   address: "127.0.0.1:18888"
 
 metrics:
-  enabled: true
-  path: "/_/metrics"
+  enabled: false
+  path: "/metrics"

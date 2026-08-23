@@ -1,9 +1,7 @@
 package backend
 
 import (
-	"bufio"
 	"context"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -17,15 +15,18 @@ import (
 
 // TorInstance represents a single managed Tor daemon process.
 type TorInstance struct {
-	ID        int
-	SocksPort int
+	ID          int
+	SocksPort   int
 	ControlPort int
-	Cmd       *exec.Cmd
-	DataDir   string
-	Ready     bool
-	StartedAt time.Time
-	Requests  int64
-	mu        sync.RWMutex
+	Cmd         *exec.Cmd
+	DataDir     string
+	Ready       bool
+	StartedAt   time.Time
+	Requests    int64
+	FailCount   int
+	LastRotated time.Time
+	lastHealed  time.Time
+	mu          sync.RWMutex
 }
 
 // GetSocksPort returns the SOCKS port (thread-safe).
@@ -35,11 +36,19 @@ func (i *TorInstance) GetSocksPort() int {
 	return i.SocksPort
 }
 
-// IsReady returns readiness status (thread-safe).
+// IsReady returns readiness status (thread-safe and checks process liveness).
 func (i *TorInstance) IsReady() bool {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
-	return i.Ready
+	if !i.Ready {
+		return false
+	}
+	if i.Cmd != nil && i.Cmd.Process != nil {
+		if err := i.Cmd.Process.Signal(syscall.Signal(0)); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // SetReady sets readiness status (thread-safe).
@@ -61,6 +70,61 @@ func (i *TorInstance) GetRequests() int64 {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return i.Requests
+}
+
+// ResetRequests zeroes the request counter (thread-safe). Used after a
+// rotation so the next rotation window starts from zero.
+func (i *TorInstance) ResetRequests() {
+	i.mu.Lock()
+	i.Requests = 0
+	i.mu.Unlock()
+}
+
+// GetFailCount returns consecutive fail count (thread-safe).
+func (i *TorInstance) GetFailCount() int {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.FailCount
+}
+
+// IncFailCount increments fail counter (thread-safe).
+func (i *TorInstance) IncFailCount() int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.FailCount++
+	return i.FailCount
+}
+
+// ResetFailCount resets fail counter to 0 (thread-safe).
+func (i *TorInstance) ResetFailCount() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.FailCount = 0
+}
+
+// SetLastRotated sets the rotation timestamp (thread-safe).
+func (i *TorInstance) SetLastRotated(t time.Time) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.LastRotated = t
+}
+
+// GetLastRotated gets the rotation timestamp (thread-safe).
+func (i *TorInstance) GetLastRotated() time.Time {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.LastRotated
+}
+
+// TryStartHeal checks if auto-heal can run (enforcing a 2-minute cooldown).
+func (i *TorInstance) TryStartHeal() bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if time.Since(i.lastHealed) < 2*time.Minute {
+		return false
+	}
+	i.lastHealed = time.Now()
+	return true
 }
 
 // TorLifecycle manages the lifecycle of multiple Tor daemon processes.
@@ -106,22 +170,39 @@ func NewTorLifecycle(cfg TorLifecycleConfig) *TorLifecycle {
 	}
 }
 
-// Start launches all Tor instances and waits for bootstrap.
+// Start launches all Tor instances in parallel and waits for bootstrap.
 func (tl *TorLifecycle) Start(ctx context.Context) error {
 	if err := os.MkdirAll(tl.dataDir, 0700); err != nil {
 		return fmt.Errorf("create tor data dir: %w", err)
 	}
 
-	tl.logf("Starting %d Tor instance(s)...", tl.maxInstances)
+	tl.logf("Starting %d Tor instance(s) in parallel...", tl.maxInstances)
 
-	for i := 0; i < tl.maxInstances; i++ {
-		inst, err := tl.spawnInstance()
-		if err != nil {
-			tl.logf("Failed to spawn Tor instance %d: %v", i, err)
-			tl.ShutdownAll()
-			return fmt.Errorf("spawn tor instance %d: %w", i, err)
-		}
-		tl.logf("Tor instance %d started on SOCKS port %d", inst.ID, inst.SocksPort)
+	// Spawn all instances in parallel, each bound to a stable, unique slot.
+	// The slot index (1..maxInstances) determines the instance ID and both the
+	// SOCKS and control ports, so concurrent spawns can never collide.
+	errCh := make(chan error, tl.maxInstances)
+	var wg sync.WaitGroup
+	for slot := 0; slot < tl.maxInstances; slot++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			id := slot + 1
+			inst, err := tl.spawnInstance(id)
+			if err != nil {
+				tl.logf("Failed to spawn Tor instance %d: %v", id, err)
+				errCh <- err
+				return
+			}
+			tl.logf("Tor instance %d spawned on SOCKS port %d", inst.ID, inst.SocksPort)
+		}(slot)
+	}
+	wg.Wait()
+	close(errCh)
+
+	if err := <-errCh; err != nil {
+		tl.ShutdownAll()
+		return fmt.Errorf("spawn tor instances: %w", err)
 	}
 
 	// Wait for bootstrap by polling SOCKS ports
@@ -135,8 +216,7 @@ func (tl *TorLifecycle) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
-			tl.logf("Tor bootstrap timeout — marking instances ready anyway")
-			tl.markAllReady()
+			tl.logf("Tor bootstrap timeout reached — proceeding with currently ready instances")
 			return nil
 		case <-ticker.C:
 			allReady := true
@@ -159,10 +239,11 @@ func (tl *TorLifecycle) Start(ctx context.Context) error {
 		}
 	}
 }
-// isSocksPortReady checks if a SOCKS port is actually routing traffic
-// by performing a full SOCKS5 handshake and connecting to a known host.
+
+// isSocksPortReady checks if a SOCKS port is accepting connections
+// by performing a fast SOCKS5 greeting handshake with a 5-second timeout.
 func (tl *TorLifecycle) isSocksPortReady(port int) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 3*time.Second)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
 	if err != nil {
 		return false
 	}
@@ -171,36 +252,14 @@ func (tl *TorLifecycle) isSocksPortReady(port int) bool {
 	// SOCKS5 greeting
 	conn.Write([]byte{0x05, 0x01, 0x00})
 	resp := make([]byte, 2)
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := io.ReadFull(conn, resp); err != nil {
 		return false
 	}
-	if resp[0] != 0x05 || resp[1] != 0x00 {
-		return false
-	}
-
-	// SOCKS5 connect to a known reachable host
-	// api.ipify.org = 172.67.149.29
-	target := []byte{0x05, 0x01, 0x00, 0x03, 13}
-	target = append(target, []byte("api.ipify.org")...)
-	target = append(target, 0x00, 0x50) // port 80
-	conn.Write(target)
-
-	reply := make([]byte, 10)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		return false
-	}
-
-	// reply[1] == 0x00 means success
-	return reply[1] == 0x00
+	return resp[0] == 0x05 && resp[1] == 0x00
 }
 
-func (tl *TorLifecycle) spawnInstance() (*TorInstance, error) {
-	tl.mu.Lock()
-	id := len(tl.instances) + 1
-	tl.mu.Unlock()
-
+func (tl *TorLifecycle) spawnInstance(id int) (*TorInstance, error) {
 	socksPort := tl.basePort + id - 1
 	controlPort := tl.controlBase + id - 1
 	dataDir := filepath.Join(tl.dataDir, fmt.Sprintf("instance-%d", id))
@@ -213,6 +272,14 @@ func (tl *TorLifecycle) spawnInstance() (*TorInstance, error) {
 DataDirectory %s
 Log notice file %s/tor.log
 ControlPort %d
+CookieAuthentication 1
+KeepalivePeriod 60
+MaxCircuitDirtiness 180
+CircuitBuildTimeout 15
+LearnCircuitBuildTimeout 1
+NumEntryGuards 10
+UseEntryGuards 1
+ExcludeNodes $9AA56B3478DE9C8350F544DFBCA182CC20E5A733
 `, socksPort, dataDir, dataDir, controlPort)
 
 	torrcPath := filepath.Join(dataDir, "torrc")
@@ -253,6 +320,29 @@ func (tl *TorLifecycle) markAllReady() {
 	}
 }
 
+// cachedCookie returns the instance's control-auth cookie from the in-memory
+// cache, falling back to disk and populating the cache on success.
+func (tl *TorLifecycle) cachedCookie(inst *TorInstance) func() ([]byte, bool) {
+	return func() ([]byte, bool) {
+		tl.cookieMu.RLock()
+		cached, hit := tl.cookieCache[inst.ID]
+		tl.cookieMu.RUnlock()
+		if hit && len(cached) == cookieSize {
+			return cached, true
+		}
+
+		cookie, ok := readCookieFile(filepath.Join(inst.DataDir, "control_auth_cookie"))
+		if !ok {
+			return nil, false
+		}
+
+		tl.cookieMu.Lock()
+		tl.cookieCache[inst.ID] = cookie
+		tl.cookieMu.Unlock()
+		return cookie, true
+	}
+}
+
 // GetInstances returns a snapshot of all instances.
 func (tl *TorLifecycle) GetInstances() []*TorInstance {
 	tl.mu.RLock()
@@ -275,30 +365,107 @@ func (tl *TorLifecycle) GetReadyCount() int {
 	return count
 }
 
-// CheckHealth verifies all instances are alive and restarts dead ones.
+// CheckHealth restarts instances whose SOCKS port is no longer accepting
+// connections after multiple consecutive probe failures, while honoring a grace
+// period after NEWNYM rotation so healthy instances aren't churned.
 func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 	tl.mu.RLock()
-	var dead []*TorInstance
-	for _, inst := range tl.instances {
-		if inst.Cmd != nil && inst.Cmd.Process != nil {
-			if err := inst.Cmd.Process.Signal(syscall.Signal(0)); err != nil {
-				dead = append(dead, inst)
-			}
-		}
-	}
+	instances := make([]*TorInstance, len(tl.instances))
+	copy(instances, tl.instances)
 	tl.mu.RUnlock()
 
-	restarted := 0
-	for _, inst := range dead {
-		tl.logf("Tor instance %d (PID %d) is dead, restarting...", inst.ID, inst.Cmd.Process.Pid)
-		tl.killInstance(inst)
-		if _, err := tl.spawnInstance(); err != nil {
-			tl.logf("Failed to restart Tor instance: %v", err)
+	var unhealthy []*TorInstance
+	for _, inst := range instances {
+		if !inst.IsReady() {
+			continue
+		}
+		// 30s grace period after spawn or NEWNYM: Tor SOCKS port may be busy negotiating
+		// a new circuit or initial bootstrap; do not probe or kill during this window.
+		if time.Since(inst.StartedAt) < 30*time.Second || time.Since(inst.GetLastRotated()) < 30*time.Second {
+			continue
+		}
+
+		// A SOCKS port that refuses new TCP connections across 3 consecutive checks
+		// indicates the instance is genuinely down.
+		if !tl.isTcpAlive(inst.GetSocksPort()) {
+			fails := inst.IncFailCount()
+			tl.logf("Tor instance %d SOCKS probe failed (consecutive fails: %d/3)", inst.ID, fails)
+			if fails >= 3 {
+				unhealthy = append(unhealthy, inst)
+			} else if inst.TryStartHeal() {
+				// Proactively clear stuck guards & trigger fresh circuit to auto-heal before hard restart
+				go func(target *TorInstance) {
+					if !target.IsReady() {
+						return
+					}
+					tl.logf("Tor instance %d triggering proactive DROPGUARDS auto-heal (2m cooldown)...", target.ID)
+					_ = tl.RequestNewCircuit(target)
+				}(inst)
+			}
 		} else {
-			restarted++
+			inst.ResetFailCount()
 		}
 	}
+
+	restarted := 0
+	for _, inst := range unhealthy {
+		tl.logf("Tor instance %d SOCKS port %d down after 3 consecutive failures, restarting...", inst.ID, inst.GetSocksPort())
+		deadID := inst.ID
+		tl.killInstance(inst)
+		if _, err := tl.spawnInstance(deadID); err != nil {
+			tl.logf("Failed to restart Tor instance %d: %v", deadID, err)
+			continue
+		}
+		restarted++
+		// Mark the replacement ready once it starts answering on SOCKS.
+		go tl.waitReady(deadID)
+	}
 	return restarted
+}
+
+// isTcpAlive reports whether a TCP listener is accepting connections on the
+// given port with a 5-second timeout.
+func (tl *TorLifecycle) isTcpAlive(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// waitReady polls a respawned instance until it can route through its SOCKS
+// port, then marks it ready. Strictly avoids marking unbootstrapped instances ready.
+func (tl *TorLifecycle) waitReady(id int) {
+	port := tl.basePort + id - 1
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		if tl.isSocksPortReady(port) {
+			if inst := tl.getInstance(id); inst != nil {
+				inst.SetReady(true)
+				inst.ResetFailCount()
+				tl.logf("Tor instance %d ready after restart", id)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			tl.logf("Tor instance %d restart timed out after 2 minutes — keeping not-ready", id)
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// getInstance returns the instance with the given ID, or nil.
+func (tl *TorLifecycle) getInstance(id int) *TorInstance {
+	tl.mu.RLock()
+	defer tl.mu.RUnlock()
+	for _, inst := range tl.instances {
+		if inst.ID == id {
+			return inst
+		}
+	}
+	return nil
 }
 
 func (tl *TorLifecycle) killInstance(inst *TorInstance) {
@@ -343,62 +510,18 @@ func (tl *TorLifecycle) ShutdownAll() {
 	}
 }
 
-// RequestNewCircuit sends SIGNAL NEWNYM to a specific instance.
-// It reads the control_auth_cookie from the instance's data directory for authentication.
+// RequestNewCircuit rotates the instance's circuits: DROPGUARDS clears
+// stalled guard nodes, then SIGNAL NEWNYM builds a fresh circuit (new exit
+// IP, subject to Tor's guard rotation policy). Cookie auth uses the
+// per-instance cache to avoid re-reading the cookie file on every rotation.
 func (tl *TorLifecycle) RequestNewCircuit(inst *TorInstance) error {
 	controlAddr := fmt.Sprintf("127.0.0.1:%d", inst.ControlPort)
-	conn, err := net.DialTimeout("tcp", controlAddr, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("connect to control port: %w", err)
-	}
-	defer conn.Close()
+	client := NewTorControlClient(controlAddr, "", tl.cachedCookie(inst))
 
-	reader := bufio.NewReader(conn)
-
-	// Try to read control_auth_cookie from cache or data directory
-	cookiePath := filepath.Join(inst.DataDir, "control_auth_cookie")
-	authSent := false
-
-	// Check cache first
-	tl.cookieMu.RLock()
-	cachedCookie, cacheHit := tl.cookieCache[inst.ID]
-	tl.cookieMu.RUnlock()
-
-	if cacheHit && len(cachedCookie) == 32 {
-		hexCookie := hex.EncodeToString(cachedCookie)
-		fmt.Fprintf(conn, "AUTHENTICATE %s\r\n", hexCookie)
-		authSent = true
-	} else if cookie, err := os.ReadFile(cookiePath); err == nil && len(cookie) == 32 {
-		hexCookie := hex.EncodeToString(cookie)
-		fmt.Fprintf(conn, "AUTHENTICATE %s\r\n", hexCookie)
-		authSent = true
-		// Cache for next time
-		tl.cookieMu.Lock()
-		tl.cookieCache[inst.ID] = cookie
-		tl.cookieMu.Unlock()
+	if err := client.SignalNEWNYM(true); err != nil {
+		return err
 	}
 
-	if !authSent {
-		// Fallback: try empty auth (works if ControlPort is configured without auth)
-		fmt.Fprintf(conn, "AUTHENTICATE\r\n")
-	}
-
-	resp, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("auth failed: %w", err)
-	}
-	if len(resp) < 3 || resp[0] != '2' {
-		return fmt.Errorf("auth rejected: %s", resp)
-	}
-
-	fmt.Fprintf(conn, "SIGNAL NEWNYM\r\n")
-	resp, err = reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("newnym failed: %w", err)
-	}
-	if len(resp) < 3 || resp[0] != '2' {
-		return fmt.Errorf("newnym rejected: %s", resp)
-	}
-
+	inst.SetLastRotated(time.Now())
 	return nil
 }

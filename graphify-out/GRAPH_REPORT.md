@@ -1,97 +1,111 @@
-# Graph Report - local-relay  (2026-07-03)
+# Graph Report - local-relay  (2026-08-23)
 
 ## Corpus Check
-- 31 files · ~49,402 words
+- 60 files · ~69,750 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 671 nodes · 866 edges · 54 communities (41 shown, 13 thin omitted)
-- Extraction: 96% EXTRACTED · 4% INFERRED · 0% AMBIGUOUS · INFERRED: 32 edges (avg confidence: 0.8)
+- 1029 nodes · 1478 edges · 68 communities (48 shown, 20 thin omitted)
+- Extraction: 94% EXTRACTED · 6% INFERRED · 0% AMBIGUOUS · INFERRED: 96 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `eab094bd`
+- Built from commit: `ce7dd1e5`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
 ## Community Hubs (Navigation)
-- [[_COMMUNITY_CircuitPoolBackend|CircuitPoolBackend]]
-- [[_COMMUNITY_TorBackend|TorBackend]]
-- [[_COMMUNITY_Config|Config]]
-- [[_COMMUNITY_HTTPProxy|HTTPProxy]]
-- [[_COMMUNITY_SOCKS5Proxy|SOCKS5Proxy]]
-- [[_COMMUNITY_TorLifecycle|TorLifecycle]]
-- [[_COMMUNITY_main|main]]
-- [[_COMMUNITY_Router|Router]]
-- [[_COMMUNITY_5. Proposed Architecture Smart Rotation with Streaming Awareness|5. Proposed Architecture: Smart Rotation with Streaming Awareness]]
-- [[_COMMUNITY_MultiTorBackend|MultiTorBackend]]
-- [[_COMMUNITY_Rotator|Rotator]]
-- [[_COMMUNITY_ROUNDTABLE 02 RATE LIMIT ANALYSIS & BYPASS STRATEGY|ROUNDTABLE 02: RATE LIMIT ANALYSIS & BYPASS STRATEGY]]
-- [[_COMMUNITY_CopySSE|CopySSE]]
-- [[_COMMUNITY_ANALYST_04 Protocol Correctness Analysis|ANALYST_04: Protocol Correctness Analysis]]
-- [[_COMMUNITY_9router Integration for Model Selection|9router Integration for Model Selection]]
-- [[_COMMUNITY_Local Relay Configuration (config.yaml)|Local Relay Configuration (config.yaml)]]
-- [[_COMMUNITY_Exhaustion Alert Script (exhaustion-alert.sh)|Exhaustion Alert Script (exhaustion-alert.sh)]]
-- [[_COMMUNITY_github.comlocal-relayproxy|github.com/local-relay/proxy]]
-- [[_COMMUNITY_ROUNDTABLE 05 Intelligent Model Routing & Quota Optimization|ROUNDTABLE 05: Intelligent Model Routing & Quota Optimization]]
-- [[_COMMUNITY_Per-File Analysis|Per-File Analysis]]
-- [[_COMMUNITY_ROUNDTABLE 04 — SREDevOps Monitoring, Alerting & Automated Failover|ROUNDTABLE 04 — SRE/DevOps: Monitoring, Alerting & Automated Failover]]
-- [[_COMMUNITY_Per-File Analysis|Per-File Analysis]]
-- [[_COMMUNITY_File-by-File Analysis|File-by-File Analysis]]
-- [[_COMMUNITY_File-by-File Analysis|File-by-File Analysis]]
-- [[_COMMUNITY_6.2 Proposed Code Changes|6.2 Proposed Code Changes]]
-- [[_COMMUNITY_FILE-BY-FILE ANALYSIS|FILE-BY-FILE ANALYSIS]]
-- [[_COMMUNITY_1. `internalbackendtor.go` — Tor Backend|1. `internal/backend/tor.go` — Tor Backend]]
-- [[_COMMUNITY_2. `internalsecurityfirewall.go` — Firewall & Rate Limiter|2. `internal/security/firewall.go` — Firewall & Rate Limiter]]
-- [[_COMMUNITY_5. `internalconfigconfig.go` — Configuration|5. `internal/config/config.go` — Configuration]]
-- [[_COMMUNITY_6. `cmdrelaymain.go` — Application Entry Point|6. `cmd/relay/main.go` — Application Entry Point]]
-- [[_COMMUNITY_7. `config.yaml` — Configuration File|7. `config.yaml` — Configuration File]]
-- [[_COMMUNITY_3. `internalauthapikey.go` — API Key Authentication|3. `internal/auth/apikey.go` — API Key Authentication]]
-- [[_COMMUNITY_4. `internallogredact.go` — Header & Body Redaction|4. `internal/log/redact.go` — Header & Body Redaction]]
-- [[_COMMUNITY_CROSS-CUTTING PRIVACY CONCERNS|CROSS-CUTTING PRIVACY CONCERNS]]
-- [[_COMMUNITY_4. ACTUAL IP DIVERSITY FROM TOR|4. ACTUAL IP DIVERSITY FROM TOR]]
-- [[_COMMUNITY_1. CURRENT STATE HOW ROTATION WORKS (AND WHY IT DOESN'T)|1. CURRENT STATE: HOW ROTATION WORKS (AND WHY IT DOESN'T)]]
-- [[_COMMUNITY_ROUNDTABLE 01 — NETWORK ENGINEERING ANALYSIS|ROUNDTABLE 01 — NETWORK ENGINEERING ANALYSIS]]
-- [[_COMMUNITY_2. CRITICAL BUG ROTATION IS COMPLETELY DEAD CODE|2. CRITICAL BUG: ROTATION IS COMPLETELY DEAD CODE]]
-- [[_COMMUNITY_3. IS ROTATING EVERY 10 REQUESTS OPTIMAL|3. IS ROTATING EVERY 10 REQUESTS OPTIMAL?]]
-- [[_COMMUNITY_5. HOW LONG UNTIL A NEW CIRCUIT GIVES A FRESH IP|5. HOW LONG UNTIL A NEW CIRCUIT GIVES A FRESH IP?]]
-- [[_COMMUNITY_6. OPTIMAL ROTATION STRATEGY|6. OPTIMAL ROTATION STRATEGY]]
-- [[_COMMUNITY_7. TIMING CALCULATIONS|7. TIMING CALCULATIONS]]
-- [[_COMMUNITY_8. LATENCY IMPACT ANALYSIS|8. LATENCY IMPACT ANALYSIS]]
-- [[_COMMUNITY_9. SUMMARY OF FINDINGS|9. SUMMARY OF FINDINGS]]
-- [[_COMMUNITY_HTTPProxy|HTTPProxy]]
-- [[_COMMUNITY_Local Relay Auto-Fallback Timer|Local Relay Auto-Fallback Timer]]
-- [[_COMMUNITY_Local Relay Health Monitor (local-relay-health.service)|Local Relay Health Monitor (local-relay-health.service)]]
-- [[_COMMUNITY_Systemd Installation Script (install-systemd.sh)|Systemd Installation Script (install-systemd.sh)]]
-- [[_COMMUNITY_Passive Exhaustion Detection Algorithm|Passive Exhaustion Detection Algorithm]]
-- [[_COMMUNITY_Weighted Round-Robin Model Rotation Algorithm|Weighted Round-Robin Model Rotation Algorithm]]
-- [[_COMMUNITY_ModelState Struct for Model Quota Tracking|ModelState Struct for Model Quota Tracking]]
-- [[_COMMUNITY_ModelQueue Priority Queue Implementation|ModelQueue Priority Queue Implementation]]
-- [[_COMMUNITY_QuotaAllocator Struct for Dynamic Model Distribution|QuotaAllocator Struct for Dynamic Model Distribution]]
+- CircuitPoolBackend
+- TorBackend
+- Config
+- HTTPProxy
+- SOCKS5Proxy
+- TorLifecycle
+- main
+- Router
+- 5. Proposed Architecture: Smart Rotation with Streaming Awareness
+- MultiTorBackend
+- Rotator
+- ROUNDTABLE 02: RATE LIMIT ANALYSIS & BYPASS STRATEGY
+- CopySSE
+- ANALYST_04: Protocol Correctness Analysis
+- 9router Integration for Model Selection
+- Local Relay Configuration (config.yaml)
+- Exhaustion Alert Script (exhaustion-alert.sh)
+- github.com/local-relay/proxy
+- ROUNDTABLE 05: Intelligent Model Routing & Quota Optimization
+- Per-File Analysis
+- ROUNDTABLE 04 — SRE/DevOps: Monitoring, Alerting & Automated Failover
+- Per-File Analysis
+- File-by-File Analysis
+- File-by-File Analysis
+- 6.2 Proposed Code Changes
+- FILE-BY-FILE ANALYSIS
+- 1. `internal/backend/tor.go` — Tor Backend
+- 2. `internal/security/firewall.go` — Firewall & Rate Limiter
+- 5. `internal/config/config.go` — Configuration
+- 6. `cmd/relay/main.go` — Application Entry Point
+- 7. `config.yaml` — Configuration File
+- 3. `internal/auth/apikey.go` — API Key Authentication
+- 4. `internal/log/redact.go` — Header & Body Redaction
+- CROSS-CUTTING PRIVACY CONCERNS
+- 4. ACTUAL IP DIVERSITY FROM TOR
+- 1. CURRENT STATE: HOW ROTATION WORKS (AND WHY IT DOESN'T)
+- ROUNDTABLE 01 — NETWORK ENGINEERING ANALYSIS
+- 2. CRITICAL BUG: ROTATION IS COMPLETELY DEAD CODE
+- 3. IS ROTATING EVERY 10 REQUESTS OPTIMAL?
+- 5. HOW LONG UNTIL A NEW CIRCUIT GIVES A FRESH IP?
+- 6. OPTIMAL ROTATION STRATEGY
+- 7. TIMING CALCULATIONS
+- 8. LATENCY IMPACT ANALYSIS
+- 9. SUMMARY OF FINDINGS
+- HTTPProxy
+- Local Relay Auto-Fallback Timer
+- Local Relay Health Monitor (local-relay-health.service)
+- Systemd Installation Script (install-systemd.sh)
+- Passive Exhaustion Detection Algorithm
+- Weighted Round-Robin Model Rotation Algorithm
+- ModelState Struct for Model Quota Tracking
+- ModelQueue Priority Queue Implementation
+- QuotaAllocator Struct for Dynamic Model Distribution
+- main.go
+- Implementation Order
+- Rate Limit Benchmark Report
+- MultiTorBackend
+- Local Relay Proxy — Engineering Audit Report
+- Tor Local Relay Proxy
+- socks5_multisession_test.go
+- graphify.md
+- graphify.md
+- analyze.sh
+- loadtest.sh
+- profile.sh
+- run_all.sh
+- benchmark
 
 ## God Nodes (most connected - your core abstractions)
-1. `Config` - 23 edges
-2. `CircuitPoolBackend` - 22 edges
-3. `SOCKS5Proxy` - 19 edges
-4. `HTTPProxy` - 18 edges
-5. `main()` - 17 edges
-6. `Router` - 16 edges
-7. `TorLifecycle` - 16 edges
-8. `Rotator` - 16 edges
-9. `Per-File Analysis` - 15 edges
-10. `TorInstance` - 14 edges
+1. `Config` - 33 edges
+2. `CircuitPoolBackend` - 30 edges
+3. `NewCircuitPoolBackend()` - 28 edges
+4. `Finding-by-Finding Verification` - 27 edges
+5. `TorLifecycle` - 24 edges
+6. `TorInstance` - 23 edges
+7. `SOCKS5Proxy` - 22 edges
+8. `HTTPProxy` - 21 edges
+9. `Rotator` - 20 edges
+10. `Router` - 19 edges
 
 ## Surprising Connections (you probably didn't know these)
-- `main()` --calls--> `NewAPIKeyAuth()`  [INFERRED]
-  cmd/relay/main.go → internal/auth/apikey.go
-- `main()` --calls--> `NewMultiTorBackend()`  [INFERRED]
+- `buildBackendStack()` --calls--> `NewMultiTorBackend()`  [INFERRED]
   cmd/relay/main.go → internal/backend/multitor.go
-- `main()` --calls--> `NewCircuitPoolBackend()`  [INFERRED]
+- `buildBackendStack()` --calls--> `NewCircuitPoolBackend()`  [INFERRED]
   cmd/relay/main.go → internal/backend/pool.go
-- `main()` --calls--> `NewRouter()`  [INFERRED]
-  cmd/relay/main.go → internal/backend/router.go
-- `main()` --calls--> `NewDirectBackend()`  [INFERRED]
+- `buildBackendStack()` --calls--> `NewTorBackend()`  [INFERRED]
   cmd/relay/main.go → internal/backend/tor.go
+- `buildBackendStack()` --calls--> `NewTorLifecycle()`  [INFERRED]
+  cmd/relay/main.go → internal/backend/torlifecycle.go
+- `buildRouter()` --calls--> `NewRouter()`  [INFERRED]
+  cmd/relay/main.go → internal/backend/router.go
 
 ## Import Cycles
 - None detected.
@@ -100,67 +114,67 @@
 - **Local Relay Systemd Service Ecosystem** — roundtable_04_ops_local_relay_systemd_units, roundtable_04_ops_exhaustion_alert_script, roundtable_04_ops_local_relay_health_monitor, roundtable_04_ops_local_relay_fallback_timer, roundtable_04_ops_systemd_install_script [EXTRACTED 0.95]
 - **Model Routing Intelligence Components** — roundtable_05_model_routing_model_state, roundtable_05_model_routing_quota_allocator, roundtable_05_model_routing_priority_queue, roundtable_05_model_routing_model_rotation_algorithm, roundtable_05_model_routing_exhaustion_detection [INFERRED 0.85]
 
-## Communities (54 total, 13 thin omitted)
+## Communities (68 total, 20 thin omitted)
 
 ### Community 0 - "CircuitPoolBackend"
 Cohesion: 0.10
-Nodes (22): CircuitPoolBackend, CircuitSlot, PoolConfig, cryptoRandInt(), Conn, Context, Dialer, Duration (+14 more)
+Nodes (17): CircuitPoolBackend, CircuitSlot, PoolConfig, pooledConn, pooledConnWrap, BenchmarkCryptoRandInt(), cryptoRandInt(), Bool (+9 more)
 
 ### Community 1 - "TorBackend"
-Cohesion: 0.13
-Nodes (13): DirectBackend, TorBackend, TorConfig, Conn, TuneTCP(), Conn, Context, Dialer (+5 more)
+Cohesion: 0.07
+Nodes (32): DirectBackend, TorBackend, TorConfig, TorControlClient, BenchmarkAnomalyReporting(), BenchmarkBackendSelection(), BenchmarkBypassHostCheck(), BenchmarkCircuitSlotOperations() (+24 more)
 
 ### Community 2 - "Config"
-Cohesion: 0.13
-Nodes (18): AuthConfig, BackendConfig, BypassConfig, Config, HealthConfig, LoggingConfig, MetricsConfig, MultiTorConfig (+10 more)
+Cohesion: 0.06
+Nodes (48): APIKeyAuth, applyFlagOverrides(), authMiddlewareOrNil(), buildBackendStack(), buildProxies(), buildRotator(), buildRouter(), CancelFunc (+40 more)
 
 ### Community 3 - "HTTPProxy"
-Cohesion: 0.07
-Nodes (30): APIKeyAuth, Client, Request, ResponseWriter, NewAPIKeyAuth(), Context, Logger, HTTPProxy (+22 more)
+Cohesion: 0.09
+Nodes (28): BenchmarkBufferPool(), BenchmarkConcurrentSOCKS5(), BenchmarkHeaderStripping(), BenchmarkResponseParsing(), BenchmarkSanitizeURL(), BenchmarkSOCKS5HandshakeServer(), BenchmarkTriggerRotateOnError(), B (+20 more)
 
 ### Community 4 - "SOCKS5Proxy"
-Cohesion: 0.15
-Nodes (11): Conn, IP, Logger, NewSOCKS5Proxy(), IP, IPNet, NewSSRFBlocker(), Listener (+3 more)
+Cohesion: 0.06
+Nodes (34): BenchmarkAddBlockedRange(), BenchmarkDNSResolution(), BenchmarkSSRFBlocker(), BenchmarkSSRFBlockerBlocked(), BenchmarkSSRFBlockerConcurrent(), BenchmarkSSRFBlockerDNS(), BenchmarkSSRFBlockerIPv6(), B (+26 more)
 
 ### Community 5 - "TorLifecycle"
-Cohesion: 0.16
-Nodes (8): TorInstance, TorLifecycle, TorLifecycleConfig, Cmd, Context, RWMutex, Time, NewTorLifecycle()
+Cohesion: 0.12
+Nodes (9): TorInstance, TorLifecycle, TorLifecycleConfig, Cmd, readCookieFile(), Context, RWMutex, Time (+1 more)
 
 ### Community 6 - "main"
-Cohesion: 0.15
-Nodes (14): Logger, main(), setupLogger(), HealthChecker, HealthServer, HealthStatus, SimpleHealthChecker, Logger (+6 more)
+Cohesion: 0.19
+Nodes (11): HealthChecker, HealthServer, HealthStatus, SimpleHealthChecker, Logger, Request, ResponseWriter, Server (+3 more)
 
 ### Community 7 - "Router"
-Cohesion: 0.17
-Nodes (8): AnomalyReporter, Backend, Router, Conn, Context, Int64, RWMutex, NewRouter()
+Cohesion: 0.03
+Nodes (78): =============================================================================, 1. REQUEST LATENCY, =============================================================================, =============================================================================, 2. THROUGHPUT, =============================================================================, =============================================================================, 3. CONNECTIONS (+70 more)
 
 ### Community 8 - "5. Proposed Architecture: Smart Rotation with Streaming Awareness"
 Cohesion: 0.05
 Nodes (42): 1.1 Request Flow Architecture, 1.2 Connection State Machine, 1.3 Critical Finding: Rotator Is Disconnected From Request Path, 1.4 TorBackend Connection Details, 1. Connection Lifecycle Analysis, 2.1 Current State: No (But Only Because It's Broken), 2.2 If Rotation Were Integrated: The Danger Zones, 2.3 The Real Problem: Circuit Age Is a Lying Metric (+34 more)
 
 ### Community 9 - "MultiTorBackend"
-Cohesion: 0.17
-Nodes (8): MultiTorBackend, Conn, Context, Dialer, Duration, Int64, RWMutex, NewMultiTorBackend()
+Cohesion: 0.05
+Nodes (37): #10 — Goroutine leak in ReportAnomaly (multitor.go:196), #11 — Rotator goroutine inconsistency (rotator.go:42-46 vs 71-77), #12 — r.URL.String() double-encoding (http.go:202), #13 — IPv6 SOCKS5 formatting (socks5.go:216-219), #14 — API key hardcoded in source (config.go:116), #15 — nil pointer in CheckHealth (torlifecycle.go:290), #16 — Headers copied after status code (http.go:262-277), #17 — Type assertion panic (http.go:275) (+29 more)
 
 ### Community 10 - "Rotator"
-Cohesion: 0.18
-Nodes (6): Int64, Logger, NewRotator(), Rotator, Uint64, WaitGroup
+Cohesion: 0.14
+Nodes (35): Conn, T, tcpPair(), TestDeadConn_DetectedOnWrite(), TestDeadConn_DetectedOnWrite_RST(), TestIsConnAlive_ClosedConn(), TestIsConnAlive_IdleHealthy(), TestIsConnAlive_NilConn() (+27 more)
 
 ### Community 11 - "ROUNDTABLE 02: RATE LIMIT ANALYSIS & BYPASS STRATEGY"
 Cohesion: 0.05
 Nodes (38): 10. LEGAL & ETHICAL CONSIDERATIONS, 1.1 OpenCode Zen Detection Mechanisms, 1.2 Blackbox AI Detection Mechanisms, 1.3 Generic Free LLM Provider Patterns, 1. PROVIDER DETECTION SIGNALS, 2.1 TLS Fingerprinting (JA3/JA4), 2.2 HTTP/2 Fingerprinting, 2.3 Behavior Pattern Analysis (+30 more)
 
 ### Community 12 - "CopySSE"
-Cohesion: 0.24
-Nodes (10): Header, CopyRaw(), CopySSE(), Context, ResponseWriter, HasSSEContentType(), Relay(), ReadCloser (+2 more)
+Cohesion: 0.09
+Nodes (25): Closer, BenchmarkCopyRaw(), BenchmarkCopySSE(), BenchmarkHasSSEContentType(), BenchmarkRelay(), BenchmarkRelayConcurrent(), BenchmarkRelayThroughNet(), concurrencyName() (+17 more)
 
 ### Community 13 - "ANALYST_04: Protocol Correctness Analysis"
 Cohesion: 0.06
 Nodes (32): 1.1 RFC Compliance Check, 1.2 HTTP Forwarding (handleHTTP), 1.3 Edge Case Handling, 1. HTTP CONNECT Tunnel (internal/proxy/http.go), 2.1 RFC 1928 Compliance Check, 2.2 Edge Case Handling, 2. SOCKS5 Server (internal/proxy/socks5.go), 3.1 W3C EventSource Specification Compliance (+24 more)
 
 ### Community 18 - "ROUNDTABLE 05: Intelligent Model Routing & Quota Optimization"
-Cohesion: 0.06
-Nodes (32): 10. Summary, 1.1 Current Provider/Model Inventory (from 9router database), 1.2 Observed Rate Limits (from usage data + error patterns), 1.3 Error Signatures (what 429 looks like per provider), 1. Model Quota Map — Limits, Resets, and Rate Limit Behavior, 2.1 Core Principle: Round-Robin with Weighted Fair Queuing, 2.2 Rotation Strategy: Two-Tier Rotation, 2.3 Implementation: Go struct for model state (+24 more)
+Cohesion: 0.11
+Nodes (15): AnomalyReporter, Backend, Router, Bool, Conn, Context, Int64, RWMutex (+7 more)
 
 ### Community 19 - "Per-File Analysis"
 Cohesion: 0.07
@@ -262,25 +276,53 @@ Nodes (4): 8.1 Current Latency (No Rotation — Broken), 8.2 With NEWNYM Rotatio
 Cohesion: 0.50
 Nodes (4): 9.1 Bugs Found, 9.2 What Works, 9.3 Key Recommendations, 9. SUMMARY OF FINDINGS
 
+### Community 54 - "main.go"
+Cohesion: 0.18
+Nodes (24): BenchConfig, aggregateByTorCount(), checkIPCorrelation(), findBestConfig(), Client, Duration, Time, main() (+16 more)
+
+### Community 56 - "Implementation Order"
+Cohesion: 0.11
+Nodes (17): Benchmark & Profiling Implementation Plan, Decision Framework, Expected Hotspots (Hypotheses — To Be Measured), Files to Create, Implementation Order, Phase 1: Setup (30 minutes), Phase 2: CPU Profiling (1 hour), Phase 3: Memory Profiling (1 hour) (+9 more)
+
+### Community 57 - "Rate Limit Benchmark Report"
+Cohesion: 0.12
+Nodes (16): 3-tor-http-c1 (mode=http_proxy, concurrency=1), Are limits tied to exit IP?, Are limits tied to the API key?, Best Configuration, Bottleneck, Detailed Results, Does increasing Tor instances increase throughput?, Executive Summary (+8 more)
+
+### Community 58 - "MultiTorBackend"
+Cohesion: 0.11
+Nodes (14): MultiTorBackend, Conn, Context, Dialer, Duration, Int64, RWMutex, NewMultiTorBackend() (+6 more)
+
+### Community 59 - "Local Relay Proxy — Engineering Audit Report"
+Cohesion: 0.15
+Nodes (12): 1. Executive Summary, 2. Scores, 3. Issues Found, 4. Specification Compliance, 5. Top 20 Improvements, 6. Would I Approve This for Production?, 7. Would I Approve for Open-Source Release?, Local Relay Proxy — Engineering Audit Report (+4 more)
+
+### Community 60 - "Tor Local Relay Proxy"
+Cohesion: 0.17
+Nodes (11): 1. Build, 2. Run, 3. Test, 🛠️ CLI Flags, Direct Relay Header Mode, 🔌 Integration, ⚡ Key Features, 🚀 Quick Start (+3 more)
+
+### Community 61 - "socks5_multisession_test.go"
+Cohesion: 0.48
+Nodes (6): Conn, T, socks5Connect(), TestTorSOCKS5_MultiSessionOnSameTCPConnection(), TestTorSOCKS5_MultiSessionThreeRounds(), truncate()
+
 ## Knowledge Gaps
-- **312 isolated node(s):** `github.com/local-relay/proxy`, `AnomalyReporter`, `HealthStatus`, `HTTPProxy`, `Executive Summary` (+307 more)
+- **449 isolated node(s):** `analyze.sh script`, `loadtest.sh script`, `profile.sh script`, `run_all.sh script`, `benchmark` (+444 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **13 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **20 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `main()` connect `main` to `CircuitPoolBackend`, `TorBackend`, `Config`, `HTTPProxy`, `SOCKS5Proxy`, `TorLifecycle`, `Router`, `MultiTorBackend`, `Rotator`?**
-  _High betweenness centrality (0.101) - this node is a cross-community bridge._
-- **Why does `NewCircuitPoolBackend()` connect `CircuitPoolBackend` to `main`?**
+- **Why does `backendStack` connect `Config` to `CircuitPoolBackend`, `TorBackend`, `SOCKS5Proxy`, `TorLifecycle`, `MultiTorBackend`?**
+  _High betweenness centrality (0.056) - this node is a cross-community bridge._
+- **Why does `SOCKS5Proxy` connect `ROUNDTABLE 05: Intelligent Model Routing & Quota Optimization` to `Config`, `SOCKS5Proxy`?**
   _High betweenness centrality (0.036) - this node is a cross-community bridge._
-- **Why does `NewHTTPProxy()` connect `HTTPProxy` to `Rotator`, `SOCKS5Proxy`, `main`, `Router`?**
-  _High betweenness centrality (0.029) - this node is a cross-community bridge._
-- **Are the 15 inferred relationships involving `main()` (e.g. with `NewAPIKeyAuth()` and `NewMultiTorBackend()`) actually correct?**
-  _`main()` has 15 INFERRED edges - model-reasoned connections that need verification._
-- **What connects `github.com/local-relay/proxy`, `AnomalyReporter`, `HealthStatus` to the rest of the system?**
-  _312 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **Why does `NewCircuitPoolBackend()` connect `Rotator` to `CircuitPoolBackend`, `TorBackend`, `Config`, `MultiTorBackend`?**
+  _High betweenness centrality (0.034) - this node is a cross-community bridge._
+- **Are the 24 inferred relationships involving `NewCircuitPoolBackend()` (e.g. with `buildBackendStack()` and `TestPool_DeadConnDiscarded()`) actually correct?**
+  _`NewCircuitPoolBackend()` has 24 INFERRED edges - model-reasoned connections that need verification._
+- **What connects `analyze.sh script`, `loadtest.sh script`, `profile.sh script` to the rest of the system?**
+  _449 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `CircuitPoolBackend` be split into smaller, more focused modules?**
-  _Cohesion score 0.09855072463768116 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.09725158562367865 - nodes in this community are weakly interconnected._
 - **Should `TorBackend` be split into smaller, more focused modules?**
-  _Cohesion score 0.13 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.07493061979648474 - nodes in this community are weakly interconnected._

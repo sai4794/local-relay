@@ -1,20 +1,12 @@
 package stream
 
 import (
-	"bufio"
 	"context"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 )
-
-var eventPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, 0, 4096)
-		return &buf
-	},
-}
 
 var bufPool = sync.Pool{
 	New: func() any {
@@ -35,23 +27,22 @@ func CopySSE(w http.ResponseWriter, body io.ReadCloser, statusCode int) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(statusCode)
+	flusher.Flush()
 
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 4096), 64*1024)
+	buf := bufPool.Get().(*[]byte)
+	defer bufPool.Put(buf)
 
-	for scanner.Scan() {
-		event := scanner.Bytes()
-
-		bufPtr := eventPool.Get().(*[]byte)
-		*bufPtr = append((*bufPtr)[:0], event...)
-		*bufPtr = append(*bufPtr, '\n', '\n')
-		if _, err := w.Write(*bufPtr); err != nil {
-			eventPool.Put(bufPtr)
+	for {
+		n, err := body.Read(*buf)
+		if n > 0 {
+			if _, wErr := w.Write((*buf)[:n]); wErr != nil {
+				return
+			}
+			flusher.Flush()
+		}
+		if err != nil {
 			return
 		}
-		eventPool.Put(bufPtr)
-
-		flusher.Flush()
 	}
 }
 

@@ -19,8 +19,10 @@ type Router struct {
 	backends      []Backend
 	directBackend Backend
 	bypassHosts   []string
+	bypassHostMap map[string]bool
 	bypassMu      sync.RWMutex
 	current       atomic.Int64
+	hasBypass     atomic.Bool
 }
 
 // NewRouter creates a router with an explicit direct (bypass) backend
@@ -35,19 +37,30 @@ func NewRouter(direct Backend, backends ...Backend) *Router {
 func (r *Router) SetBypassHosts(hosts []string) {
 	r.bypassMu.Lock()
 	r.bypassHosts = make([]string, len(hosts))
+	r.bypassHostMap = make(map[string]bool, len(hosts)*2)
 	for i, h := range hosts {
-		r.bypassHosts[i] = strings.ToLower(h)
+		h = strings.ToLower(h)
+		r.bypassHosts[i] = h
+		r.bypassHostMap[h] = true
+		r.bypassHostMap["."+h] = true
 	}
 	r.bypassMu.Unlock()
+	r.hasBypass.Store(len(hosts) > 0)
 }
 
 func (r *Router) isBypassHost(host string) bool {
+	if !r.hasBypass.Load() {
+		return false
+	}
 	host = strings.ToLower(host)
 	r.bypassMu.RLock()
 	defer r.bypassMu.RUnlock()
-	for _, bypassHost := range r.bypassHosts {
-		// Exact match or ".domain" suffix match
-		if host == bypassHost || strings.HasSuffix(host, "."+bypassHost) {
+	if r.bypassHostMap[host] {
+		return true
+	}
+	// Check for ".domain" suffix match
+	if idx := strings.LastIndex(host, "."); idx > 0 {
+		if r.bypassHostMap[host[idx:]] {
 			return true
 		}
 	}

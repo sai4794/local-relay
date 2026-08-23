@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -51,21 +52,28 @@ func (p *SOCKS5Proxy) Start(addr string) error {
 	for {
 		conn, err := p.listener.Accept()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				p.logger.Error("SOCKS5 accept temporary error", "error", err)
-				time.Sleep(100 * time.Millisecond)
-				continue
+			if errors.Is(err, net.ErrClosed) {
+				return nil
 			}
-			return nil
+			p.logger.Error("SOCKS5 accept error", "error", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 		go p.handleConn(conn)
 	}
 }
 
+// handshakeTimeout bounds the SOCKS5 greeting/auth/request exchange. Without
+// it a client that opens a socket and never speaks pins a goroutine forever
+// (slowloris). The deadline is cleared once the tunnel is established.
+const handshakeTimeout = 30 * time.Second
+
 func (p *SOCKS5Proxy) handleConn(conn net.Conn) {
 	defer conn.Close()
 
 	backend.TuneTCP(conn)
+
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
 	if err := p.handshake(conn); err != nil {
 		p.logger.Debug("SOCKS5 handshake failed", "error", err)
@@ -274,6 +282,10 @@ func (p *SOCKS5Proxy) handleConnect(conn net.Conn, target string) {
 		return
 	}
 	p.sendReply(conn, 0x00, tcpAddr.IP)
+
+	// Tunnel established — lift the handshake deadline so long-lived
+	// streams (LLM completions, downloads) are never truncated.
+	_ = conn.SetDeadline(time.Time{})
 
 	p.logger.Info("SOCKS5 CONNECT established", "target", target)
 
