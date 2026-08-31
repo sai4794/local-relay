@@ -28,39 +28,55 @@ var copyBufPool = sync.Pool{
 	},
 }
 
-// Per-model rate limiter for nvidia/moonshotai – 2 req/s (500ms interval)
-// to avoid `429 reset after 3m4s`. Kimi removed per user request. Queues instead of blocking.
+// Per-model rate limiter for nvidia/moonshotai — 2 req/s (500ms interval)
+// to avoid `429 reset after 3m4s`. Kimi removed per user request.
+// Mutex is held across the sleep so concurrent same-host callers are
+// serialized into real spacing instead of all waking and re-stamping
+// `last` together (which previously collapsed to 1 interval total).
 var modelRateLimiters = struct {
 	mu   sync.Mutex
 	last map[string]time.Time
 }{last: make(map[string]time.Time)}
 
+// exactHosts matched at full-name granularity; previous strings.Contains
+// matched any host containing the substring (e.g. "notnvidia.example.com").
+var rateLimitedHosts = map[string]bool{
+	"integrate.api.nvidia.com": true,
+	"opencode.ai":              true,
+	"api.moonshot.cn":          true,
+	"api.moonshot.ai":          true,
+}
+
 func enforceModelRateLimit(host string) {
 	h := strings.ToLower(host)
-	if !strings.Contains(h, "nvidia") && !strings.Contains(h, "moonshot") && !strings.Contains(h, "integrate.api") && !strings.Contains(h, "opencode.ai") {
-		return
-	}
 	// Normalize host key (strip port)
 	if strings.Contains(h, ":") {
 		if hp, _, err := net.SplitHostPort(h); err == nil {
 			h = hp
 		}
 	}
+	// Match exact host or any subdomain of a listed host.
+	matched := false
+	for lh := range rateLimitedHosts {
+		if h == lh || strings.HasSuffix(h, "."+lh) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return
+	}
+
 	modelRateLimiters.mu.Lock()
+	defer modelRateLimiters.mu.Unlock()
+	const minInterval = 500 * time.Millisecond // 2 req/s
 	last, ok := modelRateLimiters.last[h]
 	now := time.Now()
-	minInterval := 500 * time.Millisecond // 2 req/s
 	if ok && now.Sub(last) < minInterval {
-		sleep := minInterval - now.Sub(last)
-		modelRateLimiters.mu.Unlock()
-		// Log throttling for observability (debug level to avoid spam)
-		// Use fmt to avoid import cycle - logger not available here, rely on caller log
-		time.Sleep(sleep)
-		modelRateLimiters.mu.Lock()
+		time.Sleep(minInterval - now.Sub(last))
 		now = time.Now()
 	}
 	modelRateLimiters.last[h] = now
-	modelRateLimiters.mu.Unlock()
 }
 
 type HTTPProxy struct {
@@ -400,6 +416,7 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var resp *http.Response
 	var lastErr error
+retryLoop:
 	for attempt := 1; attempt <= maxUpstreamAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, reqBody())
 		if err != nil {
@@ -425,7 +442,7 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-time.After(retryDelay):
 			case <-r.Context().Done():
-				break
+				break retryLoop
 			}
 			continue
 		}
@@ -447,7 +464,7 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				select {
 				case <-time.After(retryDelay):
 				case <-r.Context().Done():
-					break
+					break retryLoop
 				}
 				continue
 			}

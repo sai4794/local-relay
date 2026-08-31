@@ -27,4 +27,7 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("TOR_BINARY"); v != "" {
 		cfg.MultiTor.Binary = v
 	}
+	if v := os.Getenv("TOR_LIBRARY_PATH"); v != "" {
+		cfg.MultiTor.LibraryPath = v
+	}
 }

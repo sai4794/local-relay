@@ -31,6 +31,9 @@ type TorControlClient struct {
 	// Cookie optionally supplies the raw control-auth cookie. Returning
 	// no cookie falls through to Password / empty auth.
 	Cookie func() ([]byte, bool)
+	// Logf optionally receives non-fatal control-channel notices
+	// (e.g. tolerated DROPGUARDS failures).
+	Logf func(string, ...interface{})
 }
 
 // NewTorControlClient builds a client for the given control address.
@@ -40,7 +43,7 @@ func NewTorControlClient(addr, password string, cookie func() ([]byte, bool)) *T
 
 // SignalNEWNYM requests a fresh circuit. When dropGuards is true a
 // DROPGUARDS is issued first to clear stalled guard nodes; DROPGUARDS
-// failure is tolerated (it is an optimization, not a requirement).
+// failure is tolerated but surfaced to the caller's log via Logf when set.
 func (c *TorControlClient) SignalNEWNYM(dropGuards bool) error {
 	if c.Addr == "" {
 		return fmt.Errorf("tor control port not configured")
@@ -60,9 +63,9 @@ func (c *TorControlClient) SignalNEWNYM(dropGuards bool) error {
 	}
 
 	if dropGuards {
-		if err := writeCommand(conn, reader, "DROPGUARDS"); err != nil {
+		if err := writeCommand(conn, reader, "DROPGUARDS"); err != nil && c.Logf != nil {
 			// Non-fatal: proceed with NEWNYM even if guard dropping failed.
-			_ = err
+			c.Logf("tor-control: DROPGUARDS failed (continuing with NEWNYM): %v", err)
 		}
 	}
 

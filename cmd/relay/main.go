@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -136,6 +137,7 @@ func buildBackendStack(ctx context.Context, cfg *config.Config, logger *slog.Log
 			ControlBase:  cfg.MultiTor.ControlBase,
 			MaxInstances: cfg.MultiTor.MaxInstances,
 			RotateAfter:  cfg.MultiTor.RotateAfter,
+			LibraryPath:  cfg.MultiTor.LibraryPath,
 			Logf: func(format string, args ...interface{}) {
 				logger.Debug("[tor-lifecycle] "+format, args...)
 			},
@@ -297,11 +299,14 @@ func buildProxies(
 	ssrfBlocker *security.SSRFBlocker,
 ) (*proxy.HTTPProxy, *proxy.SOCKS5Proxy) {
 
+	// SOCKS5 auth: constant-time on both comma forms; cfg.Auth.APIKey is
+	// validated to be >=16 chars at load time.
 	var socks5Auth proxy.AuthCheck
 	if cfg.Auth.Enabled && cfg.Auth.APIKey != "" {
 		apiKey := cfg.Auth.APIKey
 		socks5Auth = func(username, password string) bool {
-			return username == apiKey || password == apiKey
+			return subtle.ConstantTimeCompare([]byte(username), []byte(apiKey)) == 1 ||
+				subtle.ConstantTimeCompare([]byte(password), []byte(apiKey)) == 1
 		}
 		logger.Info("SOCKS5 authentication enabled")
 	}
@@ -410,6 +415,7 @@ func startHealthServer(cfg *config.Config, s *backendStack, rotator *rotate.Rota
 	)
 
 	healthSrv := health.NewHealthServer(cfg.Health.Address, checker, logger)
+	healthSrv.SetMetricsEnabled(cfg.Metrics.Enabled)
 	go runComponent("health server", logger, healthSrv.Start)
 	return healthSrv
 }

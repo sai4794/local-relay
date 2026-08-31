@@ -109,6 +109,15 @@ func (i *TorInstance) SetLastRotated(t time.Time) {
 	i.LastRotated = t
 }
 
+// GetStartedAt returns the spawn timestamp (thread-safe). StartedAt is
+// written once under tl.mu during spawnInstance before the instance is
+// published, but accessors keep the lock discipline uniform.
+func (i *TorInstance) GetStartedAt() time.Time {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.StartedAt
+}
+
 // GetLastRotated gets the rotation timestamp (thread-safe).
 func (i *TorInstance) GetLastRotated() time.Time {
 	i.mu.RLock()
@@ -135,6 +144,7 @@ type TorLifecycle struct {
 	controlBase  int
 	maxInstances int
 	rotateAfter  int
+	libraryPath  string
 	instances    []*TorInstance
 	mu           sync.RWMutex
 	logf         func(string, ...interface{})
@@ -150,7 +160,10 @@ type TorLifecycleConfig struct {
 	ControlBase  int
 	MaxInstances int
 	RotateAfter  int
-	Logf         func(string, ...interface{})
+	// LibraryPath is exported as LD_LIBRARY_PATH on spawned Tor children
+	// when non-empty (empty = inherit parent env).
+	LibraryPath string
+	Logf        func(format string, args ...interface{})
 }
 
 // NewTorLifecycle creates a new Tor lifecycle manager.
@@ -165,6 +178,7 @@ func NewTorLifecycle(cfg TorLifecycleConfig) *TorLifecycle {
 		controlBase:  cfg.ControlBase,
 		maxInstances: cfg.MaxInstances,
 		rotateAfter:  cfg.RotateAfter,
+		libraryPath:  cfg.LibraryPath,
 		logf:         cfg.Logf,
 		cookieCache:  make(map[int][]byte),
 	}
@@ -292,7 +306,9 @@ TestSocks 1
 	}
 
 	cmd := exec.Command(tl.binary, "-f", torrcPath)
-	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH=/home/stb/tor/tor")
+	if tl.libraryPath != "" {
+		cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+tl.libraryPath)
+	}
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 
@@ -315,14 +331,6 @@ TestSocks 1
 	tl.mu.Unlock()
 
 	return inst, nil
-}
-
-func (tl *TorLifecycle) markAllReady() {
-	tl.mu.Lock()
-	defer tl.mu.Unlock()
-	for _, inst := range tl.instances {
-		inst.SetReady(true)
-	}
 }
 
 // cachedCookie returns the instance's control-auth cookie from the in-memory
@@ -388,7 +396,7 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 		}
 		// 30s grace period after spawn or NEWNYM: Tor SOCKS port may be busy negotiating
 		// a new circuit or initial bootstrap; do not probe or kill during this window.
-		if time.Since(inst.StartedAt) < 30*time.Second || time.Since(inst.GetLastRotated()) < 30*time.Second {
+		if time.Since(inst.GetStartedAt()) < 30*time.Second || time.Since(inst.GetLastRotated()) < 30*time.Second {
 			continue
 		}
 
@@ -432,12 +440,6 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 		go tl.waitReady(deadID)
 	}
 	return restarted
-}
-
-// isTcpAlive is deprecated; now delegates to SOCKS5 handshake to avoid masking
-// circuit stalls where TCP succeeds but CONNECT fails.
-func (tl *TorLifecycle) isTcpAlive(port int) bool {
-	return tl.isSocksPortReady(port)
 }
 
 // isConsensusStale reports true if the cached microdesc consensus is older than 90m.
@@ -507,7 +509,10 @@ func (tl *TorLifecycle) killInstance(inst *TorInstance) {
 			<-done
 		}
 	}
-	os.RemoveAll(inst.DataDir)
+	// Preserve DataDir (entry guards, cached consensus). Wiping it on every
+	// heal churned guard nodes and made the fresh instance look
+	// consensus-stale to isConsensusStale, causing a follow-up false-positive
+	// failure cycle. spawnInstance rewrites the torrc idempotently.
 
 	tl.mu.Lock()
 	defer tl.mu.Unlock()
@@ -552,6 +557,7 @@ func (tl *TorLifecycle) RequestNewCircuitWithDropGuards(inst *TorInstance, dropG
 
 	controlAddr := fmt.Sprintf("127.0.0.1:%d", inst.ControlPort)
 	client := NewTorControlClient(controlAddr, "", tl.cachedCookie(inst))
+	client.Logf = tl.logf
 
 	if err := client.SignalNEWNYM(dropGuards); err != nil {
 		return err

@@ -28,6 +28,13 @@ func (c *SOCKS5Client) Connect(ctx context.Context, socksAddr, targetAddr, isoUs
 		return nil, fmt.Errorf("tor socks connect: %w", err)
 	}
 
+	// Bound the entire handshake — the dial timeout only covers connect.
+	// A Tor instance that accepts TCP but never answers the greeting
+	// (wedged-but-listening) would otherwise pin the request goroutine forever.
+	if err := conn.SetDeadline(time.Now().Add(c.dialer.Timeout)); err == nil {
+		defer conn.SetDeadline(time.Time{})
+	}
+
 	if err := c.handshake(conn, targetAddr, isoUser); err != nil {
 		conn.Close()
 		return nil, err

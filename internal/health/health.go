@@ -14,6 +14,10 @@ type HealthServer struct {
 	logger  *slog.Logger
 	checker HealthChecker
 	server  *http.Server
+	// serveMetrics gates the /metrics endpoint. The separate Prometheus
+	// listener (cfg.Metrics.Enabled) is a different concern — this flag is
+	// driven by the same config so metrics-disabled actually means off.
+	serveMetrics bool
 }
 
 type HealthChecker interface {
@@ -68,12 +72,18 @@ func NewHealthServer(addr string, checker HealthChecker, logger *slog.Logger) *H
 	}
 }
 
+// SetMetricsEnabled controls whether the health port also serves /metrics.
+// Called from main with cfg.Metrics.Enabled.
+func (hs *HealthServer) SetMetricsEnabled(on bool) { hs.serveMetrics = on }
+
 func (hs *HealthServer) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", hs.handleHealth)
 	mux.HandleFunc("/healthz", hs.handleHealth)
 	mux.HandleFunc("/readyz", hs.handleReady)
-	mux.HandleFunc("/metrics", hs.handleMetrics)
+	if hs.serveMetrics {
+		mux.HandleFunc("/metrics", hs.handleMetrics)
+	}
 
 	hs.server = &http.Server{
 		Addr:         hs.addr,

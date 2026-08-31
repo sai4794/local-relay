@@ -46,6 +46,10 @@ type MultiTorConfig struct {
 	ControlBase  int    `yaml:"control_base"`
 	MaxInstances int    `yaml:"max_instances"`
 	RotateAfter  int    `yaml:"rotate_after"`
+	// LibraryPath, when non-empty, is exported as LD_LIBRARY_PATH to the
+	// spawned Tor children (needed when tor is linked against private libs
+	// not on the system loader path). Default empty = inherit parent's env.
+	LibraryPath string `yaml:"library_path"`
 }
 
 type BypassConfig struct {

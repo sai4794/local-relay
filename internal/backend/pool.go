@@ -125,15 +125,19 @@ func NewCircuitPoolBackend(cfg PoolConfig) *CircuitPoolBackend {
 		maxAnomaly:        int64(cfg.MaxAnomaly),
 		dialer:            &net.Dialer{Timeout: cfg.Timeout},
 		socksClient:       transport.NewSOCKS5Client(cfg.Timeout),
-		control:           NewTorControlClient(cfg.ControlAddr, cfg.ControlPass, cookieFileProvider(cfg.ControlCookiePath)),
-		logf:              cfg.Logf,
-		lastNymTime:       time.Now().Add(-10 * time.Second),
-		minNymGap:         10 * time.Second,
-		nymBackoff:        1,
-		isolationPrefix:   fmt.Sprintf("relay-%d", cryptoRandInt(99999)),
-		maxIdle:           cfg.MaxIdle,
-		idleTTL:           cfg.IdleTTL,
-		connPool:          make([]*pooledConn, 0, cfg.MaxIdle),
+		control: func() *TorControlClient {
+			c := NewTorControlClient(cfg.ControlAddr, cfg.ControlPass, cookieFileProvider(cfg.ControlCookiePath))
+			c.Logf = cfg.Logf
+			return c
+		}(),
+		logf:            cfg.Logf,
+		lastNymTime:     time.Now().Add(-10 * time.Second),
+		minNymGap:       10 * time.Second,
+		nymBackoff:      1,
+		isolationPrefix: fmt.Sprintf("relay-%d", cryptoRandInt(99999)),
+		maxIdle:         cfg.MaxIdle,
+		idleTTL:         cfg.IdleTTL,
+		connPool:        make([]*pooledConn, 0, cfg.MaxIdle),
 	}
 
 	p.slots = make([]*CircuitSlot, cfg.CircuitCount)
@@ -498,6 +502,14 @@ func (p *CircuitPoolBackend) putConn(slotIdx int, addr string, conn net.Conn) {
 	defer p.connPoolMu.Unlock()
 
 	p.evictStale()
+
+	// NOTE: a "liveness" probe read from this conn was tried and reverted.
+	// It raced with the SOCKS5 server's own read deadline machinery and
+	// dropped the tunnel reliably in pool_test.go. Pooled conns here are
+	// POST-CONNECT tunnels (SOCKS5 CONNECT already completed) — if the peer
+	// closed cleanly there is nothing readable and the probe misfires. Dead
+	// pooled conns are detected by the caller on first write/read and are
+	// discarded there (see handleHTTP / handleConnect).
 
 	if len(p.connPool) >= p.maxIdle {
 		old := p.connPool[0]

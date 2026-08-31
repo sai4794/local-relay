@@ -58,9 +58,11 @@ func (r *Router) isBypassHost(host string) bool {
 	if r.bypassHostMap[host] {
 		return true
 	}
-	// Check for ".domain" suffix match
-	if idx := strings.LastIndex(host, "."); idx > 0 {
-		if r.bypassHostMap[host[idx:]] {
+	// Walk every dot position so any sub-depth (www.example.com,
+	// a.b.example.com) matches a bypass entry "example.com" via its
+	// stored ".example.com" key.
+	for i := 0; i < len(host); i++ {
+		if host[i] == '.' && r.bypassHostMap[host[i:]] {
 			return true
 		}
 	}

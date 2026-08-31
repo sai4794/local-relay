@@ -7,6 +7,7 @@ multi_tor:
   enabled: true
   binary: "/home/stb/tor/tor/tor"
   data_dir: "/home/stb/tor/data_multi"
+  library_path: "/home/stb/tor/tor"  # tor binary links against private libs here
   base_port: 9150
   control_base: 9160
   max_instances: 3

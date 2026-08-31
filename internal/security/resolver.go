@@ -7,7 +7,9 @@ import (
 	"time"
 )
 
-// dnsTTL balances freshness against per-request lookup cost.
+// Resolver TTL is intentionally ~5m: longer pinning turns a stale DNS answer
+// into an SSRF hole (host re-bound to a private IP after initial check).
+// Final resolution is done by the Tor exit — this cache is advisory only.
 const dnsTTL = 5 * time.Minute
 
 // resolver is a shared, mutex-guarded DNS cache used by both the SSRF

@@ -69,7 +69,9 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	// Round-robin across pickable instances (mask sign bit to avoid negative index on overflow)
 	idx := int((m.counter.Add(1)-1)&0x7fffffffffffffff) % len(pickFrom)
 	inst := pickFrom[idx]
-	// Map back to original ready idx for fallback loop if we used fresh subset
+	// Map back to original ready idx for fallback loop if we used fresh subset.
+	// Invariant: instance IDs are unique (derived from the spawn slot 1..N),
+	// so the first ID match IS the picked instance.
 	if len(fresh) > 0 {
 		for i, r := range ready {
 			if r.ID == inst.ID {

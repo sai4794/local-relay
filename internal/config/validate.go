@@ -71,6 +71,24 @@ func Validate(cfg *Config) error {
 		return fmt.Errorf("auth.api_key must be at least 16 characters")
 	}
 
+	// Rate limits: negatives are meaningless; zero falls through to "disabled"
+	// (firewall) — anything else must be sane.
+	if cfg.Security.RateLimit < 0 || cfg.Security.RateBurst < 0 {
+		return fmt.Errorf("security.rate_limit / rate_burst must not be negative")
+	}
+
+	// Multi-tor port ranges must be valid and non-overlapping with the
+	// proxy listeners and each other.
+	if cfg.MultiTor.Enabled {
+		for i := 0; i < cfg.MultiTor.MaxInstances; i++ {
+			socks := cfg.MultiTor.BasePort + i
+			ctrl := cfg.MultiTor.ControlBase + i
+			if socks < 1 || socks > 65535 || ctrl < 1 || ctrl > 65535 {
+				return fmt.Errorf("multi_tor port out of range (socks=%d ctrl=%d)", socks, ctrl)
+			}
+		}
+	}
+
 	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLevels[cfg.Logging.Level] {
 		return fmt.Errorf("logging.level must be one of: debug, info, warn, error")
