@@ -10,7 +10,7 @@ multi_tor:
   base_port: 9150
   control_base: 9160
   max_instances: 3
-  rotate_after: 200  # Rotate individual instance after 200 requests (was 50)
+  rotate_after: 0  # Disabled: don't throw away healthy circuits – only rotate on 429/feedback (was 200)
 
 # Single Tor / fallback
 backend:

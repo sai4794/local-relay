@@ -28,6 +28,41 @@ var copyBufPool = sync.Pool{
 	},
 }
 
+// Per-model rate limiter for nvidia/moonshotai – 2 req/s (500ms interval)
+// to avoid `429 reset after 3m4s`. Kimi removed per user request. Queues instead of blocking.
+var modelRateLimiters = struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}{last: make(map[string]time.Time)}
+
+func enforceModelRateLimit(host string) {
+	h := strings.ToLower(host)
+	if !strings.Contains(h, "nvidia") && !strings.Contains(h, "moonshot") && !strings.Contains(h, "integrate.api") && !strings.Contains(h, "opencode.ai") {
+		return
+	}
+	// Normalize host key (strip port)
+	if strings.Contains(h, ":") {
+		if hp, _, err := net.SplitHostPort(h); err == nil {
+			h = hp
+		}
+	}
+	modelRateLimiters.mu.Lock()
+	last, ok := modelRateLimiters.last[h]
+	now := time.Now()
+	minInterval := 500 * time.Millisecond // 2 req/s
+	if ok && now.Sub(last) < minInterval {
+		sleep := minInterval - now.Sub(last)
+		modelRateLimiters.mu.Unlock()
+		// Log throttling for observability (debug level to avoid spam)
+		// Use fmt to avoid import cycle - logger not available here, rely on caller log
+		time.Sleep(sleep)
+		modelRateLimiters.mu.Lock()
+		now = time.Now()
+	}
+	modelRateLimiters.last[h] = now
+	modelRateLimiters.mu.Unlock()
+}
+
 type HTTPProxy struct {
 	router    *backend.Router
 	auth      *auth.APIKeyAuth
@@ -127,6 +162,9 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "connection blocked", http.StatusForbidden)
 		return
 	}
+
+	// Per-model rate limiter: queue to 2 req/s for nvidia/moonshot to avoid 429 3m4s (kimi removed)
+	enforceModelRateLimit(host)
 
 	destConn, err := p.router.DialContext(r.Context(), "tcp", host)
 	if err != nil {
@@ -263,6 +301,8 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 					parsed.RawQuery = pathParsed.RawQuery
 				}
 				r.URL = parsed
+			} else if parsed.Path != "" && parsed.Path != "/" {
+				r.URL = parsed
 			} else {
 				r.URL = parsed.ResolveReference(r.URL)
 			}
@@ -312,6 +352,11 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		p.logger.Warn("blocked request to private/internal IP", "host", r.URL.Host)
 		http.Error(w, "request blocked", http.StatusForbidden)
 		return
+	}
+
+	// Per-model rate limiter: queue to 2 req/s for nvidia/moonshot to avoid 429 3m4s (kimi removed)
+	if !isBypass {
+		enforceModelRateLimit(r.URL.Host)
 	}
 
 	// Enforce the configured request body limit (if set).
@@ -364,25 +409,56 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		req.Header = headerClone
 
 		resp, lastErr = p.client.Do(req)
-		if lastErr == nil || !bodyRetryable(bodyOverCap) ||
-			attempt == maxUpstreamAttempts || !isRetryableConnectError(lastErr) ||
-			r.Context().Err() != nil {
-			break
+		if lastErr != nil {
+			if !bodyRetryable(bodyOverCap) ||
+				attempt == maxUpstreamAttempts || !isRetryableConnectError(lastErr) ||
+				r.Context().Err() != nil {
+				break
+			}
+			p.logger.Warn("upstream connect-phase failure, retrying on fresh circuit",
+				"url", sanitizeURL(r.URL),
+				"attempt", attempt,
+				"max_attempts", maxUpstreamAttempts,
+				"error", lastErr,
+			)
+			p.router.ReportAnomaly(-1)
+			select {
+			case <-time.After(retryDelay):
+			case <-r.Context().Done():
+				break
+			}
+			continue
 		}
 
-		p.logger.Warn("upstream connect-phase failure, retrying on fresh circuit",
-			"url", sanitizeURL(r.URL),
-			"attempt", attempt,
-			"max_attempts", maxUpstreamAttempts,
-			"error", lastErr,
-		)
-		// Mark the serving instance so rotation/next dial picks a healthy one.
-		p.router.ReportAnomaly(-1)
-
-		select {
-		case <-time.After(retryDelay):
-		case <-r.Context().Done():
+		// Got response – check for rate-limit that should trigger retry on fresh exit
+		contentTypeTmp := resp.Header.Get("Content-Type")
+		isSSEtmp := strings.Contains(contentTypeTmp, "text/event-stream")
+		if !isSSEtmp && (resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusServiceUnavailable) {
+			if attempt < maxUpstreamAttempts && bodyRetryable(bodyOverCap) && r.Context().Err() == nil {
+				p.logger.Warn("rate-limit detected, rotating exit and retrying",
+					"status", resp.StatusCode,
+					"url", sanitizeURL(r.URL),
+					"attempt", attempt,
+					"max_attempts", maxUpstreamAttempts,
+				)
+				resp.Body.Close()
+				p.router.ReportAnomaly(-1)
+				select {
+				case <-time.After(retryDelay):
+				case <-r.Context().Done():
+					break
+				}
+				continue
+			}
+			// Final attempt – still rate-limited, rotate for next request and fall through to forward 429
+			p.logger.Warn("rate-limit detected, triggering instant circuit rotation",
+				"status", resp.StatusCode,
+				"url", sanitizeURL(r.URL),
+			)
+			p.router.ReportAnomaly(-1)
 		}
+		break
 	}
 
 	if lastErr != nil {
@@ -395,17 +471,6 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	contentType := resp.Header.Get("Content-Type")
 	isSSE := strings.Contains(contentType, "text/event-stream")
-
-	// Rate-limit detection — trigger instant circuit rotation on 429/503
-	// BUT skip for SSE streams: rotating the circuit mid-stream would interrupt the upstream connection
-	if !isSSE && (resp.StatusCode == http.StatusTooManyRequests ||
-		resp.StatusCode == http.StatusServiceUnavailable) {
-		p.logger.Warn("rate-limit detected, triggering instant circuit rotation",
-			"status", resp.StatusCode,
-			"url", sanitizeURL(r.URL),
-		)
-		p.router.ReportAnomaly(-1)
-	}
 
 	p.forwardResponse(w, resp, isSSE)
 }
@@ -493,12 +558,15 @@ func stripForwardHeaders(h http.Header) {
 
 const (
 	// maxUpstreamAttempts bounds transparent retries for connect-phase
-	// failures (dead circuit, TLS handshake timeout, reset). Each attempt
-	// re-dials; ReportAnomaly steers subsequent dials away from the sick one.
+	// failures (dead circuit, TLS handshake timeout, reset) and for
+	// rate-limit retries (429/503). Each attempt re-dials; ReportAnomaly
+	// steers subsequent dials away from the sick one.
 	maxUpstreamAttempts = 3
-	// retryDelay pauses between upstream attempts so Tor has a beat to
-	// switch circuits.
-	retryDelay = 200 * time.Millisecond
+	// retryDelay pauses between upstream attempts so Tor has time to
+	// build a fresh circuit. Tor needs 2-5s after NEWNYM; 200ms was too
+	// short and caused 19s hangs on second attempt. 4s covers 10s
+	// NEWNYM cooldown + 2s circuit build with margin.
+	retryDelay = 4000 * time.Millisecond
 	// maxRetryBodySize caps how much of a request body is buffered for
 	// replay across attempts. Larger bodies stream single-shot.
 	maxRetryBodySize = 8 << 20 // 8 MB

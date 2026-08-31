@@ -54,20 +54,45 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 		return nil, fmt.Errorf("no ready Tor instances")
 	}
 
-	// Round-robin across ready instances (mask sign bit to avoid negative index on overflow)
-	idx := int((m.counter.Add(1)-1)&0x7fffffffffffffff) % len(ready)
-	inst := ready[idx]
+	// Avoid picking instance that was just rotated (still building new circuit)
+	// Prefer fresh instances not rotated in last 5s; fallback to all if none fresh
+	fresh := make([]*TorInstance, 0, len(ready))
+	for _, inst := range ready {
+		if time.Since(inst.GetLastRotated()) > 5*time.Second {
+			fresh = append(fresh, inst)
+		}
+	}
+	pickFrom := ready
+	if len(fresh) > 0 {
+		pickFrom = fresh
+	}
+	// Round-robin across pickable instances (mask sign bit to avoid negative index on overflow)
+	idx := int((m.counter.Add(1)-1)&0x7fffffffffffffff) % len(pickFrom)
+	inst := pickFrom[idx]
+	// Map back to original ready idx for fallback loop if we used fresh subset
+	if len(fresh) > 0 {
+		for i, r := range ready {
+			if r.ID == inst.ID {
+				idx = i
+				break
+			}
+		}
+	}
 
+	// IsolateSOCKSAuth: per-request username ensures Tor builds distinct circuits
+	// even with MaxCircuitDirtiness reuse; also prevents conflux mixing.
+	isoUser := fmt.Sprintf("relay:%d:%d", inst.ID, time.Now().UnixNano())
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort())
-	conn, err := m.socksClient.Connect(ctx, socksAddr, addr, "")
+	conn, err := m.socksClient.Connect(ctx, socksAddr, addr, isoUser)
 	if err != nil {
 		m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
-		// Try next instance
+		// Try next instance with fresh isolation user
 		for i := 1; i < len(ready); i++ {
 			nextIdx := (idx + i) % len(ready)
 			inst = ready[nextIdx]
 			socksAddr = fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort())
-			conn, err = m.socksClient.Connect(ctx, socksAddr, addr, "")
+			isoUser = fmt.Sprintf("relay:%d:%d", inst.ID, time.Now().UnixNano())
+			conn, err = m.socksClient.Connect(ctx, socksAddr, addr, isoUser)
 			if err == nil {
 				break
 			}
@@ -137,9 +162,16 @@ func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
 	if slotIdx >= 0 && slotIdx < len(instances) {
 		target = instances[slotIdx]
 	} else {
-		// If slotIdx is unknown (-1), rotate the current round-robin candidate safely
+		// If slotIdx is unknown (-1), prefer an instance that hasn't been rotated in the last 10s
 		idx := int(m.counter.Load()&0x7fffffffffffffff) % len(instances)
 		target = instances[idx]
+		for i := 0; i < len(instances); i++ {
+			cand := instances[(idx+i)%len(instances)]
+			if time.Since(cand.GetLastRotated()) >= 10*time.Second {
+				target = cand
+				break
+			}
+		}
 	}
 
 	m.logf("multi-tor: anomaly reported (slot %d), triggering circuit rotation on instance %d", slotIdx, target.ID)

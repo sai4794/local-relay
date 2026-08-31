@@ -268,18 +268,22 @@ func (tl *TorLifecycle) spawnInstance(id int) (*TorInstance, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	torrc := fmt.Sprintf(`SocksPort %d
+	torrc := fmt.Sprintf(`SocksPort %d IsolateSOCKSAuth
 DataDirectory %s
 Log notice file %s/tor.log
 ControlPort %d
 CookieAuthentication 1
+DormantClientTimeout 30 days
+DormantOnFirstStartup 0
+DormantCanceledByStartup 1
 KeepalivePeriod 60
-MaxCircuitDirtiness 180
-CircuitBuildTimeout 15
+MaxCircuitDirtiness 20
+CircuitBuildTimeout 30
 LearnCircuitBuildTimeout 1
-NumEntryGuards 10
+NumEntryGuards 2
 UseEntryGuards 1
-ExcludeNodes $9AA56B3478DE9C8350F544DFBCA182CC20E5A733
+SafeSocks 1
+TestSocks 1
 `, socksPort, dataDir, dataDir, controlPort)
 
 	torrcPath := filepath.Join(dataDir, "torrc")
@@ -288,6 +292,7 @@ ExcludeNodes $9AA56B3478DE9C8350F544DFBCA182CC20E5A733
 	}
 
 	cmd := exec.Command(tl.binary, "-f", torrcPath)
+	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH=/home/stb/tor/tor")
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 
@@ -368,6 +373,8 @@ func (tl *TorLifecycle) GetReadyCount() int {
 // CheckHealth restarts instances whose SOCKS port is no longer accepting
 // connections after multiple consecutive probe failures, while honoring a grace
 // period after NEWNYM rotation so healthy instances aren't churned.
+// Fixed: uses SOCKS5 handshake (not bare TCP) and checks consensus freshness
+// to catch "circuit-established but no exit" stall observed at 15:54.
 func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 	tl.mu.RLock()
 	instances := make([]*TorInstance, len(tl.instances))
@@ -385,11 +392,15 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 			continue
 		}
 
-		// A SOCKS port that refuses new TCP connections across 3 consecutive checks
-		// indicates the instance is genuinely down.
-		if !tl.isTcpAlive(inst.GetSocksPort()) {
+		staleConsensus := tl.isConsensusStale(inst)
+		socksReady := tl.isSocksPortReady(inst.GetSocksPort())
+		if !socksReady || staleConsensus {
+			reason := "SOCKS handshake failed"
+			if staleConsensus {
+				reason = "consensus stale >90m"
+			}
 			fails := inst.IncFailCount()
-			tl.logf("Tor instance %d SOCKS probe failed (consecutive fails: %d/3)", inst.ID, fails)
+			tl.logf("Tor instance %d health failed (%s) (consecutive fails: %d/3)", inst.ID, reason, fails)
 			if fails >= 3 {
 				unhealthy = append(unhealthy, inst)
 			} else if inst.TryStartHeal() {
@@ -399,7 +410,7 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 						return
 					}
 					tl.logf("Tor instance %d triggering proactive DROPGUARDS auto-heal (2m cooldown)...", target.ID)
-					_ = tl.RequestNewCircuit(target)
+					_ = tl.RequestNewCircuitWithDropGuards(target, true)
 				}(inst)
 			}
 		} else {
@@ -423,15 +434,30 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 	return restarted
 }
 
-// isTcpAlive reports whether a TCP listener is accepting connections on the
-// given port with a 5-second timeout.
+// isTcpAlive is deprecated; now delegates to SOCKS5 handshake to avoid masking
+// circuit stalls where TCP succeeds but CONNECT fails.
 func (tl *TorLifecycle) isTcpAlive(port int) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+	return tl.isSocksPortReady(port)
+}
+
+// isConsensusStale reports true if the cached microdesc consensus is older than 90m.
+// This catches instances that stopped fetching directory info (stale consensus
+// leads to "waiting for circuit" with valid TCP/SOCKS handshake).
+func (tl *TorLifecycle) isConsensusStale(inst *TorInstance) bool {
+	path := filepath.Join(inst.DataDir, "cached-microdesc-consensus")
+	info, err := os.Stat(path)
 	if err != nil {
-		return false
+		return true
 	}
-	conn.Close()
-	return true
+	// Fresh-until is 1h, valid-until 3h. >90m indicates fetch stall.
+	if time.Since(info.ModTime()) > 90*time.Minute {
+		return true
+	}
+	// Also check that file is not empty/truncated
+	if info.Size() < 1024*1024 {
+		return true
+	}
+	return false
 }
 
 // waitReady polls a respawned instance until it can route through its SOCKS
@@ -510,15 +536,24 @@ func (tl *TorLifecycle) ShutdownAll() {
 	}
 }
 
-// RequestNewCircuit rotates the instance's circuits: DROPGUARDS clears
-// stalled guard nodes, then SIGNAL NEWNYM builds a fresh circuit (new exit
-// IP, subject to Tor's guard rotation policy). Cookie auth uses the
-// per-instance cache to avoid re-reading the cookie file on every rotation.
+// RequestNewCircuit rotates the instance's circuits: SIGNAL NEWNYM builds
+// a fresh circuit (new exit IP) without dropping healthy guard nodes.
+// A 10-second cooldown is enforced to match Tor's native NEWNYM rate-limit.
+// Cookie auth uses the per-instance cache to avoid re-reading the cookie file on every rotation.
 func (tl *TorLifecycle) RequestNewCircuit(inst *TorInstance) error {
+	return tl.RequestNewCircuitWithDropGuards(inst, false)
+}
+
+// RequestNewCircuitWithDropGuards requests a new circuit, optionally clearing guards on recovery.
+func (tl *TorLifecycle) RequestNewCircuitWithDropGuards(inst *TorInstance, dropGuards bool) error {
+	if !dropGuards && time.Since(inst.GetLastRotated()) < 10*time.Second {
+		return nil
+	}
+
 	controlAddr := fmt.Sprintf("127.0.0.1:%d", inst.ControlPort)
 	client := NewTorControlClient(controlAddr, "", tl.cachedCookie(inst))
 
-	if err := client.SignalNEWNYM(true); err != nil {
+	if err := client.SignalNEWNYM(dropGuards); err != nil {
 		return err
 	}
 

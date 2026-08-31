@@ -116,14 +116,26 @@ func writeCommand(conn net.Conn, reader *bufio.Reader, cmd string) error {
 // cookieSize is the fixed length of a Tor control-auth cookie.
 const cookieSize = 32
 
-// readCookieFile loads a control-auth cookie from disk.
+// readCookieFile loads a control-auth cookie from disk with retry to handle
+// Tor's atomic replace race where file is briefly 0 bytes (observed
+// "Got authentication cookie with wrong length (0)" warnings).
 func readCookieFile(path string) ([]byte, bool) {
 	if path == "" {
 		return nil, false
 	}
-	cookie, err := os.ReadFile(path)
-	if err != nil || len(cookie) != cookieSize {
+	for attempt := 0; attempt < 3; attempt++ {
+		cookie, err := os.ReadFile(path)
+		if err == nil && len(cookie) == cookieSize {
+			return cookie, true
+		}
+		if err == nil && len(cookie) == 0 && attempt < 2 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			return nil, false
+		}
 		return nil, false
 	}
-	return cookie, true
+	return nil, false
 }
