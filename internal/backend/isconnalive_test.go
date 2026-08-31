@@ -129,20 +129,23 @@ func TestDeadConn_DetectedOnWrite(t *testing.T) {
 	}
 	defer ln.Close()
 
+	accepted := make(chan net.Conn, 1)
 	go func() {
 		c, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		// RST instead of FIN
-		c.(*net.TCPConn).SetLinger(0)
-		c.Close()
+		accepted <- c
 	}()
 
 	client, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Deterministic ordering: accept first, then RST, then write.
+	server := <-accepted
+	server.(*net.TCPConn).SetLinger(0)
+	server.Close()
 	time.Sleep(10 * time.Millisecond)
 
 	_, err = client.Write([]byte("x"))
@@ -159,20 +162,23 @@ func TestDeadConn_DetectedOnWrite_RST(t *testing.T) {
 	}
 	defer ln.Close()
 
+	accepted := make(chan net.Conn, 1)
 	go func() {
 		c, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		// RST instead of FIN
-		c.(*net.TCPConn).SetLinger(0)
-		c.Close()
+		accepted <- c
 	}()
 
 	client, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Deterministic ordering: accept first, then RST, then write.
+	server := <-accepted
+	server.(*net.TCPConn).SetLinger(0)
+	server.Close()
 	time.Sleep(10 * time.Millisecond)
 
 	// Write should fail with RST

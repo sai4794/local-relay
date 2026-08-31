@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/local-relay/proxy/internal/metrics"
 )
 
 type HealthServer struct {
@@ -158,6 +160,36 @@ func (hs *HealthServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		healthy = 1
 	}
 	fmt.Fprintf(w, "relay_healthy %d\n", healthy)
+
+	// Per-instance gauges from backend status (multi-tor): in-flight load
+	// and the observed exit IP exposed as an info-style metric.
+	if hs.checker != nil {
+		info := hs.checker.GetStatus()
+		if b, ok := info["backend"]; ok {
+			if bm, ok := b.(map[string]interface{}); ok {
+				// instances may sit directly (multi-tor Status()) or one
+				// level deeper under backend.backend (wrapped by main.go).
+				insts, direct := bm["instances"].([]map[string]interface{})
+				if !direct {
+					if nested, ok := bm["backend"].(map[string]interface{}); ok {
+						insts, _ = nested["instances"].([]map[string]interface{})
+					}
+				}
+				for _, inst := range insts {
+					id, _ := inst["id"].(int)
+					if fl, ok := inst["in_flight"].(int64); ok {
+						fmt.Fprintf(w, "lano_in_flight{instance=\"%d\"} %d\n", id, fl)
+					}
+					if ip, ok := inst["exit_ip"].(string); ok && ip != "" {
+						fmt.Fprintf(w, "lano_exit_ip{instance=\"%d\",ip=\"%s\"} 1\n", id, ip)
+					}
+				}
+			}
+		}
+	}
+
+	// Counter series recorded by the process-wide metrics registry.
+	metrics.Default().Render(w)
 
 	if hs.checker != nil {
 		info := hs.checker.GetStatus()

@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/local-relay/proxy/internal/metrics"
 	"github.com/local-relay/proxy/internal/transport"
 )
 
@@ -54,8 +56,11 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 		return nil, fmt.Errorf("no ready Tor instances")
 	}
 
-	// Avoid picking instance that was just rotated (still building new circuit)
-	// Prefer fresh instances not rotated in last 5s; fallback to all if none fresh
+	// In multi-tor mode every request builds a fresh Tor circuit via
+	// IsolateSOCKSAuth, so "round-robin" would land a long LLM stream on an
+	// instance that might already be serving another one. Pick the ready
+	// instance with the FEWEST in-flight requests; tie-break on least
+	// recently rotated so a post-429 instance isn't immediately re-picked.
 	fresh := make([]*TorInstance, 0, len(ready))
 	for _, inst := range ready {
 		if time.Since(inst.GetLastRotated()) > 5*time.Second {
@@ -66,18 +71,21 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	if len(fresh) > 0 {
 		pickFrom = fresh
 	}
-	// Round-robin across pickable instances (mask sign bit to avoid negative index on overflow)
-	idx := int((m.counter.Add(1)-1)&0x7fffffffffffffff) % len(pickFrom)
-	inst := pickFrom[idx]
-	// Map back to original ready idx for fallback loop if we used fresh subset.
-	// Invariant: instance IDs are unique (derived from the spawn slot 1..N),
-	// so the first ID match IS the picked instance.
-	if len(fresh) > 0 {
-		for i, r := range ready {
-			if r.ID == inst.ID {
-				idx = i
-				break
-			}
+	var inst *TorInstance
+	minInFlight := int64(-1)
+	for _, cand := range pickFrom {
+		if minInFlight < 0 || cand.InFlight() < minInFlight {
+			inst = cand
+			minInFlight = cand.InFlight()
+		}
+	}
+	// Map back to original ready idx for fallback loop. Invariant: IDs are
+	// unique (spawn slot 1..N), so first match IS the picked instance.
+	idx := 0
+	for i, r := range ready {
+		if r.ID == inst.ID {
+			idx = i
+			break
 		}
 	}
 
@@ -106,6 +114,13 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	}
 
 	inst.IncRequests()
+	metrics.Default().Inc("lano_requests_total", map[string]string{
+		"instance": strconv.Itoa(inst.ID),
+	})
+
+	// Increment in-flight before wrapping so Close always balances it.
+	inst.IncInFlight()
+	conn = &inFlightConn{Conn: conn, inst: inst}
 
 	// Check if this instance needs rotation (reset counter synchronously to prevent stampedes)
 	if m.lifecycle.rotateAfter > 0 && inst.GetRequests() >= int64(m.lifecycle.rotateAfter) {
@@ -120,6 +135,21 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	}
 
 	return conn, nil
+}
+
+// inFlightConn decrements the instance's in-flight counter on Close.
+// Double-close is safe — the atomic flag guards it.
+type inFlightConn struct {
+	net.Conn
+	inst     *TorInstance
+	released atomic.Bool
+}
+
+func (c *inFlightConn) Close() error {
+	if c.released.CompareAndSwap(false, true) {
+		c.inst.DecInFlight()
+	}
+	return c.Conn.Close()
 }
 
 // IsHealthy returns true if at least one Tor instance is ready.
@@ -137,11 +167,14 @@ func (m *MultiTorBackend) Status() map[string]interface{} {
 	instances := m.lifecycle.GetInstances()
 	statuses := make([]map[string]interface{}, len(instances))
 	for i, inst := range instances {
+		exitIP, _ := inst.LastExitIP()
 		statuses[i] = map[string]interface{}{
-			"id":       inst.ID,
-			"socks":    inst.GetSocksPort(),
-			"ready":    inst.IsReady(),
-			"requests": inst.GetRequests(),
+			"id":        inst.ID,
+			"socks":     inst.GetSocksPort(),
+			"ready":     inst.IsReady(),
+			"requests":  inst.GetRequests(),
+			"in_flight": inst.InFlight(),
+			"exit_ip":   exitIP,
 		}
 	}
 	return map[string]interface{}{

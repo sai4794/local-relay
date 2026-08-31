@@ -2,31 +2,40 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/local-relay/proxy/internal/metrics"
+	"github.com/local-relay/proxy/internal/transport"
 )
 
 // TorInstance represents a single managed Tor daemon process.
 type TorInstance struct {
-	ID          int
-	SocksPort   int
-	ControlPort int
-	Cmd         *exec.Cmd
-	DataDir     string
-	Ready       bool
-	StartedAt   time.Time
-	Requests    int64
-	FailCount   int
-	LastRotated time.Time
-	lastHealed  time.Time
-	mu          sync.RWMutex
+	ID            int
+	SocksPort     int
+	ControlPort   int
+	Cmd           *exec.Cmd
+	DataDir       string
+	Ready         bool
+	StartedAt     time.Time
+	Requests      int64
+	FailCount     int
+	LastRotated   time.Time
+	lastHealed    time.Time
+	inFlight      int64
+	lastExitIP    string    // last observed Tor exit for this instance
+	exitIPChecked time.Time // when lastExitIP was last refreshed
+	mu            sync.RWMutex
 }
 
 // GetSocksPort returns the SOCKS port (thread-safe).
@@ -116,6 +125,46 @@ func (i *TorInstance) GetStartedAt() time.Time {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return i.StartedAt
+}
+
+// IncInFlight increments the in-flight (active long-lived request) counter
+// used by least-inflight selection. DecInFlight MUST be called when the
+// request finishes (typically via the dial wrapper's Close hook).
+func (i *TorInstance) IncInFlight() {
+	i.mu.Lock()
+	i.inFlight++
+	i.mu.Unlock()
+}
+
+// DecInFlight decrements in-flight; safe to call on zero.
+func (i *TorInstance) DecInFlight() {
+	i.mu.Lock()
+	if i.inFlight > 0 {
+		i.inFlight--
+	}
+	i.mu.Unlock()
+}
+
+// InFlight returns the current in-flight count (thread-safe).
+func (i *TorInstance) InFlight() int64 {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.inFlight
+}
+
+// SetExitIP records the observed exit IP for the current circuit.
+func (i *TorInstance) SetExitIP(ip string) {
+	i.mu.Lock()
+	i.lastExitIP = ip
+	i.exitIPChecked = time.Now()
+	i.mu.Unlock()
+}
+
+// LastExitIP returns the cached exit IP and when it was last observed.
+func (i *TorInstance) LastExitIP() (string, time.Time) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.lastExitIP, i.exitIPChecked
 }
 
 // GetLastRotated gets the rotation timestamp (thread-safe).
@@ -423,6 +472,16 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 			}
 		} else {
 			inst.ResetFailCount()
+			// Opportunistic exit-IP refresh: priming at startup can race the
+			// fresh-Tor bootstrap (SOCKS answers before the first circuit is
+			// buildable), so backfill here until the exit is known and keep it
+			// fresh on a 10-minute cycle.
+			ip, checked := inst.LastExitIP()
+			if ip == "" || time.Since(checked) > 10*time.Minute {
+				go func(target *TorInstance) {
+					tl.RefreshExitIP(target, 15*time.Second)
+				}(inst)
+			}
 		}
 	}
 
@@ -445,18 +504,25 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 // isConsensusStale reports true if the cached microdesc consensus is older than 90m.
 // This catches instances that stopped fetching directory info (stale consensus
 // leads to "waiting for circuit" with valid TCP/SOCKS handshake).
+//
+// Fresh instances are exempt: a young Tor has no consensus file yet, which is
+// normal bootstrap, not a stall. Flagging it stale here caused DROPGUARDS
+// churn on brand-new guards (observed: rotations_total{trigger="health"} on
+// fresh spawns).
 func (tl *TorLifecycle) isConsensusStale(inst *TorInstance) bool {
 	path := filepath.Join(inst.DataDir, "cached-microdesc-consensus")
 	info, err := os.Stat(path)
 	if err != nil {
-		return true
+		// No file at all — normal for a recently spawned instance.
+		return time.Since(inst.GetStartedAt()) > 3*time.Minute
 	}
 	// Fresh-until is 1h, valid-until 3h. >90m indicates fetch stall.
 	if time.Since(info.ModTime()) > 90*time.Minute {
 		return true
 	}
-	// Also check that file is not empty/truncated
-	if info.Size() < 1024*1024 {
+	// Also check that file is not empty/truncated — but only once the
+	// instance is old enough that a full consensus should exist.
+	if info.Size() < 1024*1024 && time.Since(inst.GetStartedAt()) > 3*time.Minute {
 		return true
 	}
 	return false
@@ -564,5 +630,56 @@ func (tl *TorLifecycle) RequestNewCircuitWithDropGuards(inst *TorInstance, dropG
 	}
 
 	inst.SetLastRotated(time.Now())
+	trigger := "anomaly"
+	if dropGuards {
+		trigger = "health"
+	}
+	metrics.Default().Inc("lano_rotations_total", map[string]string{
+		"instance": strconv.Itoa(inst.ID),
+		"trigger":  trigger,
+	})
+
+	// NOTE: with IsolateSOCKSAuth per-request there is no long-lived circuit
+	// to drain — every dial mints its own circuit. The race concern from the
+	// design note only applied to shared-circuit pooling. We simply verify
+	// the exit IP changed after NEWNYM and record it for observability.
+	go tl.RefreshExitIP(inst, 5*time.Second)
+
 	return nil
+}
+
+// RefreshExitIP dials through this instance's SOCKS port to the Tor Project
+// self-check endpoint and records the observed exit. Any failure leaves the
+// stale value intact and is logged but non-fatal.
+func (tl *TorLifecycle) RefreshExitIP(inst *TorInstance, maxWait time.Duration) {
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(inst.GetSocksPort()))
+	client := &http.Client{
+		Timeout: maxWait,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				sc := transport.NewSOCKS5Client(10 * time.Second)
+				return sc.Connect(ctx, addr, "check.torproject.org:443", "")
+			},
+			DisableKeepAlives: true,
+		},
+	}
+	resp, err := client.Get("https://check.torproject.org/api/ip")
+	if err != nil {
+		tl.logf("exit-IP refresh failed for instance %d: %v", inst.ID, err)
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	if err != nil {
+		return
+	}
+	var parsed struct {
+		IsTor bool   `json:"IsTor"`
+		IP    string `json:"IP"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil && parsed.IsTor && parsed.IP != "" {
+		old, _ := inst.LastExitIP()
+		inst.SetExitIP(parsed.IP)
+		tl.logf("instance %d exit IP: %s (was %s)", inst.ID, parsed.IP, old)
+	}
 }

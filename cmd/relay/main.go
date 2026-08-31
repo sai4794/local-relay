@@ -154,6 +154,13 @@ func buildBackendStack(ctx context.Context, cfg *config.Config, logger *slog.Log
 			logger.Info("Multi-Tor backend ready",
 				"instances", s.torLifecycle.GetReadyCount(),
 			)
+			// Prime exit-IP visibility: probe each instance's exit once
+			// so /health and metrics show real IPs before the first rotation.
+			for _, inst := range s.torLifecycle.GetInstances() {
+				go func(i *backend.TorInstance) {
+					s.torLifecycle.RefreshExitIP(i, 15*time.Second)
+				}(inst)
+			}
 		}
 
 	case cfg.IsPool():
@@ -247,8 +254,15 @@ func authMiddlewareOrNil(cfg *config.Config) *auth.APIKeyAuth {
 }
 
 // buildRotator wires request-count-based rotation into whichever backend is active.
+// In multi-Tor mode rotation is driven purely by per-instance anomaly events
+// (429/503/dead-tunnel), so no request-count Rotator is created — global churn
+// would pound ALL instances on any error and defeats per-instance isolation.
 func buildRotator(cfg *config.Config, s *backendStack, logger *slog.Logger) *rotate.Rotator {
 	if !cfg.Rotation.Enabled {
+		return nil
+	}
+	if s.multiTor != nil {
+		logger.Info("Multi-Tor active: request-count rotator disabled (rotation is per-instance)")
 		return nil
 	}
 
@@ -349,6 +363,9 @@ func startServers(
 		go func() {
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
+			// allDownSince escalates to a full Tor stack restart when every
+			// instance has been continuously unhealthy.
+			var allDownSince time.Time
 			for {
 				select {
 				case <-ctx.Done():
@@ -357,6 +374,25 @@ func startServers(
 					restarted := torLifecycle.CheckHealth(ctx)
 					if restarted > 0 {
 						logger.Info("Restarted dead Tor instances", "count", restarted)
+					}
+					// Dead-man's switch: if every instance has been down for
+					// >2 minutes individual heals aren't cutting it — recycle
+					// the whole Tor stack once (guards/consensus preserved).
+					ready := torLifecycle.GetReadyCount()
+					if ready == 0 {
+						if allDownSince.IsZero() {
+							allDownSince = time.Now()
+						} else if time.Since(allDownSince) > 2*time.Minute {
+							logger.Error("FATAL: all Tor instances unhealthy > 2m — full multi-Tor restart",
+								"since", allDownSince)
+							torLifecycle.ShutdownAll()
+							if err := torLifecycle.Start(ctx); err != nil {
+								logger.Error("multi-Tor full restart failed", "error", err)
+							}
+							allDownSince = time.Time{} // re-arm
+						}
+					} else {
+						allDownSince = time.Time{}
 					}
 				}
 			}
