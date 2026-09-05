@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,6 +34,7 @@ type TorInstance struct {
 	LastRotated   time.Time
 	lastHealed    time.Time
 	inFlight      int64
+	circuitGen    atomic.Int64
 	lastExitIP    string    // last observed Tor exit for this instance
 	exitIPChecked time.Time // when lastExitIP was last refreshed
 	mu            sync.RWMutex
@@ -150,6 +152,20 @@ func (i *TorInstance) InFlight() int64 {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return i.inFlight
+}
+
+// CircuitGen returns the current circuit generation for SOCKS auth isolation.
+func (i *TorInstance) CircuitGen() int64 {
+	gen := i.circuitGen.Load()
+	if gen == 0 {
+		return 1
+	}
+	return gen
+}
+
+// NextCircuitGen increments and returns the next circuit generation.
+func (i *TorInstance) NextCircuitGen() int64 {
+	return i.circuitGen.Add(1)
 }
 
 // SetExitIP records the observed exit IP for the current circuit.
@@ -374,6 +390,7 @@ TestSocks 1
 		Ready:       false,
 		StartedAt:   time.Now(),
 	}
+	inst.circuitGen.Store(1)
 
 	tl.mu.Lock()
 	tl.instances = append(tl.instances, inst)
@@ -629,6 +646,7 @@ func (tl *TorLifecycle) RequestNewCircuitWithDropGuards(inst *TorInstance, dropG
 		return err
 	}
 
+	inst.NextCircuitGen()
 	inst.SetLastRotated(time.Now())
 	trigger := "anomaly"
 	if dropGuards {

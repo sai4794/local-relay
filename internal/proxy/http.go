@@ -30,13 +30,23 @@ var copyBufPool = sync.Pool{
 
 // Per-model rate limiter for nvidia/moonshotai — 2 req/s (500ms interval)
 // to avoid `429 reset after 3m4s`. Kimi removed per user request.
-// Mutex is held across the sleep so concurrent same-host callers are
-// serialized into real spacing instead of all waking and re-stamping
-// `last` together (which previously collapsed to 1 interval total).
-var modelRateLimiters = struct {
+// Each provider has its own independent rate limiter with context awareness,
+// so requests to one provider never block requests to other providers.
+type hostRateLimiter struct {
 	mu   sync.Mutex
-	last map[string]time.Time
-}{last: make(map[string]time.Time)}
+	last time.Time
+}
+
+var hostLimiters sync.Map // string -> *hostRateLimiter
+
+func getHostLimiter(host string) *hostRateLimiter {
+	val, ok := hostLimiters.Load(host)
+	if ok {
+		return val.(*hostRateLimiter)
+	}
+	actual, _ := hostLimiters.LoadOrStore(host, &hostRateLimiter{})
+	return actual.(*hostRateLimiter)
+}
 
 // exactHosts matched at full-name granularity; previous strings.Contains
 // matched any host containing the substring (e.g. "notnvidia.example.com").
@@ -47,7 +57,7 @@ var rateLimitedHosts = map[string]bool{
 	"api.moonshot.ai":          true,
 }
 
-func enforceModelRateLimit(host string) {
+func enforceModelRateLimit(ctx context.Context, host string) {
 	h := strings.ToLower(host)
 	// Normalize host key (strip port)
 	if strings.Contains(h, ":") {
@@ -56,27 +66,33 @@ func enforceModelRateLimit(host string) {
 		}
 	}
 	// Match exact host or any subdomain of a listed host.
-	matched := false
+	matchedKey := ""
 	for lh := range rateLimitedHosts {
 		if h == lh || strings.HasSuffix(h, "."+lh) {
-			matched = true
+			matchedKey = lh
 			break
 		}
 	}
-	if !matched {
+	if matchedKey == "" {
 		return
 	}
 
-	modelRateLimiters.mu.Lock()
-	defer modelRateLimiters.mu.Unlock()
+	hl := getHostLimiter(matchedKey)
+	hl.mu.Lock()
+	defer hl.mu.Unlock()
+
 	const minInterval = 500 * time.Millisecond // 2 req/s
-	last, ok := modelRateLimiters.last[h]
 	now := time.Now()
-	if ok && now.Sub(last) < minInterval {
-		time.Sleep(minInterval - now.Sub(last))
+	if !hl.last.IsZero() && now.Sub(hl.last) < minInterval {
+		wait := minInterval - now.Sub(hl.last)
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return
+		}
 		now = time.Now()
 	}
-	modelRateLimiters.last[h] = now
+	hl.last = now
 }
 
 type HTTPProxy struct {
@@ -180,7 +196,7 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Per-model rate limiter: queue to 2 req/s for nvidia/moonshot to avoid 429 3m4s (kimi removed)
-	enforceModelRateLimit(host)
+	enforceModelRateLimit(r.Context(), host)
 
 	destConn, err := p.router.DialContext(r.Context(), "tcp", host)
 	if err != nil {
@@ -237,33 +253,18 @@ func (p *HTTPProxy) relayConn(host string, destConn, clientConn net.Conn) {
 	defer relayCancel()
 
 	start := time.Now()
-	done := make(chan struct{})
-	var upstreamToClient, clientToUpstream int64
-	go func() {
-		upstreamToClient, clientToUpstream = stream.Relay(relayCtx, destConn, clientConn)
-		close(done)
-	}()
+	clientToUpstream, upstreamToClient := stream.Relay(relayCtx, destConn, clientConn)
 
-	// A tunnel that closes within 2s likely hit a dead pooled connection.
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-
-	select {
-	case <-done:
-		if elapsed := time.Since(start); elapsed < deadTunnelWindow {
-			if upstreamToClient == 0 {
-				p.logger.Warn("dead tunnel detected (no bytes returned), triggering rotation",
-					"host", host, "duration", elapsed, "client_sent", clientToUpstream)
-				p.rotateForDeadTunnel()
-			} else {
-				p.logger.Debug("short tunnel completed with data — no rotation",
-					"host", host, "duration", elapsed,
-					"upstream_to_client", upstreamToClient, "client_to_upstream", clientToUpstream)
-			}
+	if elapsed := time.Since(start); elapsed < deadTunnelWindow {
+		if upstreamToClient == 0 {
+			p.logger.Warn("dead tunnel detected (no bytes returned), triggering rotation",
+				"host", host, "duration", elapsed, "client_sent", clientToUpstream)
+			p.rotateForDeadTunnel()
+		} else {
+			p.logger.Debug("short tunnel completed with data — no rotation",
+				"host", host, "duration", elapsed,
+				"upstream_to_client", upstreamToClient, "client_to_upstream", clientToUpstream)
 		}
-	case <-timer.C:
-		// Tunnel lived long enough — the relay keeps running in the background
-		// and cleans itself up via stream.Relay.
 	}
 }
 
@@ -372,7 +373,7 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Per-model rate limiter: queue to 2 req/s for nvidia/moonshot to avoid 429 3m4s (kimi removed)
 	if !isBypass {
-		enforceModelRateLimit(r.URL.Host)
+		enforceModelRateLimit(r.Context(), r.URL.Host)
 	}
 
 	// Enforce the configured request body limit (if set).
@@ -440,7 +441,7 @@ retryLoop:
 			)
 			p.router.ReportAnomaly(-1)
 			select {
-			case <-time.After(retryDelay):
+			case <-time.After(retryDelay(attempt)):
 			case <-r.Context().Done():
 				break retryLoop
 			}
@@ -462,7 +463,7 @@ retryLoop:
 				resp.Body.Close()
 				p.router.ReportAnomaly(-1)
 				select {
-				case <-time.After(retryDelay):
+				case <-time.After(retryDelay(attempt)):
 				case <-r.Context().Done():
 					break retryLoop
 				}
@@ -579,15 +580,25 @@ const (
 	// rate-limit retries (429/503). Each attempt re-dials; ReportAnomaly
 	// steers subsequent dials away from the sick one.
 	maxUpstreamAttempts = 3
-	// retryDelay pauses between upstream attempts so Tor has time to
-	// build a fresh circuit. Tor needs 2-5s after NEWNYM; 200ms was too
-	// short and caused 19s hangs on second attempt. 4s covers 10s
-	// NEWNYM cooldown + 2s circuit build with margin.
-	retryDelay = 4000 * time.Millisecond
+
 	// maxRetryBodySize caps how much of a request body is buffered for
 	// replay across attempts. Larger bodies stream single-shot.
-	maxRetryBodySize = 8 << 20 // 8 MB
+	// 1 MB covers all standard LLM prompts and API JSON payloads without
+	// imposing multi-megabyte pre-dial memory buffering overhead.
+	maxRetryBodySize = 1 << 20 // 1 MB
 )
+
+// retryDelay pauses between upstream attempts with progressive backoff.
+// In multi-Tor (3 instances) and circuit pools, alternate healthy circuits/instances
+// are already warm and available, making 200ms-400ms fast backoff optimal instead
+// of 4-second stalls.
+func retryDelay(attempt int) time.Duration {
+	d := time.Duration(attempt) * 200 * time.Millisecond
+	if d > 1*time.Second {
+		d = 1 * time.Second
+	}
+	return d
+}
 
 // bodyRetryable reports whether the buffered body allows another attempt.
 func bodyRetryable(streamed bool) bool { return !streamed }

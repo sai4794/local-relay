@@ -11,15 +11,14 @@ import (
 // Resolver TTL is intentionally ~5m: longer pinning turns a stale DNS answer
 // into an SSRF hole (host re-bound to a private IP after initial check).
 // Final resolution is done by the Tor exit — this cache is advisory only.
-const dnsTTL = 5 * time.Minute
+const (
+	dnsTTL         = 5 * time.Minute
+	negativeDNSTTL = 30 * time.Second
+)
 
-// resolver is a shared, mutex-guarded DNS cache used by both the SSRF
-// blocker and the firewall so a single request never triggers two
-// independent lookups of the same host.
-type resolver struct {
-	cache  map[string]dnsEntry
-	mu     sync.RWMutex
-	cancel context.CancelFunc
+type inFlightCall struct {
+	done chan struct{}
+	ips  []net.IP
 }
 
 type dnsEntry struct {
@@ -27,14 +26,33 @@ type dnsEntry struct {
 	expires time.Time
 }
 
-func newResolver() *resolver {
-	return &resolver{cache: make(map[string]dnsEntry)}
+// Resolver is a shared, mutex-guarded DNS cache with singleflight deduplication
+// used by both the SSRF blocker and the firewall so a single request never
+// triggers duplicate lookups of the same host.
+type Resolver struct {
+	cache    map[string]dnsEntry
+	inFlight map[string]*inFlightCall
+	mu       sync.RWMutex
+	cancel   context.CancelFunc
 }
 
-// Lookup returns cached results when fresh; otherwise performs a blocking
-// lookup and caches it. A failed or empty lookup returns nil and is NOT
-// cached (transient resolver failures must not poison the cache).
-func (r *resolver) Lookup(host string) []net.IP {
+// NewResolver constructs a new shared DNS resolver cache.
+func NewResolver() *Resolver {
+	return &Resolver{
+		cache:    make(map[string]dnsEntry),
+		inFlight: make(map[string]*inFlightCall),
+	}
+}
+
+// newResolver provides package-internal compatibility.
+func newResolver() *Resolver {
+	return NewResolver()
+}
+
+// Lookup returns cached results when fresh; otherwise performs a deduplicated
+// lookup and caches it. Failed lookups are negatively cached for negativeDNSTTL
+// (30s) to prevent repetitive timeouts during bursts.
+func (r *Resolver) Lookup(host string) []net.IP {
 	hostOnly := strings.ToLower(host)
 	if h, _, err := net.SplitHostPort(hostOnly); err == nil {
 		hostOnly = h
@@ -53,6 +71,7 @@ func (r *resolver) Lookup(host string) []net.IP {
 		return nil
 	}
 
+	// Fast path: check cache under read lock
 	r.mu.RLock()
 	entry, ok := r.cache[hostOnly]
 	r.mu.RUnlock()
@@ -61,22 +80,55 @@ func (r *resolver) Lookup(host string) []net.IP {
 		return entry.ips
 	}
 
-	ips, err := net.LookupIP(hostOnly)
-	if err != nil || len(ips) == 0 {
-		return nil
+	// Slow path: singleflight deduplication
+	r.mu.Lock()
+	// Recheck cache after acquiring write lock
+	if entry, ok = r.cache[hostOnly]; ok && time.Now().Before(entry.expires) {
+		r.mu.Unlock()
+		return entry.ips
 	}
 
+	// If another goroutine is already resolving this host, wait for its result
+	if call, active := r.inFlight[hostOnly]; active {
+		r.mu.Unlock()
+		<-call.done
+		return call.ips
+	}
+
+	// Register leader call for this host
+	call := &inFlightCall{done: make(chan struct{})}
+	r.inFlight[hostOnly] = call
+	r.mu.Unlock()
+
+	// Perform actual DNS lookup outside lock
+	ips, err := net.LookupIP(hostOnly)
+
 	r.mu.Lock()
-	r.cache[hostOnly] = dnsEntry{ips: ips, expires: time.Now().Add(dnsTTL)}
+	ttl := dnsTTL
+	if err != nil || len(ips) == 0 {
+		ttl = negativeDNSTTL
+		ips = nil
+	}
+	r.cache[hostOnly] = dnsEntry{ips: ips, expires: time.Now().Add(ttl)}
+	delete(r.inFlight, hostOnly)
+	call.ips = ips
+	close(call.done)
 	r.mu.Unlock()
 
 	return ips
 }
 
 // StartCleanup evicts expired entries every interval until the returned
-// context is cancelled (or Stop is called).
-func (r *resolver) StartCleanup(ctx context.Context, interval time.Duration) {
+// context is cancelled (or Stop is called). It is safe to call multiple times.
+func (r *Resolver) StartCleanup(ctx context.Context, interval time.Duration) {
+	r.mu.Lock()
+	if r.cancel != nil {
+		r.mu.Unlock()
+		return
+	}
 	ctx, r.cancel = context.WithCancel(ctx)
+	r.mu.Unlock()
+
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -99,8 +151,11 @@ func (r *resolver) StartCleanup(ctx context.Context, interval time.Duration) {
 }
 
 // Stop terminates the cleanup goroutine.
-func (r *resolver) Stop() {
+func (r *Resolver) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.cancel != nil {
 		r.cancel()
+		r.cancel = nil
 	}
 }

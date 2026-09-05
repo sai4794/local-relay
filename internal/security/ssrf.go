@@ -10,11 +10,16 @@ import (
 // SSRFBlocker blocks requests to private/internal IP ranges.
 type SSRFBlocker struct {
 	blockedNets []*net.IPNet
-	resolver    *resolver
+	resolver    *Resolver
 }
 
-// NewSSRFBlocker creates a blocker from CIDR strings.
+// NewSSRFBlocker creates a blocker from CIDR strings with a default resolver.
 func NewSSRFBlocker(cidrs []string) *SSRFBlocker {
+	return NewSSRFBlockerWithResolver(cidrs, NewResolver())
+}
+
+// NewSSRFBlockerWithResolver creates a blocker from CIDR strings with a shared resolver.
+func NewSSRFBlockerWithResolver(cidrs []string, r *Resolver) *SSRFBlocker {
 	blocked := make([]*net.IPNet, 0, len(cidrs))
 	for _, cidr := range cidrs {
 		_, ipNet, err := net.ParseCIDR(cidr)
@@ -25,7 +30,7 @@ func NewSSRFBlocker(cidrs []string) *SSRFBlocker {
 	}
 	return &SSRFBlocker{
 		blockedNets: blocked,
-		resolver:    newResolver(),
+		resolver:    r,
 	}
 }
 

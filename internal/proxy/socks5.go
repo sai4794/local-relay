@@ -273,6 +273,8 @@ func (p *SOCKS5Proxy) handleConnect(conn net.Conn, target string) {
 		return
 	}
 
+	backend.TuneTCP(destConn)
+
 	localAddr := destConn.LocalAddr()
 	tcpAddr, ok := localAddr.(*net.TCPAddr)
 	if !ok {

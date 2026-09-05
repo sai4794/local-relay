@@ -229,19 +229,22 @@ func buildRouter(s *backendStack, cfg *config.Config, logger *slog.Logger) *back
 	return router
 }
 
-// setupSecurity constructs SSRF protection and the per-host firewall/rate limiter.
+// setupSecurity constructs SSRF protection and the per-host firewall/rate limiter,
+// sharing a single DNS cache and singleflight deduplicator between them.
 func setupSecurity(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*security.Firewall, *security.SSRFBlocker) {
+	sharedResolver := security.NewResolver()
+	sharedResolver.StartCleanup(ctx, cleanupInterval)
+
 	var blocker *security.SSRFBlocker
 	if len(cfg.Security.BlockedNetworks) > 0 {
-		blocker = security.NewSSRFBlocker(cfg.Security.BlockedNetworks)
-		blocker.StartCleanup(ctx, cleanupInterval)
+		blocker = security.NewSSRFBlockerWithResolver(cfg.Security.BlockedNetworks, sharedResolver)
 		logger.Info("SSRF protection enabled", "blocked_networks", len(cfg.Security.BlockedNetworks))
 	}
 
-	fw := security.NewFirewall(security.FirewallConfig{
+	fw := security.NewFirewallWithResolver(security.FirewallConfig{
 		RateLimit: cfg.Security.RateLimit,
 		RateBurst: cfg.Security.RateBurst,
-	})
+	}, sharedResolver)
 	fw.StartCleanup(ctx, cleanupInterval)
 	return fw, blocker
 }

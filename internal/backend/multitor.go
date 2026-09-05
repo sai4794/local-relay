@@ -89,19 +89,20 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 		}
 	}
 
-	// IsolateSOCKSAuth: per-request username ensures Tor builds distinct circuits
-	// even with MaxCircuitDirtiness reuse; also prevents conflux mixing.
-	isoUser := fmt.Sprintf("relay:%d:%d", inst.ID, time.Now().UnixNano())
+	// IsolateSOCKSAuth: isolation user groups streams to this instance and circuit generation,
+	// allowing Tor to reuse warm 3-hop circuits while maintaining instance isolation and
+	// ensuring instant circuit refresh when generation increments on rotation.
+	isoUser := fmt.Sprintf("relay:%d:%d", inst.ID, inst.CircuitGen())
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort())
 	conn, err := m.socksClient.Connect(ctx, socksAddr, addr, isoUser)
 	if err != nil {
 		m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
-		// Try next instance with fresh isolation user
+		// Try next instance with its isolation user
 		for i := 1; i < len(ready); i++ {
 			nextIdx := (idx + i) % len(ready)
 			inst = ready[nextIdx]
 			socksAddr = fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort())
-			isoUser = fmt.Sprintf("relay:%d:%d", inst.ID, time.Now().UnixNano())
+			isoUser = fmt.Sprintf("relay:%d:%d", inst.ID, inst.CircuitGen())
 			conn, err = m.socksClient.Connect(ctx, socksAddr, addr, isoUser)
 			if err == nil {
 				break
@@ -145,6 +146,10 @@ type inFlightConn struct {
 	net.Conn
 	inst     *TorInstance
 	released atomic.Bool
+}
+
+func (c *inFlightConn) Unwrap() net.Conn {
+	return c.Conn
 }
 
 func (c *inFlightConn) Close() error {

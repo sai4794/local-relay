@@ -473,6 +473,10 @@ func (w *pooledConnWrap) Close() error {
 	return nil
 }
 
+func (w *pooledConnWrap) Unwrap() net.Conn {
+	return w.Conn
+}
+
 func (w *pooledConnWrap) CloseWrite() error {
 	if cw, ok := w.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()

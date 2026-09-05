@@ -2,6 +2,7 @@ package security
 
 import (
 	"net"
+	"sync"
 	"testing"
 )
 
@@ -90,6 +91,29 @@ func TestResolver_Lookup(t *testing.T) {
 	if len(ips) == 0 || !ips[0].Equal(net.IPv4(127, 0, 0, 1)) {
 		t.Errorf("expected 127.0.0.1 for localhost, got %v", ips)
 	}
+
+	// Negative caching test: unresolvable domain
+	ips1 := r.Lookup("invalid-nonexistent-domain.test")
+	if ips1 != nil {
+		t.Errorf("expected nil for invalid domain, got %v", ips1)
+	}
+	// Second lookup should return cached nil immediately
+	ips2 := r.Lookup("invalid-nonexistent-domain.test")
+	if ips2 != nil {
+		t.Errorf("expected nil from negative cache, got %v", ips2)
+	}
+
+	// Concurrent lookups should exercise singleflight deduplication without races
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.Lookup("localhost:9090")
+			r.Lookup("invalid-nonexistent-domain.test")
+		}()
+	}
+	wg.Wait()
 }
 
 func TestSSRFBlocker_IsBlocked(t *testing.T) {

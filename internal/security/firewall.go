@@ -20,7 +20,7 @@ const idleBucketTTL = 10 * time.Minute
 type Firewall struct {
 	blockedRanges []*net.IPNet
 	mu            sync.RWMutex
-	resolver      *resolver
+	resolver      *Resolver
 	rateLimit     float64
 	rateBurst     float64
 	limiters      map[string]*tokenBucket
@@ -33,9 +33,13 @@ type FirewallConfig struct {
 }
 
 func NewFirewall(cfg FirewallConfig) *Firewall {
+	return NewFirewallWithResolver(cfg, NewResolver())
+}
+
+func NewFirewallWithResolver(cfg FirewallConfig, r *Resolver) *Firewall {
 	fw := &Firewall{
 		blockedRanges: getDefaultBlockedRanges(),
-		resolver:      newResolver(),
+		resolver:      r,
 		rateLimit:     float64(cfg.RateLimit),
 		rateBurst:     float64(cfg.RateBurst),
 		limiters:      make(map[string]*tokenBucket),
