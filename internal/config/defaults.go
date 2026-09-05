@@ -22,7 +22,7 @@ var defaultConfig = &Config{
 		Binary:       "tor",
 		DataDir:      "/tmp/local-relay-tor",
 		BasePort:     9050,
-		ControlBase:  9051,
+		ControlBase:  9060,
 		MaxInstances: 3,
 		RotateAfter:  50,
 	},

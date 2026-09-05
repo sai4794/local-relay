@@ -3,6 +3,7 @@ package security
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,21 +35,39 @@ func newResolver() *resolver {
 // lookup and caches it. A failed or empty lookup returns nil and is NOT
 // cached (transient resolver failures must not poison the cache).
 func (r *resolver) Lookup(host string) []net.IP {
+	hostOnly := strings.ToLower(host)
+	if h, _, err := net.SplitHostPort(hostOnly); err == nil {
+		hostOnly = h
+	}
+
+	if ip := net.ParseIP(hostOnly); ip != nil {
+		return []net.IP{ip}
+	}
+
+	if hostOnly == "localhost" || strings.HasSuffix(hostOnly, ".localhost") {
+		return []net.IP{net.ParseIP("127.0.0.1")}
+	}
+
+	// Never perform local DNS resolution on .onion addresses
+	if strings.HasSuffix(hostOnly, ".onion") {
+		return nil
+	}
+
 	r.mu.RLock()
-	entry, ok := r.cache[host]
+	entry, ok := r.cache[hostOnly]
 	r.mu.RUnlock()
 
 	if ok && time.Now().Before(entry.expires) {
 		return entry.ips
 	}
 
-	ips, err := net.LookupIP(host)
+	ips, err := net.LookupIP(hostOnly)
 	if err != nil || len(ips) == 0 {
 		return nil
 	}
 
 	r.mu.Lock()
-	r.cache[host] = dnsEntry{ips: ips, expires: time.Now().Add(dnsTTL)}
+	r.cache[hostOnly] = dnsEntry{ips: ips, expires: time.Now().Add(dnsTTL)}
 	r.mu.Unlock()
 
 	return ips

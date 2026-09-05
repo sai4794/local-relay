@@ -80,12 +80,44 @@ func Validate(cfg *Config) error {
 	// Multi-tor port ranges must be valid and non-overlapping with the
 	// proxy listeners and each other.
 	if cfg.MultiTor.Enabled {
+		usedPorts := make(map[int]string)
+		if p := parsePort(cfg.Server.HTTP); p > 0 {
+			usedPorts[p] = "server.http"
+		}
+		if p := parsePort(cfg.Server.SOCKS5); p > 0 {
+			usedPorts[p] = "server.socks5"
+		}
+		if cfg.Health.Enabled {
+			if p := parsePort(cfg.Health.Address); p > 0 {
+				usedPorts[p] = "health.address"
+			}
+		}
+		if cfg.Metrics.Enabled {
+			if p := parsePort(cfg.Metrics.Address); p > 0 {
+				usedPorts[p] = "metrics.address"
+			}
+		}
+
 		for i := 0; i < cfg.MultiTor.MaxInstances; i++ {
 			socks := cfg.MultiTor.BasePort + i
 			ctrl := cfg.MultiTor.ControlBase + i
 			if socks < 1 || socks > 65535 || ctrl < 1 || ctrl > 65535 {
 				return fmt.Errorf("multi_tor port out of range (socks=%d ctrl=%d)", socks, ctrl)
 			}
+			if socks == ctrl {
+				return fmt.Errorf("multi_tor port conflict: instance %d socks and control port are identical (%d)", i, socks)
+			}
+			socksKey := fmt.Sprintf("multi_tor instance %d socks", i)
+			if conflict, exists := usedPorts[socks]; exists {
+				return fmt.Errorf("multi_tor port conflict: %s collides with %s on port %d", socksKey, conflict, socks)
+			}
+			usedPorts[socks] = socksKey
+
+			ctrlKey := fmt.Sprintf("multi_tor instance %d control", i)
+			if conflict, exists := usedPorts[ctrl]; exists {
+				return fmt.Errorf("multi_tor port conflict: %s collides with %s on port %d", ctrlKey, conflict, ctrl)
+			}
+			usedPorts[ctrl] = ctrlKey
 		}
 	}
 

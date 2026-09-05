@@ -259,9 +259,13 @@ func TestConnPoolHalfClosedConnection(t *testing.T) {
 		CircuitCount: 3,
 	})
 
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
 	defer ln.Close()
 
+	clientDone := make(chan struct{})
 	serverDone := make(chan struct{})
 	go func() {
 		conn, err := ln.Accept()
@@ -269,12 +273,17 @@ func TestConnPoolHalfClosedConnection(t *testing.T) {
 			close(serverDone)
 			return
 		}
+		<-clientDone // Wait until client has completed Dial
 		conn.(*net.TCPConn).SetLinger(0)
 		conn.Close()
 		close(serverDone)
 	}()
 
-	fakeConn, _ := net.Dial("tcp", ln.Addr().String())
+	fakeConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	close(clientDone)
 	<-serverDone
 	time.Sleep(10 * time.Millisecond)
 
@@ -293,7 +302,7 @@ func TestConnPoolHalfClosedConnection(t *testing.T) {
 		t.Fatal("getConn should return the RST'd connection")
 	}
 
-	_, err := got.Write([]byte("x"))
+	_, err = got.Write([]byte("x"))
 	if err == nil {
 		t.Fatal("write to RST'd connection should fail")
 	}

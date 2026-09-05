@@ -125,10 +125,13 @@ func (r *Router) DialContext(ctx context.Context, network, addr string) (net.Con
 }
 
 func (r *Router) IsHealthy() bool {
-	for _, b := range r.backends {
-		if b.IsHealthy() {
-			return true
+	if len(r.backends) > 0 {
+		for _, b := range r.backends {
+			if b.IsHealthy() {
+				return true
+			}
 		}
+		return false
 	}
 	if r.directBackend != nil && r.directBackend.IsHealthy() {
 		return true
@@ -152,16 +155,25 @@ type AnomalyReporter interface {
 // ReportAnomaly signals an anomaly (e.g. rate-limit) to the backend
 // that served the last request.
 func (r *Router) ReportAnomaly(idx int) {
-	if idx < 0 || idx >= len(r.backends) {
-		if len(r.backends) > 0 {
-			if ar, ok := r.backends[0].(AnomalyReporter); ok {
-				ar.ReportAnomaly(-1)
-			}
+	if len(r.backends) == 0 {
+		return
+	}
+	// If exactly one proxied backend exists (e.g. MultiTor or CircuitPool),
+	// pass the slot/instance index directly to it.
+	if len(r.backends) == 1 {
+		if ar, ok := r.backends[0].(AnomalyReporter); ok {
+			ar.ReportAnomaly(idx)
 		}
 		return
 	}
-	if ar, ok := r.backends[idx].(AnomalyReporter); ok {
-		ar.ReportAnomaly(idx)
+	if idx >= 0 && idx < len(r.backends) {
+		if ar, ok := r.backends[idx].(AnomalyReporter); ok {
+			ar.ReportAnomaly(idx)
+		}
+		return
+	}
+	if ar, ok := r.backends[0].(AnomalyReporter); ok {
+		ar.ReportAnomaly(-1)
 	}
 }
 

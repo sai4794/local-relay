@@ -19,3 +19,15 @@ func validateAddress(addr, field string) error {
 	}
 	return nil
 }
+
+func parsePort(addr string) int {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0
+	}
+	return p
+}

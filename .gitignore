@@ -1,6 +1,6 @@
 # build artifacts
-relay
-local-relay
+/relay
+/local-relay
 *.test
 benchmark/bench/
 

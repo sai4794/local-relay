@@ -207,24 +207,19 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 	p.logf("[pool] all slots exhausted, dispatching async NEWNYM")
 	p.asyncNEWNYM()
 
-	if !p.slots[0].IsHealthy() {
-		return nil, fmt.Errorf("circuit pool exhausted: all slots unhealthy")
-	}
-
-	conn, err := p.dialTor(ctx, addr, 0)
-	if err != nil {
-		return nil, fmt.Errorf("circuit pool exhausted: %w", err)
-	}
-
-	p.slots[0].RecordSuccess()
-	p.resetErrorBackoff()
-	return &pooledConnWrap{Conn: conn, pool: p, slotIdx: 0, addr: addr}, nil
+	return nil, fmt.Errorf("circuit pool exhausted: all slots unhealthy")
 }
 
 // ReportAnomaly marks a slot as having a rate-limit anomaly.
 // Triggers a rate-limited NEWNYM when threshold is exceeded.
 func (p *CircuitPoolBackend) ReportAnomaly(slotIdx int) {
 	if slotIdx < 0 || slotIdx >= len(p.slots) {
+		p.RotateRandomSlot()
+		go func() {
+			if err := p.rateLimitedNEWNYM(); err != nil {
+				p.logf("[pool] anomaly-triggered NEWNYM failed: %v", err)
+			}
+		}()
 		return
 	}
 	slot := p.slots[slotIdx]
@@ -478,6 +473,13 @@ func (w *pooledConnWrap) Close() error {
 	return nil
 }
 
+func (w *pooledConnWrap) CloseWrite() error {
+	if cw, ok := w.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
 func (p *CircuitPoolBackend) getConn(slotIdx int, addr string) net.Conn {
 	p.connPoolMu.Lock()
 	defer p.connPoolMu.Unlock()
@@ -498,6 +500,9 @@ func (p *CircuitPoolBackend) getConn(slotIdx int, addr string) net.Conn {
 }
 
 func (p *CircuitPoolBackend) putConn(slotIdx int, addr string, conn net.Conn) {
+	if conn == nil {
+		return
+	}
 	p.connPoolMu.Lock()
 	defer p.connPoolMu.Unlock()
 

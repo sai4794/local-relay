@@ -3,6 +3,7 @@ package security
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -110,12 +111,23 @@ func (fw *Firewall) allowRateLimit(host string) bool {
 }
 
 func (fw *Firewall) AllowHost(host string) bool {
-	if !fw.allowRateLimit(host) {
+	hostname := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostname = h
+	}
+	if !fw.allowRateLimit(hostname) {
 		return false
 	}
-	ip := net.ParseIP(host)
+	ip := net.ParseIP(hostname)
 	if ip == nil {
-		ips := fw.resolver.Lookup(host)
+		lower := strings.ToLower(hostname)
+		if lower == "localhost" || strings.HasSuffix(lower, ".localhost") || strings.HasSuffix(lower, ".local") {
+			return false
+		}
+		if strings.HasSuffix(lower, ".onion") {
+			return true
+		}
+		ips := fw.resolver.Lookup(hostname)
 		// If we cannot resolve the host locally, allow it rather than fail-closed.
 		// In the Tor context the destination is resolved by Tor/its exit nodes, so a
 		// local DNS miss (e.g. a restricted resolver) must not make otherwise-routable

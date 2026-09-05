@@ -130,6 +130,8 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 		go func(target *TorInstance) {
 			if err := m.lifecycle.RequestNewCircuit(target); err != nil {
 				m.logf("multi-tor: auto-rotate NEWNYM failed for instance %d: %v", target.ID, err)
+			} else if m.OnRotate != nil {
+				m.OnRotate()
 			}
 		}(inst)
 	}
@@ -150,6 +152,13 @@ func (c *inFlightConn) Close() error {
 		c.inst.DecInFlight()
 	}
 	return c.Conn.Close()
+}
+
+func (c *inFlightConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 // IsHealthy returns true if at least one Tor instance is ready.
@@ -198,7 +207,7 @@ func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
 		target = instances[slotIdx]
 	} else {
 		// If slotIdx is unknown (-1), prefer an instance that hasn't been rotated in the last 10s
-		idx := int(m.counter.Load()&0x7fffffffffffffff) % len(instances)
+		idx := int(m.counter.Add(1)&0x7fffffffffffffff) % len(instances)
 		target = instances[idx]
 		for i := 0; i < len(instances); i++ {
 			cand := instances[(idx+i)%len(instances)]

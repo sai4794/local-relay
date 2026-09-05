@@ -49,6 +49,14 @@ func (s *SSRFBlocker) IsBlocked(host string) bool {
 		return s.isIPBlocked(ip)
 	}
 
+	lower := strings.ToLower(hostname)
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") || strings.HasSuffix(lower, ".local") {
+		return s.isIPBlocked(net.ParseIP("127.0.0.1"))
+	}
+	if strings.HasSuffix(lower, ".onion") {
+		return false
+	}
+
 	// Resolve domain with caching
 	for _, ip := range s.resolver.Lookup(hostname) {
 		if s.isIPBlocked(ip) {

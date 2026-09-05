@@ -1,16 +1,16 @@
-# Graph Report - local-relay  (2026-08-23)
+# Graph Report - local-relay  (2026-09-05)
 
 ## Corpus Check
-- 60 files · ~69,750 words
+- 73 files · ~76,892 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 1029 nodes · 1478 edges · 68 communities (48 shown, 20 thin omitted)
-- Extraction: 94% EXTRACTED · 6% INFERRED · 0% AMBIGUOUS · INFERRED: 96 edges (avg confidence: 0.8)
+- 1118 nodes · 1649 edges · 72 communities (52 shown, 20 thin omitted)
+- Extraction: 92% EXTRACTED · 8% INFERRED · 0% AMBIGUOUS · INFERRED: 138 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `ce7dd1e5`
+- Built from commit: `d65dacd0`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -69,6 +69,7 @@
 - ModelQueue Priority Queue Implementation
 - QuotaAllocator Struct for Dynamic Model Distribution
 - main.go
+- Router
 - Implementation Order
 - Rate Limit Benchmark Report
 - MultiTorBackend
@@ -82,14 +83,17 @@
 - profile.sh
 - run_all.sh
 - benchmark
+- bench_test.go
+- APIKeyAuth
+- Validate
 
 ## God Nodes (most connected - your core abstractions)
-1. `Config` - 33 edges
-2. `CircuitPoolBackend` - 30 edges
-3. `NewCircuitPoolBackend()` - 28 edges
-4. `Finding-by-Finding Verification` - 27 edges
-5. `TorLifecycle` - 24 edges
-6. `TorInstance` - 23 edges
+1. `TorInstance` - 33 edges
+2. `Config` - 33 edges
+3. `CircuitPoolBackend` - 30 edges
+4. `NewCircuitPoolBackend()` - 28 edges
+5. `Finding-by-Finding Verification` - 27 edges
+6. `TorLifecycle` - 25 edges
 7. `SOCKS5Proxy` - 22 edges
 8. `HTTPProxy` - 21 edges
 9. `Rotator` - 20 edges
@@ -114,35 +118,35 @@
 - **Local Relay Systemd Service Ecosystem** — roundtable_04_ops_local_relay_systemd_units, roundtable_04_ops_exhaustion_alert_script, roundtable_04_ops_local_relay_health_monitor, roundtable_04_ops_local_relay_fallback_timer, roundtable_04_ops_systemd_install_script [EXTRACTED 0.95]
 - **Model Routing Intelligence Components** — roundtable_05_model_routing_model_state, roundtable_05_model_routing_quota_allocator, roundtable_05_model_routing_priority_queue, roundtable_05_model_routing_model_rotation_algorithm, roundtable_05_model_routing_exhaustion_detection [INFERRED 0.85]
 
-## Communities (68 total, 20 thin omitted)
+## Communities (72 total, 20 thin omitted)
 
 ### Community 0 - "CircuitPoolBackend"
-Cohesion: 0.10
+Cohesion: 0.09
 Nodes (17): CircuitPoolBackend, CircuitSlot, PoolConfig, pooledConn, pooledConnWrap, BenchmarkCryptoRandInt(), cryptoRandInt(), Bool (+9 more)
 
 ### Community 1 - "TorBackend"
-Cohesion: 0.07
-Nodes (32): DirectBackend, TorBackend, TorConfig, TorControlClient, BenchmarkAnomalyReporting(), BenchmarkBackendSelection(), BenchmarkBypassHostCheck(), BenchmarkCircuitSlotOperations() (+24 more)
+Cohesion: 0.10
+Nodes (16): DirectBackend, TorBackend, TorConfig, TorControlClient, Conn, Reader, NewTorControlClient(), readCookieFile() (+8 more)
 
 ### Community 2 - "Config"
-Cohesion: 0.06
-Nodes (48): APIKeyAuth, applyFlagOverrides(), authMiddlewareOrNil(), buildBackendStack(), buildProxies(), buildRotator(), buildRouter(), CancelFunc (+40 more)
+Cohesion: 0.05
+Nodes (48): applyFlagOverrides(), authMiddlewareOrNil(), buildBackendStack(), buildProxies(), buildRotator(), buildRouter(), CancelFunc, Context (+40 more)
 
 ### Community 3 - "HTTPProxy"
-Cohesion: 0.09
-Nodes (28): BenchmarkBufferPool(), BenchmarkConcurrentSOCKS5(), BenchmarkHeaderStripping(), BenchmarkResponseParsing(), BenchmarkSanitizeURL(), BenchmarkSOCKS5HandshakeServer(), BenchmarkTriggerRotateOnError(), B (+20 more)
+Cohesion: 0.10
+Nodes (28): Listener, T, newStallServer(), TestClassifyRealHeaderTimeout(), bodyRetryable(), enforceModelRateLimit(), Client, Conn (+20 more)
 
 ### Community 4 - "SOCKS5Proxy"
-Cohesion: 0.06
-Nodes (34): BenchmarkAddBlockedRange(), BenchmarkDNSResolution(), BenchmarkSSRFBlocker(), BenchmarkSSRFBlockerBlocked(), BenchmarkSSRFBlockerConcurrent(), BenchmarkSSRFBlockerDNS(), BenchmarkSSRFBlockerIPv6(), B (+26 more)
+Cohesion: 0.07
+Nodes (33): BenchmarkAddBlockedRange(), BenchmarkDNSResolution(), BenchmarkSSRFBlocker(), BenchmarkSSRFBlockerBlocked(), BenchmarkSSRFBlockerConcurrent(), BenchmarkSSRFBlockerDNS(), BenchmarkSSRFBlockerIPv6(), B (+25 more)
 
 ### Community 5 - "TorLifecycle"
-Cohesion: 0.12
-Nodes (9): TorInstance, TorLifecycle, TorLifecycleConfig, Cmd, readCookieFile(), Context, RWMutex, Time (+1 more)
+Cohesion: 0.11
+Nodes (9): TorInstance, TorLifecycle, TorLifecycleConfig, Cmd, Context, Duration, RWMutex, Time (+1 more)
 
 ### Community 6 - "main"
-Cohesion: 0.19
-Nodes (11): HealthChecker, HealthServer, HealthStatus, SimpleHealthChecker, Logger, Request, ResponseWriter, Server (+3 more)
+Cohesion: 0.07
+Nodes (29): HealthChecker, HealthServer, HealthStatus, SimpleHealthChecker, Logger, Request, ResponseWriter, Server (+21 more)
 
 ### Community 7 - "Router"
 Cohesion: 0.03
@@ -165,16 +169,16 @@ Cohesion: 0.05
 Nodes (38): 10. LEGAL & ETHICAL CONSIDERATIONS, 1.1 OpenCode Zen Detection Mechanisms, 1.2 Blackbox AI Detection Mechanisms, 1.3 Generic Free LLM Provider Patterns, 1. PROVIDER DETECTION SIGNALS, 2.1 TLS Fingerprinting (JA3/JA4), 2.2 HTTP/2 Fingerprinting, 2.3 Behavior Pattern Analysis (+30 more)
 
 ### Community 12 - "CopySSE"
-Cohesion: 0.09
-Nodes (25): Closer, BenchmarkCopyRaw(), BenchmarkCopySSE(), BenchmarkHasSSEContentType(), BenchmarkRelay(), BenchmarkRelayConcurrent(), BenchmarkRelayThroughNet(), concurrencyName() (+17 more)
+Cohesion: 0.08
+Nodes (33): Closer, BenchmarkCopyRaw(), BenchmarkCopySSE(), BenchmarkHasSSEContentType(), BenchmarkRelay(), BenchmarkRelayConcurrent(), BenchmarkRelayThroughNet(), concurrencyName() (+25 more)
 
 ### Community 13 - "ANALYST_04: Protocol Correctness Analysis"
 Cohesion: 0.06
 Nodes (32): 1.1 RFC Compliance Check, 1.2 HTTP Forwarding (handleHTTP), 1.3 Edge Case Handling, 1. HTTP CONNECT Tunnel (internal/proxy/http.go), 2.1 RFC 1928 Compliance Check, 2.2 Edge Case Handling, 2. SOCKS5 Server (internal/proxy/socks5.go), 3.1 W3C EventSource Specification Compliance (+24 more)
 
 ### Community 18 - "ROUNDTABLE 05: Intelligent Model Routing & Quota Optimization"
-Cohesion: 0.11
-Nodes (15): AnomalyReporter, Backend, Router, Bool, Conn, Context, Int64, RWMutex (+7 more)
+Cohesion: 0.25
+Nodes (7): Conn, IP, Listener, Logger, NewSOCKS5Proxy(), AuthCheck, SOCKS5Proxy
 
 ### Community 19 - "Per-File Analysis"
 Cohesion: 0.07
@@ -280,6 +284,10 @@ Nodes (4): 9.1 Bugs Found, 9.2 What Works, 9.3 Key Recommendations, 9. SUMMARY O
 Cohesion: 0.18
 Nodes (24): BenchConfig, aggregateByTorCount(), checkIPCorrelation(), findBestConfig(), Client, Duration, Time, main() (+16 more)
 
+### Community 55 - "Router"
+Cohesion: 0.09
+Nodes (27): AnomalyReporter, Backend, Router, BenchmarkAnomalyReporting(), BenchmarkBackendSelection(), BenchmarkBypassHostCheck(), BenchmarkCircuitSlotOperations(), BenchmarkConcurrentDialContext() (+19 more)
+
 ### Community 56 - "Implementation Order"
 Cohesion: 0.11
 Nodes (17): Benchmark & Profiling Implementation Plan, Decision Framework, Expected Hotspots (Hypotheses — To Be Measured), Files to Create, Implementation Order, Phase 1: Setup (30 minutes), Phase 2: CPU Profiling (1 hour), Phase 3: Memory Profiling (1 hour) (+9 more)
@@ -289,40 +297,52 @@ Cohesion: 0.12
 Nodes (16): 3-tor-http-c1 (mode=http_proxy, concurrency=1), Are limits tied to exit IP?, Are limits tied to the API key?, Best Configuration, Bottleneck, Detailed Results, Does increasing Tor instances increase throughput?, Executive Summary (+8 more)
 
 ### Community 58 - "MultiTorBackend"
-Cohesion: 0.11
-Nodes (14): MultiTorBackend, Conn, Context, Dialer, Duration, Int64, RWMutex, NewMultiTorBackend() (+6 more)
+Cohesion: 0.07
+Nodes (21): inFlightConn, MultiTorBackend, Bool, Conn, Context, Dialer, Duration, Int64 (+13 more)
 
 ### Community 59 - "Local Relay Proxy — Engineering Audit Report"
 Cohesion: 0.15
 Nodes (12): 1. Executive Summary, 2. Scores, 3. Issues Found, 4. Specification Compliance, 5. Top 20 Improvements, 6. Would I Approve This for Production?, 7. Would I Approve for Open-Source Release?, Local Relay Proxy — Engineering Audit Report (+4 more)
 
 ### Community 60 - "Tor Local Relay Proxy"
-Cohesion: 0.17
-Nodes (11): 1. Build, 2. Run, 3. Test, 🛠️ CLI Flags, Direct Relay Header Mode, 🔌 Integration, ⚡ Key Features, 🚀 Quick Start (+3 more)
+Cohesion: 0.15
+Nodes (12): Architecture, Build, CLI flags, Configuration reference (config.yaml), Development, Endpoints, Exit-IP change conditions (multi-tor mode), Quick start (+4 more)
 
 ### Community 61 - "socks5_multisession_test.go"
 Cohesion: 0.48
 Nodes (6): Conn, T, socks5Connect(), TestTorSOCKS5_MultiSessionOnSameTCPConnection(), TestTorSOCKS5_MultiSessionThreeRounds(), truncate()
 
+### Community 69 - "bench_test.go"
+Cohesion: 0.39
+Nodes (8): BenchmarkBufferPool(), BenchmarkConcurrentSOCKS5(), BenchmarkHeaderStripping(), BenchmarkResponseParsing(), BenchmarkSanitizeURL(), BenchmarkSOCKS5HandshakeServer(), BenchmarkTriggerRotateOnError(), B
+
+### Community 70 - "APIKeyAuth"
+Cohesion: 0.22
+Nodes (7): APIKeyAuth, Request, ResponseWriter, NewAPIKeyAuth(), T, TestAPIKeyAuth_HeaderAndSchemeVariants(), TestConstantTimeComparePrimitive()
+
+### Community 71 - "Validate"
+Cohesion: 0.27
+Nodes (8): loadDefaults(), parsePort(), validateAddress(), T, TestValidate_AcceptsGoodConfig(), TestValidate_RejectsBadMultiTorPorts(), TestValidate_RejectsPortCollisions(), Validate()
+
 ## Knowledge Gaps
-- **449 isolated node(s):** `analyze.sh script`, `loadtest.sh script`, `profile.sh script`, `run_all.sh script`, `benchmark` (+444 more)
+- **451 isolated node(s):** `analyze.sh script`, `loadtest.sh script`, `profile.sh script`, `run_all.sh script`, `benchmark` (+446 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **20 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `backendStack` connect `Config` to `CircuitPoolBackend`, `TorBackend`, `SOCKS5Proxy`, `TorLifecycle`, `MultiTorBackend`?**
-  _High betweenness centrality (0.056) - this node is a cross-community bridge._
-- **Why does `SOCKS5Proxy` connect `ROUNDTABLE 05: Intelligent Model Routing & Quota Optimization` to `Config`, `SOCKS5Proxy`?**
-  _High betweenness centrality (0.036) - this node is a cross-community bridge._
-- **Why does `NewCircuitPoolBackend()` connect `Rotator` to `CircuitPoolBackend`, `TorBackend`, `Config`, `MultiTorBackend`?**
-  _High betweenness centrality (0.034) - this node is a cross-community bridge._
+- **Why does `backendStack` connect `Config` to `CircuitPoolBackend`, `TorBackend`, `MultiTorBackend`, `TorLifecycle`?**
+  _High betweenness centrality (0.074) - this node is a cross-community bridge._
+- **Why does `CircuitPoolBackend` connect `CircuitPoolBackend` to `Config`, `TorBackend`, `MultiTorBackend`, `Rotator`?**
+  _High betweenness centrality (0.052) - this node is a cross-community bridge._
+- **Why does `SSRFBlocker` connect `Config` to `ROUNDTABLE 05: Intelligent Model Routing & Quota Optimization`, `HTTPProxy`, `SOCKS5Proxy`?**
+  _High betweenness centrality (0.052) - this node is a cross-community bridge._
 - **Are the 24 inferred relationships involving `NewCircuitPoolBackend()` (e.g. with `buildBackendStack()` and `TestPool_DeadConnDiscarded()`) actually correct?**
   _`NewCircuitPoolBackend()` has 24 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `analyze.sh script`, `loadtest.sh script`, `profile.sh script` to the rest of the system?**
-  _449 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _451 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `CircuitPoolBackend` be split into smaller, more focused modules?**
-  _Cohesion score 0.09725158562367865 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.09494949494949495 - nodes in this community are weakly interconnected._
 - **Should `TorBackend` be split into smaller, more focused modules?**
-  _Cohesion score 0.07493061979648474 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.10344827586206896 - nodes in this community are weakly interconnected._

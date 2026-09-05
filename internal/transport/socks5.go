@@ -78,7 +78,13 @@ func (c *SOCKS5Client) handshake(conn net.Conn, targetAddr, isoUser string) erro
 	if err != nil {
 		return err
 	}
-	port, _ := strconv.Atoi(portStr)
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid port %q: %w", portStr, err)
+	}
+	if len(host) > 255 {
+		return fmt.Errorf("target host %q exceeds maximum SOCKS5 domain length (255)", host)
+	}
 
 	req := make([]byte, 0, 4+1+len(host)+2)
 	req = append(req, 0x05, 0x01, 0x00, 0x03)

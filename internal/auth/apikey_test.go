@@ -20,6 +20,16 @@ func TestAPIKeyAuth_HeaderAndSchemeVariants(t *testing.T) {
 	ok("Bearer test-key-0123456789abcdef")
 	ok("bearer test-key-0123456789abcdef")
 	ok("Basic test-key-0123456789abcdef")
+	// Base64 encoded: "user:test-key-0123456789abcdef" -> "dXNlcjp0ZXN0LWtleS0wMTIzNDU2Nzg5YWJjZGVm"
+	ok("Basic dXNlcjp0ZXN0LWtleS0wMTIzNDU2Nzg5YWJjZGVm")
+
+	// Test Proxy-Authorization takes precedence even when Authorization has upstream token
+	rProxy := httptest.NewRequest("GET", "http://x/", nil)
+	rProxy.Header.Set("Authorization", "Bearer upstream-token-openai")
+	rProxy.Header.Set("Proxy-Authorization", "Bearer test-key-0123456789abcdef")
+	if !a.Check(httptest.NewRecorder(), rProxy) {
+		t.Error("expected Proxy-Authorization to take precedence over upstream Authorization")
+	}
 
 	r := httptest.NewRequest("GET", "http://x/", nil)
 	r.Header.Set("Authorization", "Bearer wrong-key")

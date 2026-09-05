@@ -664,14 +664,15 @@ func sanitizeURL(u *url.URL) string {
 	if u == nil {
 		return ""
 	}
-	q := u.Query()
+	clone := *u
+	q := clone.Query()
 	for key := range q {
 		if _, bad := sensitiveParams[strings.ToLower(key)]; bad {
 			q.Set(key, "***")
 		}
 	}
-	u.RawQuery = q.Encode()
-	return u.String()
+	clone.RawQuery = q.Encode()
+	return clone.String()
 }
 
 func (p *HTTPProxy) Start(addr string) error {

@@ -70,29 +70,47 @@ func Relay(ctx context.Context, dst io.ReadWriteCloser, src io.ReadWriteCloser) 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// Close connections when context is done to abort pending blocking Read calls
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		defer cancel()
-		buf := bufPool.Get().(*[]byte)
-		defer bufPool.Put(buf)
-		srcToDst, _ = io.CopyBuffer(dst, src, *buf)
-		if tc, ok := dst.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
+		select {
+		case <-ctx.Done():
+			dst.Close()
+			src.Close()
+		case <-done:
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		defer cancel()
 		buf := bufPool.Get().(*[]byte)
 		defer bufPool.Put(buf)
-		dstToSrc, _ = io.CopyBuffer(src, dst, *buf)
+		var err error
+		srcToDst, err = io.CopyBuffer(dst, src, *buf)
+		if tc, ok := dst.(interface{ CloseWrite() error }); ok {
+			tc.CloseWrite()
+		}
+		if err != nil {
+			cancel()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := bufPool.Get().(*[]byte)
+		defer bufPool.Put(buf)
+		var err error
+		dstToSrc, err = io.CopyBuffer(src, dst, *buf)
 		if tc, ok := src.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
+		}
+		if err != nil {
+			cancel()
 		}
 	}()
 
 	wg.Wait()
+	close(done)
 	dst.Close()
 	src.Close()
 	return srcToDst, dstToSrc

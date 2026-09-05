@@ -34,6 +34,7 @@ const cleanupInterval = 5 * time.Minute
 
 func main() {
 	configPath := flag.String("c", "config.yaml", "Path to config file")
+	flag.StringVar(configPath, "config", "config.yaml", "Path to config file (alias for -c)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	verbose := flag.Bool("v", false, "Shortcut for --log-level=debug")
 	httpAddr := flag.String("http", "", "Override HTTP proxy address")
@@ -68,11 +69,11 @@ func main() {
 
 	stack := buildBackendStack(ctx, cfg, logger)
 	router := buildRouter(stack, cfg, logger)
-	firewall := setupSecurity(ctx, cfg, logger)
+	firewall, ssrfBlocker := setupSecurity(ctx, cfg, logger)
 	rotator := buildRotator(cfg, stack, logger)
 
 	httpProxy, socks5Proxy := buildProxies(router, stack.usePool, cfg, logger,
-		authMiddlewareOrNil(cfg), firewall, rotator, stack.ssrfBlocker)
+		authMiddlewareOrNil(cfg), firewall, rotator, ssrfBlocker)
 
 	if stack.multiTor != nil {
 		stack.multiTor.OnRotate = func() {
@@ -143,14 +144,13 @@ func buildBackendStack(ctx context.Context, cfg *config.Config, logger *slog.Log
 			},
 		})
 
+		s.multiTor = backend.NewMultiTorBackend(s.torLifecycle, cfg.ConnectionTimeout(), func(format string, args ...interface{}) {
+			logger.Debug("[multi-tor] "+format, args...)
+		})
+
 		if err := s.torLifecycle.Start(ctx); err != nil {
-			logger.Error("Failed to start Tor instances", "error", err)
-			logger.Warn("Continuing with direct connections only")
-			s.torLifecycle = nil
+			logger.Error("Failed to start Tor instances (traffic will fail closed until Tor is healthy)", "error", err)
 		} else {
-			s.multiTor = backend.NewMultiTorBackend(s.torLifecycle, cfg.ConnectionTimeout(), func(format string, args ...interface{}) {
-				logger.Debug("[multi-tor] "+format, args...)
-			})
 			logger.Info("Multi-Tor backend ready",
 				"instances", s.torLifecycle.GetReadyCount(),
 			)
@@ -230,9 +230,10 @@ func buildRouter(s *backendStack, cfg *config.Config, logger *slog.Logger) *back
 }
 
 // setupSecurity constructs SSRF protection and the per-host firewall/rate limiter.
-func setupSecurity(ctx context.Context, cfg *config.Config, logger *slog.Logger) *security.Firewall {
+func setupSecurity(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*security.Firewall, *security.SSRFBlocker) {
+	var blocker *security.SSRFBlocker
 	if len(cfg.Security.BlockedNetworks) > 0 {
-		blocker := security.NewSSRFBlocker(cfg.Security.BlockedNetworks)
+		blocker = security.NewSSRFBlocker(cfg.Security.BlockedNetworks)
 		blocker.StartCleanup(ctx, cleanupInterval)
 		logger.Info("SSRF protection enabled", "blocked_networks", len(cfg.Security.BlockedNetworks))
 	}
@@ -242,7 +243,7 @@ func setupSecurity(ctx context.Context, cfg *config.Config, logger *slog.Logger)
 		RateBurst: cfg.Security.RateBurst,
 	})
 	fw.StartCleanup(ctx, cleanupInterval)
-	return fw
+	return fw, blocker
 }
 
 // authMiddlewareOrNil returns nil unless API-key auth is explicitly enabled.
