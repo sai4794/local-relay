@@ -57,7 +57,6 @@
   "55": "Router",
   "56": "Implementation Order",
   "57": "Rate Limit Benchmark Report",
-  "58": "MultiTorBackend",
   "59": "Local Relay Proxy — Engineering Audit Report",
   "60": "Tor Local Relay Proxy",
   "61": "socks5_multisession_test.go",
@@ -68,7 +67,5 @@
   "66": "profile.sh",
   "67": "run_all.sh",
   "68": "benchmark",
-  "69": "bench_test.go",
-  "70": "APIKeyAuth",
-  "71": "Validate"
+  "69": "bench_test.go"
 }
