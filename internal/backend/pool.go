@@ -193,13 +193,16 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 			continue
 		}
 
-		// Try reusing a pooled connection first (optimistic — no alive check)
-		if conn := p.getConn(idx, addr); conn != nil {
+		// Try reusing a pooled connection first (optimistic — no alive check).
+		// The entry generation rides out atomically with the conn: a
+		// resetAll bump interleaving here cannot tag a pre-rotation tunnel
+		// with the new generation (it would re-pool as fresh and defeat
+		// rotation isolation).
+		if conn, entryGen := p.getConn(idx, addr); conn != nil {
 			p.lastSlot.Store(int64(idx))
 			p.recordDialSuccess(slot, idx)
-			gen := p.poolGen.Load()
-			fillClaimSink(ctx, "pool", idx, gen, time.Since(dialStart))
-			return &pooledConnWrap{Conn: conn, pool: p, slotIdx: idx, addr: addr, gen: gen, endpointID: idx, endpointGen: gen, dialLatency: time.Since(dialStart)}, nil
+			fillClaimSink(ctx, "pool", idx, entryGen, time.Since(dialStart))
+			return &pooledConnWrap{Conn: conn, pool: p, slotIdx: idx, addr: addr, gen: entryGen, endpointID: idx, endpointGen: entryGen, dialLatency: time.Since(dialStart)}, nil
 		}
 
 		// No pooled connection — create a new one
@@ -574,6 +577,11 @@ type pooledConn struct {
 	conn      net.Conn
 	key       string // slotIdx+dest — connections are per-destination tunnels
 	createdAt time.Time
+	// gen is the pool generation at put time. A wrapper checked out after
+	// a resetAll bump carries a stale gen and discards (closes) instead of
+	// re-pooling; stamping the entry lets getConn hand out conn+gen
+	// atomically so DialContext can never tag a pre-rotation tunnel fresh.
+	gen int64
 }
 
 func poolKey(slotIdx int, addr string) string {
@@ -673,7 +681,7 @@ func (w *pooledConnWrap) CloseWrite() error {
 	return nil
 }
 
-func (p *CircuitPoolBackend) getConn(slotIdx int, addr string) net.Conn {
+func (p *CircuitPoolBackend) getConn(slotIdx int, addr string) (net.Conn, int64) {
 	p.connPoolMu.Lock()
 
 	key := poolKey(slotIdx, addr)
@@ -697,14 +705,15 @@ func (p *CircuitPoolBackend) getConn(slotIdx int, addr string) net.Conn {
 			return p.getConn(slotIdx, addr)
 		}
 		conn := pc.conn
+		gen := pc.gen
 		p.connPool[i] = p.connPool[len(p.connPool)-1]
 		p.connPool[len(p.connPool)-1] = nil
 		p.connPool = p.connPool[:len(p.connPool)-1]
 		p.connPoolMu.Unlock()
-		return conn
+		return conn, gen
 	}
 	p.connPoolMu.Unlock()
-	return nil
+	return nil, 0
 }
 
 func (p *CircuitPoolBackend) putConn(slotIdx int, addr string, conn net.Conn) {
@@ -747,6 +756,7 @@ func (p *CircuitPoolBackend) putConn(slotIdx int, addr string, conn net.Conn) {
 		conn:      conn,
 		key:       poolKey(slotIdx, addr),
 		createdAt: time.Now(),
+		gen:       p.poolGen.Load(),
 	})
 	p.connPoolMu.Unlock()
 }

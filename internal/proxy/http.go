@@ -575,8 +575,11 @@ retryLoop:
 				"max_attempts", maxUpstreamAttempts,
 				"error", lastErr,
 			)
+			// Rotation-only: the terminal attempt below carries the single
+			// attributed sample for this client request (see the final-429
+			// branch). Reporting a failure sample per attempt would let one
+			// transient blip trip quarantine_after_fails alone.
 			p.router.ReportAnomaly(-1)
-			reportOutcome(p.router, &claim, false, 0, 0, 0)
 			select {
 			case <-time.After(retryDelay(attempt)):
 			case <-r.Context().Done():
@@ -597,8 +600,9 @@ retryLoop:
 					"max_attempts", maxUpstreamAttempts,
 				)
 				resp.Body.Close()
+				// Rotation-only (see connect-phase branch): the terminal
+				// attempt carries the single attributed sample.
 				p.router.ReportAnomaly(-1)
-				reportOutcome(p.router, &claim, false, resp.StatusCode, 0, 0)
 				select {
 				case <-time.After(retryDelay(attempt)):
 				case <-r.Context().Done():
@@ -606,7 +610,13 @@ retryLoop:
 				}
 				continue
 			}
-			// Final attempt – still rate-limited, rotate for next request and fall through to forward 429
+			// Final attempt – still rate-limited, rotate for next request and fall through to forward 429.
+			// Terminal outcome (one quarantine sample per CLIENT request,
+			// not per attempt): retries above already reported their own
+			// attempt samples; a single request must never trip the
+			// consecutive-fails gate alone, so intermediate attempts mark
+			// rotation only (ReportAnomaly) while the terminal attempt
+			// carries the single attributed sample.
 			p.logger.Warn("rate-limit detected, triggering instant circuit rotation",
 				"status", resp.StatusCode,
 				"url", sanitizeURL(r.URL),
@@ -962,12 +972,23 @@ func (p *HTTPProxy) isSelfDial(target string) bool {
 	}
 	// Resolved-loopback match: "localhost" is normalized to loopback before
 	// comparing, so a listener on 127.0.0.1 and a target of localhost (same
-	// port) are detected as the same socket. Only block when BOTH sides
-	// resolve to loopback, so a non-loopback hostname bound by config can
-	// never collide with a loopback target on the same port number.
+	// port) are detected as the same socket. An unspecified listen host
+	// (0.0.0.0 or ::, common in containers) accepts loopback traffic on
+	// that port, so it counts as loopback-equivalent on the listen side.
+	// Only block when BOTH sides resolve to loopback, so a non-loopback
+	// hostname bound by config can never collide with a loopback target on
+	// the same port number.
 	tLoop := isLoopbackHost(tHost)
-	lLoop := isLoopbackHost(lHost)
+	lLoop := isLoopbackHost(lHost) || isUnspecifiedHost(lHost)
 	return tLoop && lLoop
+}
+
+// isUnspecifiedHost reports whether h is the IPv4 or IPv6 unspecified
+// address (0.0.0.0 or ::, bracketed or bare): a listener bound there
+// accepts traffic on every local interface, including loopback.
+func isUnspecifiedHost(h string) bool {
+	ip := net.ParseIP(strings.Trim(h, "[]"))
+	return ip != nil && ip.IsUnspecified()
 }
 
 // isLoopbackHost reports whether h is a loopback address in any accepted

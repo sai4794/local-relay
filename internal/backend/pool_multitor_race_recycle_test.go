@@ -33,7 +33,7 @@ func TestPool_ConcurrentPutEvictRace(t *testing.T) {
 				a, b := net.Pipe()
 				pool.putConn(g%2, "h:1", a)
 				_ = b.Close()
-				if got := pool.getConn(g%2, "h:1"); got != nil {
+				if got, _ := pool.getConn(g%2, "h:1"); got != nil {
 					_ = got.Close()
 				}
 				if i%25 == 0 {

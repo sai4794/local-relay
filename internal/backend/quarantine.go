@@ -81,6 +81,7 @@ type endpointQuarantine struct {
 	quarantinedUntil atomic.Int64 // UnixNano; valid in Quarantined
 	quarantineCount  atomic.Int64 // consecutive quarantines (backoff exponent)
 	probeInFlight    atomic.Bool  // exactly one probation probe at a time
+	probeAt          atomic.Int64 // UnixNano the current probe was claimed; expiry budget
 }
 
 // State returns the current lifecycle state.
@@ -157,9 +158,11 @@ func (q *endpointQuarantine) enterQuarantine(now time.Time, base, max time.Durat
 }
 
 // pollPromotion lazily promotes Quarantined->Probation once until has
-// passed, claiming the single probe slot. Returns true only to the promoter
-// (exactly one probation probe at a time). Idle pools promote late —
-// harmless, promotion rides the selection path of the next dial.
+// passed, WITHOUT claiming the probe slot: the caller that wins selection
+// claims it via claimProbe (holder-only eligibility). Splitting promotion
+// from claim is what makes the single-probe guarantee enforceable —
+// otherwise every concurrent dialer sees probeInFlight=true and serves.
+// Returns true only to the promoter (exactly one promoter per expiry).
 func (q *endpointQuarantine) pollPromotion(now time.Time) bool {
 	if q.State() != StateQuarantined {
 		return false
@@ -167,11 +170,56 @@ func (q *endpointQuarantine) pollPromotion(now time.Time) bool {
 	if now.UnixNano() < q.quarantinedUntil.Load() {
 		return false
 	}
-	if !q.state.CompareAndSwap(int32(StateQuarantined), int32(StateProbation)) {
+	return q.state.CompareAndSwap(int32(StateQuarantined), int32(StateProbation))
+}
+
+// claimProbe CAS-claims the single probation probe slot. Returns true only
+// to the holder: exactly one dialer per probation window serves the sick
+// endpoint; the rest must pick another candidate. The holder releases via
+// recordSuccess (probe succeeded, back to Active) or requarantine path
+// (probe failed). A holder that dies without reporting leaks the slot —
+// callers must pair with probeExpiry (below).
+func (q *endpointQuarantine) claimProbe(now time.Time) bool {
+	if q.State() != StateProbation {
 		return false
 	}
-	q.probeInFlight.Store(true)
+	if !q.probeInFlight.CompareAndSwap(false, true) {
+		return false
+	}
+	q.probeAt.Store(now.UnixNano())
 	return true
+}
+
+// probeExpired reports whether the claimed probe slot outlived its budget
+// without an outcome (holder died mid-dial). The budget is deliberately
+// generous (2x the quarantine base, min 60s): probes normally resolve in
+// seconds, so expiry only fires for wedged holders.
+func (q *endpointQuarantine) probeExpired(now time.Time, base time.Duration) bool {
+	if !q.probeInFlight.Load() {
+		return false
+	}
+	if base <= 0 {
+		base = DefaultQuarantineConfig().Duration
+	}
+	budget := 2 * base
+	if budget < time.Minute {
+		budget = time.Minute
+	}
+	return now.UnixNano()-q.probeAt.Load() > budget.Nanoseconds()
+}
+
+// releaseStaleProbe frees a wedged probe slot (holder died without
+// reporting) so the endpoint can be re-probed instead of wedging in
+// probation forever. Returns true only to the releaser. The endpoint stays
+// in Probation — the next selection re-claims the slot for a fresh probe.
+func (q *endpointQuarantine) releaseStaleProbe(now time.Time, base time.Duration) bool {
+	if q.State() != StateProbation {
+		return false
+	}
+	if !q.probeExpired(now, base) {
+		return false
+	}
+	return q.probeInFlight.CompareAndSwap(true, false)
 }
 
 // eligibleForSelection reports whether the endpoint may serve traffic now:

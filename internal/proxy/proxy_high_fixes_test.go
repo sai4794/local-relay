@@ -206,3 +206,33 @@ func TestRegression_WaiverGatedOnRouterVerdict(t *testing.T) {
 		t.Error("configured bypass hosts must still be waived; got false")
 	}
 }
+
+// Regression: a listener on the unspecified address (0.0.0.0 or ::, common
+// in containers) accepts loopback traffic on its port, so a loopback target
+// on the same port IS the same socket and must trip the self-dial guard.
+// Pre-fix isSelfDial required both sides loopback and missed 0.0.0.0.
+func TestRegression_SelfDialUnspecifiedBind(t *testing.T) {
+	router := backend.NewRouter(backend.NewDirectBackend(2 * time.Second))
+	p := testHTTPProxy(t, router)
+	_, port, err := net.SplitHostPort(serveHTTPProxy(t, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, listen := range []string{
+		net.JoinHostPort("0.0.0.0", port),
+		net.JoinHostPort("::", port),
+	} {
+		p.listenAddr.Store(listen)
+		for _, target := range []string{
+			net.JoinHostPort("127.0.0.1", port),
+			net.JoinHostPort("localhost", port),
+		} {
+			if !p.isSelfDial(target) {
+				t.Errorf("isSelfDial(%q) with listen %q = false; want true (unspecified bind accepts loopback)", target, listen)
+			}
+		}
+		if other := net.JoinHostPort("127.0.0.1", "1"); p.isSelfDial(other) {
+			t.Errorf("isSelfDial(%q) with listen %q = true; want false (different port)", other, listen)
+		}
+	}
+}

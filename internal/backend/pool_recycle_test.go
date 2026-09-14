@@ -75,7 +75,7 @@ func TestPool_HealthyReuseUnchanged(t *testing.T) {
 	if err := wrap.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
-	got := pool.getConn(0, "example.com:443")
+	got, _ := pool.getConn(0, "example.com:443")
 	if got == nil {
 		t.Fatal("healthy tunnel was not returned to pool")
 	}
@@ -99,7 +99,7 @@ func TestPool_LazyExpiryOnGet(t *testing.T) {
 	pool.putConn(0, "example.com:443", client)
 	time.Sleep(5 * time.Millisecond)
 
-	if got := pool.getConn(0, "example.com:443"); got != nil {
+	if got, _ := pool.getConn(0, "example.com:443"); got != nil {
 		got.Close()
 		t.Fatal("getConn returned an expired tunnel; want lazy reap (nil)")
 	}

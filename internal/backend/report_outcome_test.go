@@ -70,3 +70,28 @@ func TestReportOutcome_RouterFanout(t *testing.T) {
 		t.Fatalf("fanout successes = %d, want 1", got)
 	}
 }
+
+// Single-owner rule: a dial followed by its request outcome records exactly
+// one success sample (not dial-sample + outcome-sample). Pre-fix DialContext
+// recorded the success AND ReportOutcome recorded it again, inflating the
+// success rate and passing the MinSamples gate early.
+func TestReportOutcome_SingleSamplePerRequest(t *testing.T) {
+	lc := NewTorLifecycle(TorLifecycleConfig{
+		Binary: "true", DataDir: t.TempDir(),
+		BasePort: 0, ControlBase: 0, MaxInstances: 1, Logf: func(string, ...interface{}) {},
+	})
+	lc.instances = append(lc.instances, &TorInstance{ID: 1, Ready: true, StartedAt: time.Now()})
+	m := NewMultiTorBackend(lc, time.Second, func(string, ...interface{}) {})
+	m.SetScoreParams(DefaultScoreParams())
+
+	// Simulate one served request: dial path records nothing on success now;
+	// the outcome path records the single authoritative sample.
+	gen := lc.instances[0].CircuitGen()
+	m.ReportOutcome(Outcome{ID: 1, Gen: gen, Success: true, Latency: 400 * time.Millisecond, Status: 200})
+	if got := lc.instances[0].DialSuccesses(); got != 1 {
+		t.Fatalf("successes after one request = %d, want exactly 1 (single owner)", got)
+	}
+	if got := lc.instances[0].DialLatencyEWMA(); got != 400*time.Millisecond {
+		t.Fatalf("EWMA = %v, want 400ms (single outcome sample)", got)
+	}
+}

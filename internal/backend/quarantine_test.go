@@ -330,3 +330,111 @@ func TestQuarantine_TransitionStormRace(t *testing.T) {
 		t.Fatal("post-storm selection = nil, want a candidate")
 	}
 }
+
+// Exactly one concurrent dialer may claim the probation probe: N dialers
+// racing selectInstance against one promoted endpoint yield exactly one
+// winner serving it; the rest pick the healthy candidate. Pre-fix every
+// dialer saw probeInFlight=true and served the sick endpoint (probe herd).
+func TestQuarantine_SingleProbeEnforcedUnderConcurrency(t *testing.T) {
+	var nym int64Chan
+	stop := make(chan struct{})
+	addr := serveQuarantineControl(t, &nym, stop)
+	_, m := quarantineLifecycle(t, addr)
+	m.SetQuarantineConfig(QuarantineConfig{AfterFails: 3, Duration: 100 * time.Millisecond, MaxDuration: time.Second, Probes: 1})
+
+	inst := m.getInstanceByID(1)
+	healthy := m.getInstanceByID(2)
+	gen := inst.CircuitGen()
+	for i := 0; i < 3; i++ {
+		m.ReportOutcome(Outcome{ID: 1, Gen: gen, Success: false, Status: 503})
+	}
+	time.Sleep(200 * time.Millisecond)
+	inst.SetLastRotated(time.Now().Add(-time.Minute))
+	healthy.SetLastRotated(time.Now().Add(-time.Minute))
+
+	const racers = 32
+	picks := make([]int, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got, _ := m.selectInstance([]*TorInstance{inst, healthy})
+			picks[i] = got.ID
+		}(i)
+	}
+	wg.Wait()
+	probes := 0
+	for _, id := range picks {
+		if id == 1 {
+			probes++
+		}
+	}
+	if probes != 1 {
+		t.Fatalf("probation probes served = %d, want exactly 1 (single-probe guarantee)", probes)
+	}
+	if inst.QuarantineState() != StateProbation {
+		t.Fatalf("state = %v, want probation (probe still out)", inst.QuarantineState())
+	}
+}
+
+// A wedged probe slot (holder died without reporting) must not wedge the
+// endpoint in probation forever: after the expiry budget the slot releases
+// and the next selection re-claims it for a fresh probe.
+func TestQuarantine_StaleProbeSlotExpires(t *testing.T) {
+	var q endpointQuarantine
+	now := time.Now()
+	q.state.Store(int32(StateProbation))
+	if !q.claimProbe(now) {
+		t.Fatal("initial claim failed")
+	}
+	if q.claimProbe(now) {
+		t.Fatal("second claim succeeded; want single holder")
+	}
+	// Fresh slot: not expired, no release.
+	if q.releaseStaleProbe(now.Add(time.Second), time.Hour) {
+		t.Fatal("fresh probe slot released; want hold until budget")
+	}
+	// Wedged slot: backdate claim past budget, release fires.
+	q.probeAt.Store(now.Add(-3 * time.Hour).UnixNano())
+	if !q.releaseStaleProbe(now, time.Hour) {
+		t.Fatal("wedged probe slot not released after budget")
+	}
+	if !q.claimProbe(now) {
+		t.Fatal("re-claim after expiry failed; want fresh probe")
+	}
+}
+
+// CheckHealth must not recycle a quarantined endpoint via the legacy
+// FailCount kill/spawn path: quarantine owns sick-endpoint recovery for
+// the hold duration. A quarantined instance with failing SOCKS keeps its
+// daemon across consecutive CheckHealth calls (fail count frozen).
+func TestQuarantine_CheckHealthDefersToQuarantineHold(t *testing.T) {
+	lc := NewTorLifecycle(TorLifecycleConfig{
+		Binary: "true", DataDir: t.TempDir(),
+		BasePort: 0, ControlBase: 0, MaxInstances: 1, Logf: func(string, ...interface{}) {},
+	})
+	inst := &TorInstance{ID: 1, SocksPort: 1, ControlPort: 1, Cmd: nil, DataDir: t.TempDir(), Ready: true, StartedAt: time.Now().Add(-time.Hour)}
+	lc.instances = append(lc.instances, inst)
+	// Quarantine directly with a long hold; SOCKS port 1 refuses so the
+	// health probe fails every call.
+	inst.quar.state.Store(int32(StateQuarantined))
+	inst.quar.quarantinedUntil.Store(time.Now().Add(time.Hour).UnixNano())
+
+	before := inst
+	for i := 0; i < 5; i++ {
+		lc.CheckHealth(context.Background())
+	}
+	if lc.instances[0] != before {
+		t.Fatal("quarantined instance was kill/spawn recycled; want daemon preserved for the hold")
+	}
+	if got := inst.GetFailCount(); got != 0 {
+		t.Fatalf("legacy FailCount = %d during quarantine hold; want frozen at 0", got)
+	}
+	// After release back to Active, the legacy path resumes.
+	inst.quar.state.Store(int32(StateActive))
+	lc.CheckHealth(context.Background())
+	if got := inst.GetFailCount(); got != 1 {
+		t.Fatalf("legacy FailCount after release = %d; want 1 (path resumed)", got)
+	}
+}

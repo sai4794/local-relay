@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -379,7 +380,21 @@ type TorLifecycle struct {
 	// monotonic claim ids recorded per instance (see claimNymWindow).
 	nymMu   sync.Mutex
 	nymNext int64
+	// authFailObs counts consecutive control-auth rejections per instance
+	// (keyed by instance ID, guarded by authFailMu). A stale or rotated
+	// control cookie makes every NEWNYM fail auth until the cache is
+	// evicted; after authFailThreshold consecutive rejections the instance
+	// is marked not-ready so CheckHealth recycles it instead of failing
+	// rotations forever. Success (any non-auth-rejected SIGNAL result,
+	// including cooldown skip) resets the count.
+	authFailObs map[int]int
+	authFailMu  sync.Mutex
 }
+
+// authFailThreshold is the consecutive control-auth rejections after which
+// an instance is marked not-ready for CheckHealth recycle. 3 matches the
+// existing 3-strikes discipline (CheckHealth kill/spawn, quarantine entry).
+const authFailThreshold = 3
 
 // TorLifecycleConfig configures the Tor lifecycle manager.
 type TorLifecycleConfig struct {
@@ -411,6 +426,7 @@ func NewTorLifecycle(cfg TorLifecycleConfig) *TorLifecycle {
 		logf:         cfg.Logf,
 		cookieCache:  make(map[int][]byte),
 		notReadyObs:  make(map[int]int),
+		authFailObs:  make(map[int]int),
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -627,6 +643,49 @@ TestSocks 1
 	return inst, nil
 }
 
+// evictCookie drops the cached control cookie for instID, forcing the next
+// control operation to re-read the cookie file from disk. Called on
+// definitive auth rejections: the on-disk cookie rotated (or the datadir
+// was replaced) and the in-memory copy is now permanently wrong —
+// retrying with the same bytes would fail forever while refunding the
+// NEWNYM cooldown each time.
+func (tl *TorLifecycle) evictCookie(instID int) {
+	tl.cookieMu.Lock()
+	delete(tl.cookieCache, instID)
+	tl.cookieMu.Unlock()
+}
+
+// isAuthRejected reports whether err is a definitive control-auth rejection
+// (bad/stale credentials), as opposed to a transport failure, timeout, or
+// cooldown skip. Only auth-rejected warrants cookie eviction: anything else
+// says nothing about the cached cookie's validity.
+func isAuthRejected(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "auth rejected")
+}
+
+// noteAuthResult tracks consecutive control-auth rejections per instance.
+// On auth-rejected it evicts the cookie and bumps the counter; at threshold
+// it marks the instance not-ready so CheckHealth recycles it instead of
+// failing rotations forever. Any non-rejected result resets the counter.
+// Safe for concurrent use; never blocks on I/O.
+func (tl *TorLifecycle) noteAuthResult(inst *TorInstance, err error) {
+	if !isAuthRejected(err) {
+		tl.authFailMu.Lock()
+		delete(tl.authFailObs, inst.ID)
+		tl.authFailMu.Unlock()
+		return
+	}
+	tl.evictCookie(inst.ID)
+	tl.authFailMu.Lock()
+	tl.authFailObs[inst.ID]++
+	n := tl.authFailObs[inst.ID]
+	tl.authFailMu.Unlock()
+	if n >= authFailThreshold {
+		tl.logf("Tor instance %d control auth rejected %d consecutive times, marking not-ready for recycle", inst.ID, n)
+		inst.SetReady(false)
+	}
+}
+
 // cachedCookie returns the instance's control-auth cookie from the in-memory
 // cache, falling back to disk and populating the cache on success.
 func (tl *TorLifecycle) cachedCookie(inst *TorInstance) func() ([]byte, bool) {
@@ -753,6 +812,16 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 		staleConsensus := tl.isConsensusStale(inst)
 		socksReady := tl.isSocksPortReady(inst.GetSocksPort())
 		if !socksReady || staleConsensus {
+			// Quarantine owns sick-endpoint recovery (entry NEWNYM +
+			// probation + backoff): the legacy FailCount kill/spawn path
+			// must not cut a 60-300s hold short by recycling the daemon
+			// underneath it. Liveness observation continues (a dead
+			// daemon still trips the not-ready branch above), but the
+			// consecutive-fail counter and heal/restart decisions wait
+			// until the endpoint leaves quarantine/probation.
+			if st := inst.quar.State(); st == StateQuarantined || st == StateProbation {
+				continue
+			}
 			reason := "SOCKS handshake failed"
 			if staleConsensus {
 				reason = "consensus stale >90m"
@@ -762,15 +831,9 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 			if fails >= 3 {
 				unhealthy = append(unhealthy, inst)
 			} else if inst.TryStartHeal() {
-				// Quarantined endpoints skip the proactive DROPGUARDS heal:
-				// quarantine entry already issued ONE attributed NEWNYM, and
-				// a second proactive signal would double-signal the same
-				// sickness (plus fight the 60s hold). SOCKS liveness probes
-				// above still run regardless of state.
-				if inst.quar.State() == StateQuarantined || inst.quar.State() == StateProbation {
-					continue
-				}
-				// Proactively clear stuck guards & trigger fresh circuit to auto-heal before hard restart
+				// Proactively clear stuck guards & trigger fresh circuit to auto-heal before hard restart.
+				// (Quarantined/probation endpoints never reach here: the
+				// quarantine-ownership gate above skips the whole branch.)
 				go func(target *TorInstance) {
 					if !target.IsReady() {
 						return
@@ -1044,8 +1107,14 @@ func (tl *TorLifecycle) requestNewCircuitResultWithDropGuards(inst *TorInstance,
 
 	if err := client.SignalNEWNYM(dropGuards); err != nil {
 		tl.refundNymWindow(inst, claim)
+		// Auth rejection means the cached cookie is stale (rotated on
+		// disk or datadir replaced): evict so the next attempt re-reads,
+		// and after repeated rejections mark not-ready for recycle.
+		// Transport failures say nothing about the cookie — keep it.
+		tl.noteAuthResult(inst, err)
 		return false, err
 	}
+	tl.noteAuthResult(inst, nil)
 
 	inst.NextCircuitGen()
 	inst.SetLastRotated(time.Now())
@@ -1082,8 +1151,13 @@ func (tl *TorLifecycle) VerifyControls() error {
 		client := NewTorControlClient(controlAddr, "", tl.cachedCookie(inst))
 		client.Logf = tl.logf
 		if err := client.VerifyAuth(); err != nil {
+			// Same stale-cookie handling as the NEWNYM path: a rejected
+			// startup probe evicts the cache so the next attempt (or the
+			// first rotation) re-reads disk instead of replaying bad bytes.
+			tl.noteAuthResult(inst, err)
 			return fmt.Errorf("instance %d control auth: %w", inst.ID, err)
 		}
+		tl.noteAuthResult(inst, nil)
 	}
 	return nil
 }

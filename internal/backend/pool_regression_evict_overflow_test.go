@@ -50,7 +50,7 @@ func TestPool_EvictConnsNoBackingAlias(t *testing.T) {
 	_ = oldBacking // keep the old array alive so the address comparison is valid
 
 	// The newly pooled tunnel must be intact and usable.
-	got := pool.getConn(0, "c:1")
+	got, _ := pool.getConn(0, "c:1")
 	if got == nil {
 		t.Fatal("newly pooled conn missing after evict")
 	}

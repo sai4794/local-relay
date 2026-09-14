@@ -232,3 +232,67 @@ func TestSelect_KillSwitchDisablesSteering(t *testing.T) {
 		t.Fatalf("disabled pick = %d, want 1 (pure least-inflight ID tie-break)", got.ID)
 	}
 }
+
+// Po2 mode samples k candidates and picks the best of the sample: with a
+// sick instance present, repeated dials must mostly avoid it (sampling can
+// occasionally draw only the sick + one equal candidate, but the sick one
+// must never win a sample containing a healthy candidate).
+func TestSelect_Po2AvoidsSick(t *testing.T) {
+	var m *MultiTorBackend
+	insts := selectTestLifecycle(t, &m)
+	p := DefaultScoreParams()
+	m.SetScoreParams(p)
+	m.SetSelection("po2", 2)
+	sicken(insts[0], p)
+
+	sickWins := 0
+	const dials = 30
+	for i := 0; i < dials; i++ {
+		got, _ := m.selectInstance(insts)
+		if got.ID == 1 {
+			sickWins++
+		}
+	}
+	if sickWins > dials/3 {
+		t.Fatalf("po2 picked sick instance %d/%d times; want mostly avoided", sickWins, dials)
+	}
+}
+
+// Po2 with k >= N degenerates to full-scan weighted: deterministic pick of
+// the healthy best.
+func TestSelect_Po2FullScanMatchesWeighted(t *testing.T) {
+	var m *MultiTorBackend
+	insts := selectTestLifecycle(t, &m)
+	p := DefaultScoreParams()
+	m.SetScoreParams(p)
+	sicken(insts[0], p)
+	insts[1].IncInFlight() // inst3 (ID 3) is the unique best
+
+	m.SetSelection("weighted", 2)
+	want, _ := m.selectInstance(insts)
+	m.SetSelection("po2", 8) // k clamps to N=3
+	got, _ := m.selectInstance(insts)
+	if got.ID != want.ID {
+		t.Fatalf("po2 full-scan = %d, weighted = %d; want agreement", got.ID, want.ID)
+	}
+}
+
+// Unknown selection names fall back to weighted; out-of-range samples clamp.
+func TestSelect_SetSelectionValidation(t *testing.T) {
+	var m *MultiTorBackend
+	selectTestLifecycle(t, &m)
+	m.SetSelection("random", 99)
+	if got := m.selectionMode(); got != "weighted" {
+		t.Fatalf("selectionMode = %q, want weighted fallback", got)
+	}
+	if got := m.po2SampleSize(); got != 2 {
+		t.Fatalf("po2SampleSize = %d, want clamped 2", got)
+	}
+	m.SetSelection("po2", 5)
+	if got := m.selectionMode(); got != "po2" {
+		t.Fatalf("selectionMode = %q, want po2", got)
+	}
+	if got := m.po2SampleSize(); got != 5 {
+		t.Fatalf("po2SampleSize = %d, want 5", got)
+	}
+}

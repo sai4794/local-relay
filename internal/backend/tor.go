@@ -21,7 +21,15 @@ type TorBackend struct {
 	circuitAge    int
 	maxCircuitAge int
 	lastRotate    time.Time
+	// consecDialFail counts consecutive SOCKS-dial failures for the
+	// health gate below; reset on any successful dial or probe.
+	consecDialFail int
 }
+
+// dialFailThreshold is the consecutive dial failures before single-tor
+// marks itself unhealthy. 3 matches the CheckHealth 3-strikes and
+// quarantine-entry discipline elsewhere in the backend package.
+const dialFailThreshold = 3
 
 type TorConfig struct {
 	Address           string
@@ -72,14 +80,23 @@ func cookieFileProvider(path string) func() ([]byte, bool) {
 func (t *TorBackend) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	conn, err := t.socksClient.Connect(ctx, t.addr, addr, "")
 	if err != nil {
+		// Health gate: a single refused upstream must not fail-close all
+		// single-tor traffic — only consecutive dial failures (daemon
+		// likely down or wedged) flip healthy=false. An upstream CONNECT
+		// rejection and a dead daemon look identical at this layer, so
+		// the threshold, not the first error, decides.
 		t.mu.Lock()
-		t.healthy = false
+		t.consecDialFail++
+		if t.consecDialFail >= dialFailThreshold {
+			t.healthy = false
+		}
 		t.mu.Unlock()
 		return nil, fmt.Errorf("tor dial failed: %w", err)
 	}
 
 	t.mu.Lock()
 	t.circuitAge++
+	t.consecDialFail = 0
 	t.healthy = true
 	t.mu.Unlock()
 

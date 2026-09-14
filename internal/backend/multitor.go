@@ -27,6 +27,13 @@ type MultiTorBackend struct {
 	// enabling later starts from warm data, not cold.
 	scoreParams ScoreParams
 	scored      atomic.Bool
+	// selection names the selection algorithm ("weighted" = full-scan
+	// least-effective-load; "po2" = power-of-two-choices sampling).
+	// Set via SetSelection; defaults to weighted. Read atomically on the
+	// dial path (a string header word — race-free under the race detector).
+	selection atomic.Value // string
+	// po2Samples is the candidate sample size for po2 selection (2..8).
+	po2Samples atomic.Int64
 	// quarCfg tunes the quarantine/probation state machine (quarantine.go).
 	// Zero value means defaults (see SetQuarantineConfig); quarantine
 	// transitions run regardless of scored steering — exclusion is not
@@ -93,6 +100,39 @@ func (m *MultiTorBackend) SetQuarantineConfig(c QuarantineConfig) {
 
 // ScoredSelection reports whether quality steering is enabled.
 func (m *MultiTorBackend) ScoredSelection() bool { return m.scored.Load() }
+
+// SetSelection installs the selection algorithm and Po2 sample size.
+// selection must be "weighted" (full-scan least-effective-load) or "po2"
+// (power-of-two-choices: sample po2Samples candidates, pick the best).
+// Unknown names fall back to weighted; po2Samples outside [2,8] falls back
+// to 2. Mirrors the pool.selection / pool.po2_samples validation ranges.
+func (m *MultiTorBackend) SetSelection(selection string, po2Samples int) {
+	if selection != "po2" {
+		selection = "weighted"
+	}
+	if po2Samples < 2 || po2Samples > 8 {
+		po2Samples = 2
+	}
+	m.selection.Store(selection)
+	m.po2Samples.Store(int64(po2Samples))
+}
+
+// selectionMode returns the live selection algorithm (default weighted when
+// never set — atomic.Value zero reads nil).
+func (m *MultiTorBackend) selectionMode() string {
+	if s, ok := m.selection.Load().(string); ok && s == "po2" {
+		return "po2"
+	}
+	return "weighted"
+}
+
+// po2SampleSize returns the live Po2 sample size (default 2 when unset).
+func (m *MultiTorBackend) po2SampleSize() int {
+	if n := m.po2Samples.Load(); n >= 2 && n <= 8 {
+		return int(n)
+	}
+	return 2
+}
 
 // hasServedCurrent reports whether the live instance generation has served.
 // everServed latches on the first successful DialContext; CheckRecycled
@@ -215,8 +255,15 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	inst.RecordServed()
 	m.everServed.Store(true)
 
-	// Score the successful dial: success-only EWMA sample + ok counter.
-	inst.RecordDialOutcome(true, time.Since(start), dialScoreAlpha)
+	// Score the dial outcome exactly once per request: the request-level
+	// outcome path (ReportOutcome, fed by the proxy's claim sink) is the
+	// single owner of success/failure samples. Recording here too would
+	// double-count every success (dial sample + outcome sample), inflate
+	// the success rate, pass the MinSamples gate early, and halve the
+	// effective EWMA alpha. Dial latency still rides the claim sink
+	// (filled below) so the outcome sample carries the real sample.
+	// Dial-failure err samples above stay: the outcome path only sees the
+	// winner, so failed attempts would otherwise leave no signal.
 	metrics.Default().Inc("lano_dial_ok_total", map[string]string{"instance": strconv.Itoa(inst.ID)})
 
 	// Increment in-flight before wrapping so Close always balances it.
@@ -320,93 +367,168 @@ func (c *inFlightConn) CloseWrite() error {
 // then smallest ID — deterministic). Scores never fail closed: the caller
 // guarantees len(ready) > 0 and always gets a candidate back.
 //
-// Quarantine skips (Slice 5) plug into the isExcluded hook: candidates the
-// hook rejects are skipped unless every candidate is rejected, in which
-// case the least-bad one still serves.
+// Quarantine skips plug into the isExcluded hook: candidates the hook
+// rejects are skipped unless every candidate is rejected, in which case
+// the least-bad one still serves.
+//
+// Selection algorithm is live-configurable (SetSelection): "weighted" scans
+// the full ready set; "po2" samples po2Samples candidates (stride-picked
+// from the shared atomic dial counter — no crypto/rand syscall on the hot
+// path) and picks the best of the sample. Po2 trades a bounded optimality
+// gap for O(1) selection cost at large N; at N=3 both modes agree.
 func (m *MultiTorBackend) selectInstance(ready []*TorInstance) (*TorInstance, int) {
-	scored := m.scored.Load()
-	p := m.scoreParams
-	if !scored {
-		p = ScoreParams{MinQuality: DefaultScoreParams().MinQuality, MinSamples: 1 << 60}
+	if m.selectionMode() == "po2" {
+		return m.selectInstancePo2(ready)
 	}
-	bestFresh, bestFreshIdx := (*TorInstance)(nil), 0
-	bestAny, bestAnyIdx := (*TorInstance)(nil), 0
-	bestFreshEff, bestAnyEff := 0.0, 0.0
-	bestFreshLoad, bestAnyLoad := int64(0), int64(0)
-	var bestFreshRot, bestAnyRot time.Time
-	excludedFresh, excludedFreshIdx := (*TorInstance)(nil), 0
-	excludedAny, excludedAnyIdx := (*TorInstance)(nil), 0
-	excludedFreshEff, excludedAnyEff := 0.0, 0.0
-	excludedFreshLoad, excludedAnyLoad := int64(0), int64(0)
-	var excludedFreshRot, excludedAnyRot time.Time
-	anyExcludedFresh := false
+	return m.selectInstanceWeighted(ready, nil)
+}
+
+// candidateView is one candidate's hoisted selection inputs, read once per
+// dial so a burst of dials pays no duplicate scans or lock acquisitions.
+type candidateView struct {
+	cand *TorInstance
+	idx  int
+	load int64
+	rot  time.Time
+	eff  float64
+}
+
+// viewCandidates hoists per-candidate reads (InFlight + GetLastRotated +
+// scoring atomics) into a single pass. When sample is non-nil only those
+// indexes are viewed (Po2 path); otherwise the full ready set.
+func (m *MultiTorBackend) viewCandidates(ready []*TorInstance, p ScoreParams, sample []int) []candidateView {
+	n := len(ready)
+	if sample != nil {
+		n = len(sample)
+	}
+	views := make([]candidateView, 0, n)
+	if sample != nil {
+		for _, i := range sample {
+			cand := ready[i]
+			load := cand.InFlight()
+			rot := cand.GetLastRotated()
+			q := QualityScore(cand.DialSuccesses(), cand.DialFailures(), int64(cand.DialLatencyEWMA()), p)
+			views = append(views, candidateView{cand: cand, idx: i, load: load, rot: rot, eff: EffectiveLoad(load, q, p.MinQuality)})
+		}
+		return views
+	}
 	for i, cand := range ready {
 		load := cand.InFlight()
 		rot := cand.GetLastRotated()
 		q := QualityScore(cand.DialSuccesses(), cand.DialFailures(), int64(cand.DialLatencyEWMA()), p)
-		eff := EffectiveLoad(load, q, p.MinQuality)
-		fresh := time.Since(rot) > 5*time.Second
-		if m.isExcluded(cand) {
+		views = append(views, candidateView{cand: cand, idx: i, load: load, rot: rot, eff: EffectiveLoad(load, q, p.MinQuality)})
+	}
+	return views
+}
+
+// better reports whether a beats b under the selection ordering: smaller
+// effective load wins, tie → smaller load → older rotation → smaller ID.
+// Deterministic: identical inputs always agree.
+func better(a, b candidateView) bool {
+	if a.eff != b.eff {
+		return a.eff < b.eff
+	}
+	if a.load != b.load {
+		return a.load < b.load
+	}
+	if !a.rot.Equal(b.rot) {
+		return a.rot.Before(b.rot)
+	}
+	return a.cand.ID < b.cand.ID
+}
+
+// pickBest folds views into best-fresh / best-any / least-bad-excluded
+// winners with the freshness preference (fresh = no rotation within 5s).
+func (m *MultiTorBackend) pickBest(views []candidateView) (*TorInstance, int) {
+	var bestFresh, bestAny, excludedFresh, excludedAny *candidateView
+	anyExcludedFresh := false
+	for i := range views {
+		v := &views[i]
+		fresh := time.Since(v.rot) > 5*time.Second
+		if m.isExcluded(v.cand) {
 			// Track the least-bad excluded candidate per freshness class
 			// so an all-quarantined pool still serves instead of failing.
-			if fresh {
-				if !anyExcludedFresh || eff < excludedFreshEff ||
-					(eff == excludedFreshEff && (load < excludedFreshLoad ||
-						(load == excludedFreshLoad && (rot.Before(excludedFreshRot) ||
-							(rot.Equal(excludedFreshRot) && cand.ID < excludedFresh.ID))))) {
-					excludedFresh, excludedFreshIdx = cand, i
-					excludedFreshEff, excludedFreshLoad, excludedFreshRot = eff, load, rot
-					anyExcludedFresh = true
-				}
+			if fresh && (!anyExcludedFresh || better(*v, *excludedFresh)) {
+				cp := *v
+				excludedFresh = &cp
+				anyExcludedFresh = true
 			}
-			if excludedAny == nil || eff < excludedAnyEff ||
-				(eff == excludedAnyEff && (load < excludedAnyLoad ||
-					(load == excludedAnyLoad && (rot.Before(excludedAnyRot) ||
-						(rot.Equal(excludedAnyRot) && cand.ID < excludedAny.ID))))) {
-				excludedAny, excludedAnyIdx = cand, i
-				excludedAnyEff, excludedAnyLoad, excludedAnyRot = eff, load, rot
+			if excludedAny == nil || better(*v, *excludedAny) {
+				cp := *v
+				excludedAny = &cp
 			}
 			continue
 		}
-		if fresh {
-			if bestFresh == nil || eff < bestFreshEff ||
-				(eff == bestFreshEff && (load < bestFreshLoad ||
-					(load == bestFreshLoad && (rot.Before(bestFreshRot) ||
-						(rot.Equal(bestFreshRot) && cand.ID < bestFresh.ID))))) {
-				bestFresh, bestFreshIdx = cand, i
-				bestFreshEff, bestFreshLoad, bestFreshRot = eff, load, rot
-			}
+		if fresh && (bestFresh == nil || better(*v, *bestFresh)) {
+			cp := *v
+			bestFresh = &cp
 		}
-		if bestAny == nil || eff < bestAnyEff ||
-			(eff == bestAnyEff && (load < bestAnyLoad ||
-				(load == bestAnyLoad && (rot.Before(bestAnyRot) ||
-					(rot.Equal(bestAnyRot) && cand.ID < bestAny.ID))))) {
-			bestAny, bestAnyIdx = cand, i
-			bestAnyEff, bestAnyLoad, bestAnyRot = eff, load, rot
+		if bestAny == nil || better(*v, *bestAny) {
+			cp := *v
+			bestAny = &cp
 		}
 	}
 	if bestFresh != nil {
-		return bestFresh, bestFreshIdx
+		return bestFresh.cand, bestFresh.idx
 	}
 	if bestAny != nil {
-		return bestAny, bestAnyIdx
+		return bestAny.cand, bestAny.idx
 	}
 	// Every candidate excluded (e.g. all quarantined): serve the least-bad
 	// excluded one rather than failing closed. Fresh-excluded wins when it
 	// exists to preserve the freshness preference.
 	if anyExcludedFresh {
-		return excludedFresh, excludedFreshIdx
+		return excludedFresh.cand, excludedFresh.idx
 	}
-	return excludedAny, excludedAnyIdx
+	return excludedAny.cand, excludedAny.idx
+}
+
+// selectInstanceWeighted is the full-scan least-effective-load selection.
+func (m *MultiTorBackend) selectInstanceWeighted(ready []*TorInstance, _ []int) (*TorInstance, int) {
+	scored := m.scored.Load()
+	p := m.scoreParams
+	if !scored {
+		p = ScoreParams{MinQuality: DefaultScoreParams().MinQuality, MinSamples: 1 << 60}
+	}
+	return m.pickBest(m.viewCandidates(ready, p, nil))
+}
+
+// selectInstancePo2 samples po2Samples candidates by stride from the shared
+// atomic dial counter and picks the best of the sample. Stride-picking (not
+// rand) keeps the hot path syscall-free and deterministic under test; the
+// counter advances on every dial so consecutive dials sample different
+// windows. Sampling is over ready indexes, so quarantine exclusion and the
+// least-bad fallback still apply within the sample.
+func (m *MultiTorBackend) selectInstancePo2(ready []*TorInstance) (*TorInstance, int) {
+	scored := m.scored.Load()
+	p := m.scoreParams
+	if !scored {
+		p = ScoreParams{MinQuality: DefaultScoreParams().MinQuality, MinSamples: 1 << 60}
+	}
+	n := len(ready)
+	k := m.po2SampleSize()
+	if k > n {
+		k = n
+	}
+	base := int((uint64(m.counter.Add(1)) & 0x7fffffffffffffff) % uint64(n))
+	sample := make([]int, 0, k)
+	for j := 0; j < k; j++ {
+		sample = append(sample, (base+j*(n/k+1))%n)
+	}
+	return m.pickBest(m.viewCandidates(ready, p, sample))
 }
 
 // isExcluded reports whether quarantine currently excludes cand from
 // selection. Quarantined endpoints are skipped until their hold expires
 // (lazy promotion to probation happens here, on the selection path);
-// probation holds the single probe slot; draining/closed never serve.
-// Promotion here only moves Quarantined->Probation (claiming the probe);
-// Probation->Active / Probation->Quarantined resolve on the outcome path,
-// where success/failure is known.
+// probation admits ONLY the dialer that CAS-claims the single probe slot
+// (claimProbe) — concurrent dials see the claimed slot and pick someone
+// else, so a sick endpoint never takes a probe herd. A wedged slot
+// (holder died without reporting) is released after its expiry budget so
+// the endpoint can be re-probed instead of wedging in probation.
+// Draining/closed never serve. Promotion here only moves
+// Quarantined->Probation; Probation->Active / Probation->Quarantined
+// resolve on the outcome path, where success/failure is known.
 func (m *MultiTorBackend) isExcluded(cand *TorInstance) bool {
 	now := time.Now()
 	switch cand.quar.State() {
@@ -417,14 +539,17 @@ func (m *MultiTorBackend) isExcluded(cand *TorInstance) bool {
 			return true
 		}
 		cand.quar.pollPromotion(now)
-		return false
+		// Fall through: freshly promoted to Probation — claim below.
+		if cand.quar.State() != StateProbation {
+			return true
+		}
+		return !cand.quar.claimProbe(now)
 	case StateProbation:
-		// The probe holder serves; concurrent dials pick someone else.
-		// A stuck probe slot (holder died without reporting) would wedge
-		// the endpoint in probation: the outcome path always clears the
-		// slot on success/failure, and Close/drain transitions out, so no
-		// expiry is needed here.
-		return !cand.quar.probeInFlight.Load()
+		cfg := m.quarConfig()
+		if cand.quar.releaseStaleProbe(now, cfg.Duration) {
+			return !cand.quar.claimProbe(now)
+		}
+		return !cand.quar.claimProbe(now)
 	default:
 		return true
 	}
@@ -476,7 +601,7 @@ func (m *MultiTorBackend) Status() map[string]interface{} {
 	}
 	if m.scored.Load() {
 		top["scored_selection"] = true
-		top["selection"] = "weighted"
+		top["selection"] = m.selectionMode()
 	}
 	return top
 }

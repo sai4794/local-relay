@@ -17,7 +17,7 @@ func TestConnPoolGetEmpty(t *testing.T) {
 		CircuitCount: 3,
 	})
 
-	conn := pool.getConn(0, "example.com:443")
+	conn, _ := pool.getConn(0, "example.com:443")
 	if conn != nil {
 		t.Fatal("expected nil from empty pool")
 		conn.Close()
@@ -43,13 +43,13 @@ func TestConnPoolPutAndGet(t *testing.T) {
 	fakeConn, _ := net.Dial("tcp", ln.Addr().String())
 	pool.putConn(0, "example.com:443", fakeConn)
 
-	conn := pool.getConn(0, "example.com:443")
+	conn, _ := pool.getConn(0, "example.com:443")
 	if conn == nil {
 		t.Fatal("expected connection from pool")
 	}
 	conn.Close()
 
-	conn2 := pool.getConn(0, "example.com:443")
+	conn2, _ := pool.getConn(0, "example.com:443")
 	if conn2 != nil {
 		t.Fatal("expected nil after getting connection")
 		conn2.Close()
@@ -76,7 +76,7 @@ func TestConnPoolDestinationSafety(t *testing.T) {
 	fakeConn1, _ := net.Dial("tcp", ln.Addr().String())
 	pool.putConn(0, "example.com:443", fakeConn1)
 
-	conn := pool.getConn(0, "github.com:443")
+	conn, _ := pool.getConn(0, "github.com:443")
 	if conn != nil {
 		conn.Close()
 		t.Fatal("pool should NOT return example.com connection for github.com")
@@ -105,13 +105,13 @@ func TestConnPoolDifferentSlots(t *testing.T) {
 	fakeConn2, _ := net.Dial("tcp", ln.Addr().String())
 	pool.putConn(1, "example.com:443", fakeConn2)
 
-	conn0 := pool.getConn(0, "example.com:443")
+	conn0, _ := pool.getConn(0, "example.com:443")
 	if conn0 == nil {
 		t.Fatal("expected connection from slot 0")
 	}
 	conn0.Close()
 
-	conn1 := pool.getConn(1, "example.com:443")
+	conn1, _ := pool.getConn(1, "example.com:443")
 	if conn1 == nil {
 		t.Fatal("expected connection from slot 1")
 	}
@@ -140,7 +140,7 @@ func TestConnPoolEvictsStale(t *testing.T) {
 
 	time.Sleep(5 * time.Millisecond)
 
-	conn := pool.getConn(0, "example.com:443")
+	conn, _ := pool.getConn(0, "example.com:443")
 	if conn != nil {
 		t.Fatal("expected nil for stale connection")
 		conn.Close()
@@ -241,7 +241,7 @@ func TestConnPoolDeadConnection(t *testing.T) {
 		t.Fatalf("pool has %d connections, expected 1 (optimistic pool-in)", count)
 	}
 
-	got := pool.getConn(0, "example.com:443")
+	got, _ := pool.getConn(0, "example.com:443")
 	if got == nil {
 		t.Fatal("getConn should return the pooled connection")
 	}
@@ -297,7 +297,7 @@ func TestConnPoolHalfClosedConnection(t *testing.T) {
 		t.Fatalf("pool has %d connections, expected 1 (optimistic pool-in)", count)
 	}
 
-	got := pool.getConn(0, "example.com:443")
+	got, _ := pool.getConn(0, "example.com:443")
 	if got == nil {
 		t.Fatal("getConn should return the RST'd connection")
 	}
@@ -423,7 +423,7 @@ func TestPoolConnectionReuseAcrossDestinations(t *testing.T) {
 	fakeConn, _ := net.Dial("tcp", ln.Addr().String())
 	pool.putConn(0, "example.com:443", fakeConn)
 
-	conn := pool.getConn(0, "github.com:443")
+	conn, _ := pool.getConn(0, "github.com:443")
 	if conn != nil {
 		conn.Close()
 		t.Fatal("pool should NOT return example.com connection for github.com")
@@ -459,7 +459,7 @@ func BenchmarkPoolHit(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		conn := pool.getConn(i%3, "example.com:443")
+		conn, _ := pool.getConn(i%3, "example.com:443")
 		if conn != nil {
 			pool.putConn(i%3, "example.com:443", conn)
 		}
@@ -474,7 +474,7 @@ func BenchmarkPoolMiss(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pool.getConn(i%3, "example.com:443")
+		firstConn(pool.getConn(i%3, "example.com:443"))
 	}
 }
 
@@ -512,3 +512,7 @@ func BenchmarkPooledConnWrapClose(b *testing.B) {
 		wrap.Close()
 	}
 }
+
+// firstConn drops the generation from getConn's (conn, gen) pair for
+// call sites (tests, benchmarks) that only need the connection.
+func firstConn(c interface{ Close() error }, _ int64) interface{ Close() error } { return c }

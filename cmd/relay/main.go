@@ -280,6 +280,7 @@ func applyPoolTuning(m *backend.MultiTorBackend, cfg *config.Config, logger *slo
 		MinSamples: cfg.Pool.MinSamples,
 		MinQuality: cfg.Pool.MinQuality,
 	})
+	m.SetSelection(cfg.Pool.Selection, cfg.Pool.Po2Samples)
 	m.SetQuarantineConfig(backend.QuarantineConfig{
 		AfterFails:  int64(cfg.Pool.QuarantineAfterFails),
 		Duration:    time.Duration(cfg.Pool.QuarantineSecs) * time.Second,

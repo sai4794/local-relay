@@ -204,7 +204,7 @@ func TestPool_OptimisticReturn(t *testing.T) {
 
 	pool.putConn(0, "example.com:443", client)
 
-	got := pool.getConn(0, "example.com:443")
+	got, _ := pool.getConn(0, "example.com:443")
 	if got == nil {
 		t.Fatal("getConn should return the pooled connection")
 	}
@@ -227,7 +227,7 @@ func TestPool_DeadConnDiscarded(t *testing.T) {
 	server.Close()
 	time.Sleep(10 * time.Millisecond)
 
-	got := pool.getConn(0, "example.com:443")
+	got, _ := pool.getConn(0, "example.com:443")
 	if got == nil {
 		t.Fatal("getConn should return pooled connection optimistically")
 	}
@@ -242,7 +242,7 @@ func TestPool_DeadConnDiscarded(t *testing.T) {
 	defer server2.Close()
 	pool.putConn(0, "example.com:443", client2)
 
-	retry := pool.getConn(0, "example.com:443")
+	retry, _ := pool.getConn(0, "example.com:443")
 	if retry == nil {
 		t.Fatal("retry should return fresh connection")
 	}
@@ -273,7 +273,7 @@ func TestPool_RetryAfterDeadPooledConn(t *testing.T) {
 	})
 	pool.connPoolMu.Unlock()
 
-	got := pool.getConn(0, "example.com:443")
+	got, _ := pool.getConn(0, "example.com:443")
 	if got == nil {
 		t.Skip("getConn returned nil — pool may have evicted it")
 		return
@@ -292,7 +292,7 @@ func TestPool_FreshConnBypassesDeadPool(t *testing.T) {
 		CircuitCount: 1,
 	})
 
-	got := pool.getConn(0, "example.com:443")
+	got, _ := pool.getConn(0, "example.com:443")
 	if got != nil {
 		got.Close()
 		t.Fatal("empty pool should return nil")
@@ -308,7 +308,7 @@ func TestPool_FreshConnBypassesDeadPool(t *testing.T) {
 
 	pool.putConn(0, "example.com:443", client)
 
-	got = pool.getConn(0, "example.com:443")
+	got, _ = pool.getConn(0, "example.com:443")
 	if got == nil {
 		t.Fatal("should get pooled connection")
 	}

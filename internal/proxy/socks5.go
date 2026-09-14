@@ -465,11 +465,14 @@ func (p *SOCKS5Proxy) isSelfDial(target string) bool {
 	}
 	// Resolved-loopback match for IP spellings: only block when BOTH sides
 	// resolve to loopback. "localhost" has no ParseIP form, so normalize it
-	// to loopback explicitly on each side.
+	// to loopback explicitly on each side. An unspecified listen host
+	// (0.0.0.0 or ::) accepts loopback traffic on that port, so it counts
+	// as loopback-equivalent on the listen side (mirrors HTTPProxy).
 	tLoop := strings.EqualFold(strings.TrimSuffix(tHost, "."), "localhost") ||
 		net.ParseIP(strings.Trim(tHost, "[]")).IsLoopback()
 	lLoop := strings.EqualFold(strings.TrimSuffix(lHost, "."), "localhost") ||
-		net.ParseIP(strings.Trim(lHost, "[]")).IsLoopback()
+		net.ParseIP(strings.Trim(lHost, "[]")).IsLoopback() ||
+		isUnspecifiedHost(lHost)
 	return tLoop && lLoop
 }
 
