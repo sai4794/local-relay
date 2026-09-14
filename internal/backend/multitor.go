@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -138,7 +139,20 @@ func (m *MultiTorBackend) po2SampleSize() int {
 	return 2
 }
 
-// hasServedCurrent reports whether the live instance generation has served.
+// isDaemonDeadErr reports whether a SOCKS dial error means the Tor daemon
+// itself is unreachable (TCP connect to the daemon's SOCKS port failed),
+// as opposed to a target-dependent handshake failure (refused upstream,
+// bad port/host, auth downgrade). Only daemon-dead may pin the liveness
+// cache: the transport wraps TCP-dial failures as "tor socks connect: …"
+// (see transport/socks5.go Connect) while handshake errors carry their
+// own prefixes (greeting/auth/connect …).
+func isDaemonDeadErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "tor socks connect:")
+}
+
 // everServed latches on the first successful DialContext; CheckRecycled
 // (kill/spawn replacement) re-arms it when no live instance carries a
 // LastServed stamp, so recycled-cold stacks skip pre-serve NEWNYM dispatch.
@@ -243,9 +257,19 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	// the claim would wedge the endpoint until expiry. Release (not
 	// re-quarantine with NEWNYM): the request outcome path owns the
 	// re-quarantine signal and the claim sink may still report.
+	// Liveness pins ONLY on daemon-dead signals (TCP connect to the daemon
+	// failed): target-dependent SOCKS failures (refused upstream, bad
+	// port/host) must not park a healthy daemon — one dead-target request
+	// would otherwise pin all instances dead and fail the next request
+	// for ANY target until CheckHealth revives them.
 	dialScoreAlpha := m.scoreParams.Alpha
 	if !m.scored.Load() {
 		dialScoreAlpha = DefaultScoreParams().Alpha
+	}
+	markDead := func(t *TorInstance, dialErr error) {
+		if dialErr != nil && isDaemonDeadErr(dialErr) {
+			t.MarkLivenessDead()
+		}
 	}
 	releaseProbe := func(t *TorInstance) {
 		if t.quar.State() == StateProbation {
@@ -255,7 +279,7 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	if err != nil {
 		m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
 		inst.RecordDialOutcome(false, 0, dialScoreAlpha)
-		inst.MarkLivenessDead()
+		markDead(inst, err)
 		releaseProbe(inst)
 		metrics.Default().IncKey(inst.dialErrKey(), 1)
 		// Try next instance with its isolation user
@@ -270,7 +294,7 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 			}
 			m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
 			inst.RecordDialOutcome(false, 0, dialScoreAlpha)
-			inst.MarkLivenessDead()
+			markDead(inst, err)
 			releaseProbe(inst)
 			metrics.Default().IncKey(inst.dialErrKey(), 1)
 		}
@@ -537,12 +561,16 @@ func (m *MultiTorBackend) selectInstanceWeighted(ready []*TorInstance, _ []int) 
 	return m.pickBest(m.viewCandidates(ready, p, nil))
 }
 
-// selectInstancePo2 samples po2Samples candidates by stride from the shared
-// atomic dial counter and picks the best of the sample. Stride-picking (not
-// rand) keeps the hot path syscall-free and deterministic under test; the
-// counter advances on every dial so consecutive dials sample different
-// windows. Sampling is over ready indexes, so quarantine exclusion and the
-// least-bad fallback still apply within the sample.
+// selectInstancePo2 samples po2Samples candidates by consecutive window
+// from the shared atomic dial counter and picks the best of the sample.
+// Window-picking (not rand) keeps the hot path syscall-free and
+// deterministic under test; the counter advances on every dial so
+// consecutive dials sample different windows. Sampling is over ready
+// indexes and pickBest applies quarantine exclusion inside the sample —
+// same order of operations as the pool twin (which strides its eligible
+// list): a quarantined candidate inside the sample loses to a healthy one
+// inside the same sample. Cross-sample exclusion (healthy outside an
+// all-quarantined sample) still serves least-bad via the fallback.
 func (m *MultiTorBackend) selectInstancePo2(ready []*TorInstance) (*TorInstance, int) {
 	scored := m.scored.Load()
 	p := m.scoreParams
@@ -554,10 +582,16 @@ func (m *MultiTorBackend) selectInstancePo2(ready []*TorInstance) (*TorInstance,
 	if k > n {
 		k = n
 	}
+	// Distinct-index sampling: stride 1 with a counter-rotated base walks
+	// k distinct windows (consecutive runs), so k>=N always covers the
+	// full set (== weighted) and k<N covers exactly k distinct
+	// candidates. The old step=n/k+1 stride collapsed (gcd(step,n)!=1:
+	// N=2,k=2 sampled [0,0]/[1,1]; N=4,k=4 covered 2/4) — never use a
+	// multiplicative stride here.
 	base := int((uint64(m.counter.Add(1)) & 0x7fffffffffffffff) % uint64(n))
 	sample := make([]int, 0, k)
 	for j := 0; j < k; j++ {
-		sample = append(sample, (base+j*(n/k+1))%n)
+		sample = append(sample, (base+j)%n)
 	}
 	return m.pickBest(m.viewCandidates(ready, p, sample))
 }

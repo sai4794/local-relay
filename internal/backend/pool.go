@@ -380,9 +380,8 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 		}
 		base := int((uint64(p.current.Add(1)) & 0x7fffffffffffffff) % uint64(len(eligible)))
 		order = make([]slotView, 0, k)
-		step := len(eligible)/k + 1
 		for j := 0; j < k; j++ {
-			order = append(order, eligible[(base+j*step)%len(eligible)])
+			order = append(order, eligible[(base+j)%len(eligible)])
 		}
 	} else {
 		p.current.Add(1)
@@ -426,7 +425,7 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 			if slot.quar.State() == StateProbation {
 				slot.quar.probeInFlight.CompareAndSwap(true, false)
 			}
-			metrics.Default().IncKey("relay_pool_slot_dial_err_total{slot=\""+strconv.Itoa(idx)+"\"}", 1)
+			metrics.Default().IncKey(slot.slotDialErrKey(), 1)
 			p.logf("[pool] slot %d dial failed: %v", idx, err)
 			continue
 		}
@@ -443,6 +442,18 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 	p.asyncNEWNYM()
 
 	return nil, fmt.Errorf("circuit pool exhausted: all slots unhealthy")
+}
+
+// slotDialOKKey/slotDialErrKey are the pre-baked dial counter keys for one
+// pool slot (mirrors TorInstance.dialOKKey/dialErrKey): built once per slot,
+// IncKey'd on the hot dial path to skip the per-dial map/escape/sort alloc.
+func (s *CircuitSlot) slotDialOKKey() string {
+	return "relay_pool_slot_dial_ok_total{slot=\"" + strconv.Itoa(s.id) + "\"}"
+}
+
+// slotDialErrKey is the pre-baked failure counter key (see slotDialOKKey).
+func (s *CircuitSlot) slotDialErrKey() string {
+	return "relay_pool_slot_dial_err_total{slot=\"" + strconv.Itoa(s.id) + "\"}"
 }
 
 // slotView is one slot's hoisted selection inputs for pool DialContext.
@@ -474,7 +485,7 @@ func sortSlotViews(v []slotView) {
 func (p *CircuitPoolBackend) recordDialSuccess(slot *CircuitSlot, idx int, latency time.Duration) {
 	slot.RecordSuccess()
 	slot.RecordDialOutcome(true, latency, p.scoreParamsLive().Alpha)
-	metrics.Default().IncKey("relay_pool_slot_dial_ok_total{slot=\""+strconv.Itoa(idx)+"\"}", 1)
+	metrics.Default().IncKey(slot.slotDialOKKey(), 1)
 	p.resetErrorBackoff()
 	if slot.ShouldRotate(p.maxAge) {
 		slot.SetUnhealthy()

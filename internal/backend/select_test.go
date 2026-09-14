@@ -296,3 +296,25 @@ func TestSelect_SetSelectionValidation(t *testing.T) {
 		t.Fatalf("po2SampleSize = %d, want 5", got)
 	}
 }
+
+// Distinct-index sampling: k>=N covers the full set, so the WINNER equals
+// the weighted winner on every dial (same best-of-all). Pre-fix the
+// multiplicative stride collapsed (N=2,k=2 sampled [0,0]/[1,1]; N=4,k=4
+// covered 2/4). Winner-equality is the contract (coverage of losers is
+// not: the best candidate rightly wins every cold-equal tie-break).
+func TestSelect_Po2DistinctCoverage(t *testing.T) {
+	var m *MultiTorBackend
+	insts := selectTestLifecycle(t, &m)
+	m.SetScoreParams(DefaultScoreParams())
+	insts[0].IncInFlight()
+	insts[0].IncInFlight() // inst 2 and 3 tie for best; ID tie-break -> 2
+	m.SetSelection("weighted", 2)
+	want, _ := m.selectInstance(insts)
+	m.SetSelection("po2", 8) // k clamps to N=3
+	for i := 0; i < 12; i++ {
+		got, _ := m.selectInstance(insts)
+		if got.ID != want.ID {
+			t.Fatalf("po2 k>=N pick = %d, weighted = %d; want agreement every dial", got.ID, want.ID)
+		}
+	}
+}

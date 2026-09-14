@@ -297,6 +297,12 @@ func applyPoolScoreParams(
 ) {
 	if !cfg.Pool.Enabled {
 		setScore(backend.ScoreParams{})
+		// Reset the rest too: selection stays live even when unscored
+		// (po2 over neutral quality != pure least-inflight), and
+		// quarantine exclusion runs regardless of steering — the
+		// kill-switch must restore stock behavior on all three.
+		setSelection("weighted", 2)
+		setQuarantine(backend.QuarantineConfig{})
 		logger.Info("pool scoring disabled (kill-switch): pure least-inflight selection", "backend", backendName)
 		return
 	}
