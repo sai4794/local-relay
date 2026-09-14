@@ -276,10 +276,13 @@ func (p *HTTPProxy) rotateForDeadTunnel(host string, claim *backend.EndpointClai
 	}
 	// Nil-router safe AND bypass-safe: reportAnomalyForTor drops nil
 	// routers (sibling sites all nil-guard) and direct claims (a dead
-	// bypass tunnel proves nothing about Tor exits). Previously a bare
+	// bypass tunnel proves nothing about Tor exits). The host fallback
+	// takes the bare hostname WITHOUT port: IsBypassHost never strips
+	// ports, so "example.com:443" would miss the map/suffix walk and a
+	// dead bypass tunnel would spuriously rotate Tor. Previously a bare
 	// ReportAnomaly(-1) with no nil check — a nil-router dead tunnel
 	// panicked inside Router.ReportAnomaly.
-	reportAnomalyForTor(p.router, stripSchemeAndPath(host), claim)
+	reportAnomalyForTor(p.router, hostnameOf(host), claim)
 }
 
 // singleLookupVerdict runs the firewall guard once (the single shared
@@ -1118,6 +1121,18 @@ func (p *HTTPProxy) isSelfDial(target string) bool {
 	tLoop := isLoopbackHost(tHost) || isUnspecifiedHost(tHost)
 	lLoop := isLoopbackHost(lHost) || isUnspecifiedHost(lHost)
 	return tLoop && lLoop
+}
+
+// hostnameOf reduces a dial target to its bare hostname for bypass verdicts:
+// "example.com:443" -> "example.com", "[::1]:8080" -> "::1",
+// "http://localhost/path" -> "localhost". IsBypassHost never strips ports,
+// so passing host:port would miss the map/suffix walk and wrongly rotate.
+func hostnameOf(target string) string {
+	host := stripSchemeAndPath(target)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return strings.Trim(host, "[]")
 }
 
 // stripSchemeAndPath reduces an absolute-form URL (or bare host) to its

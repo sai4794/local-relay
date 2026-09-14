@@ -119,3 +119,24 @@ func TestReportAnomalyForTor_BypassSkipsTorRotates(t *testing.T) {
 	// Nil router: no panic, no-op.
 	reportAnomalyForTor(nil, "example.com", &backend.EndpointClaim{OK: true, Backend: "multitor", ID: 1})
 }
+
+// Dead-tunnel bypass skip with host:port input: rotateForDeadTunnel receives
+// host:port from relayConn, so the hostname strip must happen before the
+// bypass verdict — otherwise a dead bypass tunnel spuriously rotates Tor.
+func TestDeadTunnel_BypassHostPortSkips(t *testing.T) {
+	rec := &recordingAnomalyBackend{}
+	r := backend.NewRouter(backend.NewDirectBackend(2*time.Second), rec)
+	r.SetBypassHosts([]string{"bypass.local"})
+	p := testHTTPProxy(t, r)
+	p.rotator = nil                   // isolate the anomaly path from ForceRotate
+	claim := &backend.EndpointClaim{} // unfilled: DirectBackend never fills
+	p.rotateForDeadTunnel("bypass.local:8080", claim)
+	if n := rec.anomalies.Load(); n != 0 {
+		t.Fatalf("dead bypass tunnel anomalies = %d; want 0 (host:port must still skip)", n)
+	}
+	// Tor host:port still rotates.
+	p.rotateForDeadTunnel("example.com:443", claim)
+	if n := rec.anomalies.Load(); n != 1 {
+		t.Fatalf("dead tor tunnel anomalies = %d; want 1", n)
+	}
+}
