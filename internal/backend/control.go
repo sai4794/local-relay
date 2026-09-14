@@ -41,6 +41,32 @@ func NewTorControlClient(addr, password string, cookie func() ([]byte, bool)) *T
 	return &TorControlClient{Addr: addr, Password: password, Cookie: cookie}
 }
 
+// VerifyAuth checks control-port authentication without changing state.
+// It connects, performs cookie → password → empty AUTHENTICATE, then closes.
+// No SIGNAL or other command is issued.
+func (c *TorControlClient) VerifyAuth() error {
+	if c.Addr == "" {
+		return fmt.Errorf("tor control port not configured")
+	}
+
+	conn, err := net.DialTimeout("tcp", c.Addr, controlTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to connect to control port: %w", err)
+	}
+	defer conn.Close()
+	// Log-only on failure: the deadline is best-effort hardening so a wedged
+	// daemon cannot leak goroutines; the command reply reads still time out
+	// via the dial-bounded path, and failing the whole call here would
+	// change behavior for callers that previously proceeded.
+	if err := conn.SetDeadline(time.Now().Add(controlTimeout)); err != nil && c.Logf != nil {
+		c.Logf("tor-control: SetDeadline: %v", err)
+	}
+
+	reader := bufio.NewReader(conn)
+
+	return c.authenticate(conn, reader)
+}
+
 // SignalNEWNYM requests a fresh circuit. When dropGuards is true a
 // DROPGUARDS is issued first to clear stalled guard nodes; DROPGUARDS
 // failure is tolerated but surfaced to the caller's log via Logf when set.
@@ -54,7 +80,10 @@ func (c *TorControlClient) SignalNEWNYM(dropGuards bool) error {
 		return fmt.Errorf("failed to connect to control port: %w", err)
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(controlTimeout))
+	// Log-only on failure (see VerifyAuth): best-effort hardening, behavior-preserving.
+	if err := conn.SetDeadline(time.Now().Add(controlTimeout)); err != nil && c.Logf != nil {
+		c.Logf("tor-control: SetDeadline: %v", err)
+	}
 
 	reader := bufio.NewReader(conn)
 

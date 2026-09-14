@@ -27,15 +27,37 @@ func TestMultiTor_LeastInflightPicked(t *testing.T) {
 				if err != nil {
 					return
 				}
-				// Respond to SOCKS5 greeting with no-auth.
+				// Respond to SOCKS5 greeting with user/pass auth (0x02):
+				// production MultiTor always dials with an IsolateSOCKSAuth
+				// identity, and the transport rejects a no-auth downgrade.
+				// Read the full greeting first (2 offered methods).
 				go func(cc net.Conn) {
 					defer cc.Close()
 					// Greeting
-					buf := make([]byte, 2)
+					buf := make([]byte, 4)
 					if _, err := cc.Read(buf); err != nil {
 						return
 					}
-					cc.Write([]byte{0x05, 0x00})
+					cc.Write([]byte{0x05, 0x02})
+					// RFC1929 auth: ver=1, ulen, user, plen, pass(empty).
+					ahdr := make([]byte, 2)
+					if _, err := cc.Read(ahdr); err != nil {
+						return
+					}
+					ulen := int(ahdr[1])
+					uname := make([]byte, ulen)
+					if _, err := cc.Read(uname); err != nil {
+						return
+					}
+					plen := make([]byte, 1)
+					if _, err := cc.Read(plen); err != nil {
+						return
+					}
+					pass := make([]byte, plen[0])
+					if _, err := cc.Read(pass); err != nil {
+						return
+					}
+					cc.Write([]byte{0x01, 0x00})
 					// CONNECT request: version+cmd+rsv+at. We read addr-type to know size.
 					hdr := make([]byte, 4)
 					if _, err := cc.Read(hdr); err != nil {

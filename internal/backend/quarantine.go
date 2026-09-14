@@ -1,0 +1,197 @@
+package backend
+
+import (
+	"sync/atomic"
+	"time"
+)
+
+// EndpointState is the quarantine/probation lifecycle of one endpoint.
+// The zero value (Active) is the correct default for fresh instances.
+type EndpointState int32
+
+const (
+	// StateActive serves normally and is eligible for scored selection.
+	StateActive EndpointState = iota
+	// StateQuarantined is excluded from selection until QuarantinedUntil;
+	// promotion to Probation is lazy (time.Now comparison on the
+	// selection/outcome paths) — no background timers or goroutines.
+	StateQuarantined
+	// StateProbation serves exactly one probe at a time: success returns to
+	// Active, failure re-quarantines with doubled backoff (capped).
+	StateProbation
+	// StateDraining serves nothing and transitions to Closed on Close/kill.
+	StateDraining
+	// StateClosed is terminal (killed instance / closed pool).
+	StateClosed
+)
+
+// String names the state for status output and metric labels.
+func (s EndpointState) String() string {
+	switch s {
+	case StateActive:
+		return "active"
+	case StateQuarantined:
+		return "quarantined"
+	case StateProbation:
+		return "probation"
+	case StateDraining:
+		return "draining"
+	case StateClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
+
+// QuarantineConfig tunes the quarantine/probation state machine.
+type QuarantineConfig struct {
+	// AfterFails is the consecutive-failure count entering quarantine.
+	AfterFails int64
+	// Duration is the base quarantine hold (doubled per consecutive
+	// quarantine, capped at MaxDuration).
+	Duration time.Duration
+	// MaxDuration caps the exponential backoff.
+	MaxDuration time.Duration
+	// Probes is the number of successful probation probes returning to
+	// Active (currently exactly 1; values > 1 reserve multi-probe).
+	Probes int64
+}
+
+// DefaultQuarantineConfig returns the production quarantine tuning: 60s
+// minimum sits well above the 10s NEWNYM cooldown and the 30s CheckHealth
+// grace, so entry (which issues ONE attributed NEWNYM) never fights the
+// existing rotation/health windows.
+func DefaultQuarantineConfig() QuarantineConfig {
+	return QuarantineConfig{
+		AfterFails:  3,
+		Duration:    60 * time.Second,
+		MaxDuration: 300 * time.Second,
+		Probes:      1,
+	}
+}
+
+// endpointQuarantine is the lock-free quarantine state for one endpoint.
+// All fields are atomics/CAS — no locks, no timers, no goroutines.
+// Promotion is lazy: readers compare quarantinedUntil against time.Now and
+// CAS-promote to Probation; an idle pool simply promotes late (harmless:
+// idle endpoints lose nothing by promoting on next use).
+type endpointQuarantine struct {
+	state            atomic.Int32 // EndpointState
+	consecFail       atomic.Int64
+	quarantinedUntil atomic.Int64 // UnixNano; valid in Quarantined
+	quarantineCount  atomic.Int64 // consecutive quarantines (backoff exponent)
+	probeInFlight    atomic.Bool  // exactly one probation probe at a time
+}
+
+// State returns the current lifecycle state.
+func (q *endpointQuarantine) State() EndpointState {
+	return EndpointState(q.state.Load())
+}
+
+// ConsecFails returns the consecutive failure count.
+func (q *endpointQuarantine) ConsecFails() int64 { return q.consecFail.Load() }
+
+// QuarantineCount returns the consecutive-quarantine backoff exponent.
+func (q *endpointQuarantine) QuarantineCount() int64 { return q.quarantineCount.Load() }
+
+// recordSuccess logs a success: clears consecutive failures AND backoff
+// (a working endpoint re-earns the base duration), keeps EWMA (it decays
+// on its own). In Probation, the first success returns to Active.
+func (q *endpointQuarantine) recordSuccess() {
+	q.consecFail.Store(0)
+	q.quarantineCount.Store(0)
+	q.probeInFlight.Store(false)
+	q.state.CompareAndSwap(int32(StateProbation), int32(StateActive))
+}
+
+// recordFailure logs a failure and reports whether the caller must enter
+// quarantine (transition Active->Quarantined performed by the caller via
+// enterQuarantine). consecFails>=afterFails triggers; callers add the
+// success-rate gate (total>=minSamples && sr<0.3) on top. While already
+// quarantined, failures only bump the counter — no double-signal; the
+// re-quarantine path (probation probe failure) doubles explicitly.
+// Returns true when a fresh quarantine entry is required.
+func (q *endpointQuarantine) recordFailure(afterFails int64) bool {
+	if afterFails <= 0 {
+		afterFails = DefaultQuarantineConfig().AfterFails
+	}
+	// Probation probe failure is handled by the caller (re-quarantine with
+	// backoff); record the failure but don't trigger a fresh entry here.
+	if q.State() == StateProbation {
+		q.consecFail.Add(1)
+		return false
+	}
+	n := q.consecFail.Add(1)
+	if q.State() != StateActive {
+		return false
+	}
+	return n >= afterFails
+}
+
+// enterQuarantine CAS-transitions Active->Quarantined, stamping until and
+// bumping the backoff exponent. Returns true only to the winner (exactly
+// one caller issues the entry NEWNYM). Duration is base<<count capped at
+// max: first entry holds base, second 2x, then 4x... capped at max.
+func (q *endpointQuarantine) enterQuarantine(now time.Time, base, max time.Duration) (until time.Time, entered bool) {
+	if base <= 0 {
+		base = DefaultQuarantineConfig().Duration
+	}
+	if max < base {
+		max = base
+	}
+	if !q.state.CompareAndSwap(int32(StateActive), int32(StateQuarantined)) {
+		return time.Time{}, false
+	}
+	n := q.quarantineCount.Add(1)
+	d := base
+	for i := int64(1); i < n && d < max; i++ {
+		d *= 2
+		if d > max || d <= 0 {
+			d = max
+			break
+		}
+	}
+	until = now.Add(d)
+	q.quarantinedUntil.Store(until.UnixNano())
+	return until, true
+}
+
+// pollPromotion lazily promotes Quarantined->Probation once until has
+// passed, claiming the single probe slot. Returns true only to the promoter
+// (exactly one probation probe at a time). Idle pools promote late —
+// harmless, promotion rides the selection path of the next dial.
+func (q *endpointQuarantine) pollPromotion(now time.Time) bool {
+	if q.State() != StateQuarantined {
+		return false
+	}
+	if now.UnixNano() < q.quarantinedUntil.Load() {
+		return false
+	}
+	if !q.state.CompareAndSwap(int32(StateQuarantined), int32(StateProbation)) {
+		return false
+	}
+	q.probeInFlight.Store(true)
+	return true
+}
+
+// eligibleForSelection reports whether the endpoint may serve traffic now:
+// Active always; Probation only for the single probe holder (callers claim
+// via claimProbe); Quarantined only after expiry (promote first via
+// pollPromotion). Draining/Closed never serve.
+func (q *endpointQuarantine) eligibleForSelection(now time.Time) bool {
+	switch q.State() {
+	case StateActive:
+		return true
+	case StateProbation:
+		return q.probeInFlight.Load()
+	case StateQuarantined:
+		return now.UnixNano() >= q.quarantinedUntil.Load()
+	default:
+		return false
+	}
+}
+
+// quarantineRemaining returns the hold left (<=0 when expired / not held).
+func (q *endpointQuarantine) quarantineRemaining(now time.Time) time.Duration {
+	return time.Unix(0, q.quarantinedUntil.Load()).Sub(now)
+}

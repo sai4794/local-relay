@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -118,28 +119,28 @@ func BenchmarkSOCKS5Handshake(b *testing.B) {
 				defer c.Close()
 				// Read greeting
 				buf := make([]byte, 2)
-				if _, err := readFull(c, buf); err != nil {
+				if _, err := io.ReadFull(c, buf); err != nil {
 					return
 				}
 				nMethods := int(buf[1])
 				methods := make([]byte, nMethods)
-				readFull(c, methods)
+				io.ReadFull(c, methods)
 				// Reply: no auth
 				c.Write([]byte{0x05, 0x00})
 				// Read connect request
 				header := make([]byte, 4)
-				if _, err := readFull(c, header); err != nil {
+				if _, err := io.ReadFull(c, header); err != nil {
 					return
 				}
 				// Read address
 				switch header[3] {
 				case 0x03: // Domain
 					domainLen := make([]byte, 1)
-					readFull(c, domainLen)
+					io.ReadFull(c, domainLen)
 					domain := make([]byte, domainLen[0])
-					readFull(c, domain)
+					io.ReadFull(c, domain)
 					port := make([]byte, 2)
-					readFull(c, port)
+					io.ReadFull(c, port)
 				}
 				// Connect to target
 				c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -162,14 +163,14 @@ func BenchmarkSOCKS5Handshake(b *testing.B) {
 		// SOCKS5 greeting
 		conn.Write([]byte{0x05, 0x01, 0x00})
 		resp := make([]byte, 2)
-		readFull(conn, resp)
+		io.ReadFull(conn, resp)
 		// SOCKS5 connect request
 		req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
 		req = append(req, []byte(host)...)
 		req = append(req, byte(port>>8), byte(port&0xff))
 		conn.Write(req)
 		reply := make([]byte, 10)
-		readFull(conn, reply)
+		io.ReadFull(conn, reply)
 		conn.Close()
 	}
 }
@@ -229,22 +230,6 @@ func BenchmarkAnomalyReporting(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		router.ReportAnomaly(-1)
 	}
-}
-
-// =============================================================================
-// HELPER
-// =============================================================================
-
-func readFull(conn net.Conn, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := conn.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
 }
 
 // =============================================================================

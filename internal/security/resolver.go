@@ -14,6 +14,9 @@ import (
 const (
 	dnsTTL         = 5 * time.Minute
 	negativeDNSTTL = 30 * time.Second
+	// dnsLookupTimeout bounds a single leader lookup AND a follower's wait so
+	// one wedged resolver cannot park request goroutines indefinitely.
+	dnsLookupTimeout = 5 * time.Second
 )
 
 type inFlightCall struct {
@@ -49,14 +52,28 @@ func newResolver() *Resolver {
 	return NewResolver()
 }
 
-// Lookup returns cached results when fresh; otherwise performs a deduplicated
-// lookup and caches it. Failed lookups are negatively cached for negativeDNSTTL
-// (30s) to prevent repetitive timeouts during bursts.
-func (r *Resolver) Lookup(host string) []net.IP {
+// normalizeHostKey lowercases a host and strips any port, IPv6 brackets, and
+// one trailing dot, so firewall rate keys, DNS cache keys, and the bypass pin
+// map agree on one canonical form. Bracket-stripping matters for bare IPv6
+// literals ("[::1]" with no port): without it the same address keys two cache
+// entries ("[::1]" vs "::1") and pin lookups miss their check-time entries.
+func normalizeHostKey(host string) string {
 	hostOnly := strings.ToLower(host)
 	if h, _, err := net.SplitHostPort(hostOnly); err == nil {
 		hostOnly = h
 	}
+	// Strip brackets in either order: "[v6]." leaves a trailing "]" after
+	// dot-stripping, and "[v6]" has none — both must reach "v6".
+	hostOnly = strings.TrimSuffix(hostOnly, ".")
+	hostOnly = strings.TrimPrefix(strings.TrimSuffix(hostOnly, "]"), "[")
+	return strings.TrimSuffix(hostOnly, ".")
+}
+
+// Lookup returns cached results when fresh; otherwise performs a deduplicated
+// lookup and caches it. Failed lookups are negatively cached for negativeDNSTTL
+// (30s) to prevent repetitive timeouts during bursts.
+func (r *Resolver) Lookup(host string) []net.IP {
+	hostOnly := normalizeHostKey(host)
 
 	if ip := net.ParseIP(hostOnly); ip != nil {
 		return []net.IP{ip}
@@ -89,10 +106,15 @@ func (r *Resolver) Lookup(host string) []net.IP {
 	}
 
 	// If another goroutine is already resolving this host, wait for its result
+	// — bounded, so a wedged leader cannot park followers forever.
 	if call, active := r.inFlight[hostOnly]; active {
 		r.mu.Unlock()
-		<-call.done
-		return call.ips
+		select {
+		case <-call.done:
+			return call.ips
+		case <-time.After(dnsLookupTimeout):
+			return nil
+		}
 	}
 
 	// Register leader call for this host
@@ -100,8 +122,9 @@ func (r *Resolver) Lookup(host string) []net.IP {
 	r.inFlight[hostOnly] = call
 	r.mu.Unlock()
 
-	// Perform actual DNS lookup outside lock
-	ips, err := net.LookupIP(hostOnly)
+	// Perform actual DNS lookup outside lock, bounded so a wedged resolver
+	// cannot park the leader (and every same-host follower) indefinitely.
+	ips, err := lookupIPTimeout(hostOnly, dnsLookupTimeout)
 
 	r.mu.Lock()
 	ttl := dnsTTL
@@ -116,6 +139,17 @@ func (r *Resolver) Lookup(host string) []net.IP {
 	r.mu.Unlock()
 
 	return ips
+}
+
+// lookupIPTimeout resolves host with a hard deadline. Callers treat a nil
+// result as "unknown" (fail-open, same as NXDOMAIN today) — the timeout only
+// prevents a wedged resolver from parking goroutines, it never blocks traffic
+// by itself.
+func lookupIPTimeout(host string, timeout time.Duration) ([]net.IP, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var resolver net.Resolver
+	return resolver.LookupIP(ctx, "ip", host)
 }
 
 // StartCleanup evicts expired entries every interval until the returned

@@ -29,7 +29,7 @@ echo ""
 echo "=== Go Benchmark Results ==="
 if [ -f "$RESULTS_DIR/go_bench.txt" ]; then
     echo ""
-    echo "Running: go test -bench=. -benchmem -count=3 -cpuprofile=cpu.prof -memprofile=mem.prof ./bench/..."
+    echo "Running: go test -bench=. -benchmem -count=3 -cpuprofile=cpu.prof -memprofile=mem.prof ./internal/..."
     echo ""
     echo "To parse results, look for lines like:"
     echo "  BenchmarkRequestLatency-8    10000    123456 ns/op    1234 B/op    12 allocs/op"

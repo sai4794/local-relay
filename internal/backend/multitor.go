@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,12 +17,116 @@ import (
 // giving a different outbound IP address.
 type MultiTorBackend struct {
 	lifecycle   *TorLifecycle
-	dialer      *net.Dialer
 	socksClient *transport.SOCKS5Client
 	counter     atomic.Int64
-	mu          sync.RWMutex
 	logf        func(string, ...interface{})
 	OnRotate    func() // called after NEWNYM to clear connection pools
+	// scoreParams tunes scored selection (score.go). The zero value selects
+	// pure least-inflight (today's behavior); SetScoreParams enables
+	// quality steering. Stats are still recorded while disabled so
+	// enabling later starts from warm data, not cold.
+	scoreParams ScoreParams
+	scored      atomic.Bool
+	// quarCfg tunes the quarantine/probation state machine (quarantine.go).
+	// Zero value means defaults (see SetQuarantineConfig); quarantine
+	// transitions run regardless of scored steering — exclusion is not
+	// steering, and the kill-switch (pool.enabled:false) only disables
+	// quality ordering, never health exclusion.
+	quarCfg QuarantineConfig
+	// everServed tracks whether any DialContext has served traffic yet.
+	// A cold backend (nothing ever served) has no culprit to attribute a
+	// ReportAnomaly(-1) to, so the rotation runs WITHOUT the
+	// ResetRequests+OnRotate churn. Set on the first successful serve.
+	// hasServedCurrent scopes the flag to the live instance generation:
+	// CheckRecycled re-arms it when every instance was replaced, so a
+	// recycled-cold stack reads cold again instead of inheriting a stale
+	// everServed=true from a dead generation.
+	everServed atomic.Bool
+}
+
+// SetScoreParams enables scored selection with the given tuning. The zero
+// ScoreParams value disables steering (pure least-inflight, today's
+// behavior); any non-zero value enables it. Stats record either way.
+func (m *MultiTorBackend) SetScoreParams(p ScoreParams) {
+	if p == (ScoreParams{}) {
+		m.scored.Store(false)
+		return
+	}
+	if p.Alpha <= 0 || p.Alpha > 1 {
+		p.Alpha = DefaultScoreParams().Alpha
+	}
+	if p.LatencyRef <= 0 {
+		p.LatencyRef = DefaultScoreParams().LatencyRef
+	}
+	if p.MinSamples <= 0 {
+		p.MinSamples = DefaultScoreParams().MinSamples
+	}
+	if p.MinQuality <= 0 {
+		p.MinQuality = DefaultScoreParams().MinQuality
+	}
+	m.scoreParams = p
+	m.scored.Store(true)
+}
+
+// SetQuarantineConfig installs the quarantine/probation tuning. The zero
+// value selects DefaultQuarantineConfig; invalid fields fall back to their
+// defaults (never zero windows or unbounded backoff).
+func (m *MultiTorBackend) SetQuarantineConfig(c QuarantineConfig) {
+	d := DefaultQuarantineConfig()
+	if c.AfterFails <= 0 {
+		c.AfterFails = d.AfterFails
+	}
+	if c.Duration <= 0 {
+		c.Duration = d.Duration
+	}
+	if c.MaxDuration < c.Duration {
+		c.MaxDuration = d.MaxDuration
+		if c.MaxDuration < c.Duration {
+			c.MaxDuration = c.Duration
+		}
+	}
+	if c.Probes <= 0 {
+		c.Probes = d.Probes
+	}
+	m.quarCfg = c
+}
+
+// ScoredSelection reports whether quality steering is enabled.
+func (m *MultiTorBackend) ScoredSelection() bool { return m.scored.Load() }
+
+// hasServedCurrent reports whether the live instance generation has served.
+// everServed latches on the first successful DialContext; CheckRecycled
+// (kill/spawn replacement) re-arms it when no live instance carries a
+// LastServed stamp, so recycled-cold stacks skip pre-serve NEWNYM dispatch.
+func (m *MultiTorBackend) hasServedCurrent() bool {
+	if !m.everServed.Load() {
+		return false
+	}
+	m.CheckRecycled()
+	return m.everServed.Load()
+}
+
+// CheckRecycled re-arms everServed when the live instance generation has
+// never served: a kill/spawn (or ShutdownAll/Start) replaces TorInstance
+// pointers, and fresh instances start with LastServed==0, so a stale
+// everServed=true from a dead generation must not force NEWNYM dispatch
+// against a generation with no culprit. When the backend is cold it returns
+// true; otherwise it returns false and leaves everServed set. Callers must
+// hold no locks; concurrent DialContext serves may set everServed again.
+func (m *MultiTorBackend) CheckRecycled() bool {
+	if m.lifecycle == nil {
+		return false
+	}
+	for _, cand := range m.lifecycle.GetInstances() {
+		if cand.LastServed() > 0 {
+			return false
+		}
+	}
+	if m.everServed.CompareAndSwap(true, false) {
+		m.logf("multi-tor: instance generation recycled to unserved, re-arming cold-backend gate")
+		return true
+	}
+	return true
 }
 
 // NewMultiTorBackend creates a backend that routes through multiple Tor instances.
@@ -36,7 +139,6 @@ func NewMultiTorBackend(lifecycle *TorLifecycle, timeout time.Duration, logf fun
 	}
 	return &MultiTorBackend{
 		lifecycle:   lifecycle,
-		dialer:      &net.Dialer{Timeout: timeout},
 		socksClient: transport.NewSOCKS5Client(timeout),
 		logf:        logf,
 	}
@@ -44,6 +146,7 @@ func NewMultiTorBackend(lifecycle *TorLifecycle, timeout time.Duration, logf fun
 
 // DialContext picks the next Tor instance round-robin and dials through its SOCKS port.
 func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	start := time.Now()
 	instances := m.lifecycle.GetInstances()
 	ready := make([]*TorInstance, 0)
 	for _, inst := range instances {
@@ -58,56 +161,49 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 
 	// In multi-tor mode every request builds a fresh Tor circuit via
 	// IsolateSOCKSAuth, so "round-robin" would land a long LLM stream on an
-	// instance that might already be serving another one. Pick the ready
-	// instance with the FEWEST in-flight requests; tie-break on least
-	// recently rotated so a post-429 instance isn't immediately re-picked.
-	fresh := make([]*TorInstance, 0, len(ready))
-	for _, inst := range ready {
-		if time.Since(inst.GetLastRotated()) > 5*time.Second {
-			fresh = append(fresh, inst)
-		}
-	}
-	pickFrom := ready
-	if len(fresh) > 0 {
-		pickFrom = fresh
-	}
-	var inst *TorInstance
-	minInFlight := int64(-1)
-	for _, cand := range pickFrom {
-		if minInFlight < 0 || cand.InFlight() < minInFlight {
-			inst = cand
-			minInFlight = cand.InFlight()
-		}
-	}
-	// Map back to original ready idx for fallback loop. Invariant: IDs are
-	// unique (spawn slot 1..N), so first match IS the picked instance.
-	idx := 0
-	for i, r := range ready {
-		if r.ID == inst.ID {
-			idx = i
-			break
-		}
-	}
+	// instance that might already be serving another one. selectInstance
+	// picks the ready instance with the smallest effective load (see
+	// score.go); with scoring disabled that reduces exactly to fewest
+	// in-flight, tie-broken by oldest rotation so a post-429 instance isn't
+	// immediately re-picked. Cooldown-fresh instances (no rotation within
+	// 5s) are preferred, falling back to all ready when every instance
+	// rotated within 5s. The serving instance, circuit generation, and dial
+	// latency ride home on the returned conn (see inFlightConn endpoint
+	// fields + EndpointFromConn in outcome.go) so the proxy can attribute
+	// success/failure samples per attempt. Scores never fail a dial closed:
+	// with no fresh candidate the least-bad ready instance still serves.
+	inst, idx := m.selectInstance(ready)
 
 	// IsolateSOCKSAuth: isolation user groups streams to this instance and circuit generation,
 	// allowing Tor to reuse warm 3-hop circuits while maintaining instance isolation and
 	// ensuring instant circuit refresh when generation increments on rotation.
-	isoUser := fmt.Sprintf("relay:%d:%d", inst.ID, inst.CircuitGen())
-	socksAddr := fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort())
+	isoUser := "relay:" + strconv.Itoa(inst.ID) + ":" + strconv.FormatInt(inst.CircuitGen(), 10)
+	socksAddr := "127.0.0.1:" + strconv.Itoa(inst.GetSocksPort())
 	conn, err := m.socksClient.Connect(ctx, socksAddr, addr, isoUser)
+	// Per-attempt dial failures score err samples on the attempted instance
+	// (the outcome path only sees the winner). EWMA untouched — failure
+	// latency mixes fast-refused with slow-timeout and would pollute it.
+	dialScoreAlpha := m.scoreParams.Alpha
+	if !m.scored.Load() {
+		dialScoreAlpha = DefaultScoreParams().Alpha
+	}
 	if err != nil {
 		m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
+		inst.RecordDialOutcome(false, 0, dialScoreAlpha)
+		metrics.Default().Inc("lano_dial_err_total", map[string]string{"instance": strconv.Itoa(inst.ID)})
 		// Try next instance with its isolation user
 		for i := 1; i < len(ready); i++ {
 			nextIdx := (idx + i) % len(ready)
 			inst = ready[nextIdx]
-			socksAddr = fmt.Sprintf("127.0.0.1:%d", inst.GetSocksPort())
-			isoUser = fmt.Sprintf("relay:%d:%d", inst.ID, inst.CircuitGen())
+			socksAddr = "127.0.0.1:" + strconv.Itoa(inst.GetSocksPort())
+			isoUser = "relay:" + strconv.Itoa(inst.ID) + ":" + strconv.FormatInt(inst.CircuitGen(), 10)
 			conn, err = m.socksClient.Connect(ctx, socksAddr, addr, isoUser)
 			if err == nil {
 				break
 			}
 			m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
+			inst.RecordDialOutcome(false, 0, dialScoreAlpha)
+			metrics.Default().Inc("lano_dial_err_total", map[string]string{"instance": strconv.Itoa(inst.ID)})
 		}
 		if err != nil {
 			return nil, fmt.Errorf("all Tor instances failed: %w", err)
@@ -115,24 +211,36 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	}
 
 	inst.IncRequests()
-	metrics.Default().Inc("lano_requests_total", map[string]string{
-		"instance": strconv.Itoa(inst.ID),
-	})
+	metrics.Default().IncKey("lano_requests_total{instance=\""+strconv.Itoa(inst.ID)+"\"}", 1)
+	inst.RecordServed()
+	m.everServed.Store(true)
+
+	// Score the successful dial: success-only EWMA sample + ok counter.
+	inst.RecordDialOutcome(true, time.Since(start), dialScoreAlpha)
+	metrics.Default().Inc("lano_dial_ok_total", map[string]string{"instance": strconv.Itoa(inst.ID)})
 
 	// Increment in-flight before wrapping so Close always balances it.
 	inst.IncInFlight()
-	conn = &inFlightConn{Conn: conn, inst: inst}
+	dialLatency := time.Since(start)
+	gen := inst.CircuitGen()
+	// Attribute this attempt: fill the proxy's claim sink (if it attached
+	// one at its pin site) so success/failure samples credit the instance
+	// that actually served the dial. The same triple also rides home on the
+	// conn for callers that hold the conn but not the ctx (EndpointFromConn).
+	fillClaimSink(ctx, "multitor", inst.ID, gen, dialLatency)
+	conn = &inFlightConn{Conn: conn, inst: inst, endpointID: inst.ID, endpointGen: gen, dialLatency: dialLatency}
 
-	// Check if this instance needs rotation (reset counter synchronously to prevent stampedes)
-	if m.lifecycle.rotateAfter > 0 && inst.GetRequests() >= int64(m.lifecycle.rotateAfter) {
-		inst.ResetRequests()
-
+	// Exactly one concurrent dialer wins each rotation window (ClaimRotation
+	// is atomic), so threshold crossings never stampede NEWNYM.
+	if inst.ClaimRotation(int64(m.lifecycle.rotateAfter)) {
 		m.logf("multi-tor: instance %d reached rotation threshold, rotating circuit", inst.ID)
 		go func(target *TorInstance) {
-			if err := m.lifecycle.RequestNewCircuit(target); err != nil {
+			if rotated, err := m.lifecycle.requestNewCircuitResult(target); err != nil {
 				m.logf("multi-tor: auto-rotate NEWNYM failed for instance %d: %v", target.ID, err)
-			} else if m.OnRotate != nil {
-				m.OnRotate()
+			} else if rotated {
+				if m.OnRotate != nil {
+					m.OnRotate()
+				}
 			}
 		}(inst)
 	}
@@ -142,14 +250,49 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 
 // inFlightConn decrements the instance's in-flight counter on Close.
 // Double-close is safe — the atomic flag guards it.
+// Discard marks the tunnel as broken (spent/half-closed) so pooled layers
+// below can drop it instead of recycling a dead socket; Close still runs.
 type inFlightConn struct {
 	net.Conn
 	inst     *TorInstance
 	released atomic.Bool
+	// endpointID/endpointGen/dialLatency carry the scored-selection claim
+	// for this dial (outcome.go): ID + circuit generation at serve time and
+	// the dial latency sample. Pure attribution metadata — Close/Discard
+	// accounting is unchanged.
+	endpointID  int
+	endpointGen int64
+	dialLatency time.Duration
 }
+
+// EndpointID returns the serving instance ID carried by this dial.
+func (c *inFlightConn) EndpointID() int { return c.endpointID }
+
+// EndpointGen returns the circuit generation at serve time.
+func (c *inFlightConn) EndpointGen() int64 { return c.endpointGen }
+
+// DialLatency returns the dial latency sample for this dial.
+func (c *inFlightConn) DialLatency() time.Duration { return c.dialLatency }
 
 func (c *inFlightConn) Unwrap() net.Conn {
 	return c.Conn
+}
+
+// Discard flags the connection as broken and closes it. It unwraps to a
+// pooledConnWrap below (pool topology) and forwards the discard so the dead
+// tunnel is closed, never re-pooled. In-flight accounting is balanced here,
+// exactly as in Close, so a discard never leaks the counter.
+func (c *inFlightConn) Discard() error {
+	if c.released.CompareAndSwap(false, true) {
+		c.inst.DecInFlight()
+	}
+	if inner, ok := c.Conn.(interface{ Discard() error }); ok {
+		return inner.Discard()
+	}
+	if inner, ok := c.Conn.(interface{ MarkBroken() }); ok {
+		inner.MarkBroken()
+	}
+	return c.Conn.Close()
 }
 
 func (c *inFlightConn) Close() error {
@@ -166,6 +309,127 @@ func (c *inFlightConn) CloseWrite() error {
 	return nil
 }
 
+// selectInstance picks the ready instance with the smallest effective load,
+// preferring cooldown-fresh instances (no rotation within 5s) and falling
+// back to all ready when every instance rotated within 5s. Single pass, no
+// alloc; per-candidate reads are hoisted (one InFlight + one GetLastRotated
+// + scoring atomics each) so a burst of dials pays no duplicate scans.
+//
+// With scoring disabled the quality of every candidate reads 1.0, so the
+// ordering reduces exactly to today's least-inflight (tie: oldest rotation,
+// then smallest ID — deterministic). Scores never fail closed: the caller
+// guarantees len(ready) > 0 and always gets a candidate back.
+//
+// Quarantine skips (Slice 5) plug into the isExcluded hook: candidates the
+// hook rejects are skipped unless every candidate is rejected, in which
+// case the least-bad one still serves.
+func (m *MultiTorBackend) selectInstance(ready []*TorInstance) (*TorInstance, int) {
+	scored := m.scored.Load()
+	p := m.scoreParams
+	if !scored {
+		p = ScoreParams{MinQuality: DefaultScoreParams().MinQuality, MinSamples: 1 << 60}
+	}
+	bestFresh, bestFreshIdx := (*TorInstance)(nil), 0
+	bestAny, bestAnyIdx := (*TorInstance)(nil), 0
+	bestFreshEff, bestAnyEff := 0.0, 0.0
+	bestFreshLoad, bestAnyLoad := int64(0), int64(0)
+	var bestFreshRot, bestAnyRot time.Time
+	excludedFresh, excludedFreshIdx := (*TorInstance)(nil), 0
+	excludedAny, excludedAnyIdx := (*TorInstance)(nil), 0
+	excludedFreshEff, excludedAnyEff := 0.0, 0.0
+	excludedFreshLoad, excludedAnyLoad := int64(0), int64(0)
+	var excludedFreshRot, excludedAnyRot time.Time
+	anyExcludedFresh := false
+	for i, cand := range ready {
+		load := cand.InFlight()
+		rot := cand.GetLastRotated()
+		q := QualityScore(cand.DialSuccesses(), cand.DialFailures(), int64(cand.DialLatencyEWMA()), p)
+		eff := EffectiveLoad(load, q, p.MinQuality)
+		fresh := time.Since(rot) > 5*time.Second
+		if m.isExcluded(cand) {
+			// Track the least-bad excluded candidate per freshness class
+			// so an all-quarantined pool still serves instead of failing.
+			if fresh {
+				if !anyExcludedFresh || eff < excludedFreshEff ||
+					(eff == excludedFreshEff && (load < excludedFreshLoad ||
+						(load == excludedFreshLoad && (rot.Before(excludedFreshRot) ||
+							(rot.Equal(excludedFreshRot) && cand.ID < excludedFresh.ID))))) {
+					excludedFresh, excludedFreshIdx = cand, i
+					excludedFreshEff, excludedFreshLoad, excludedFreshRot = eff, load, rot
+					anyExcludedFresh = true
+				}
+			}
+			if excludedAny == nil || eff < excludedAnyEff ||
+				(eff == excludedAnyEff && (load < excludedAnyLoad ||
+					(load == excludedAnyLoad && (rot.Before(excludedAnyRot) ||
+						(rot.Equal(excludedAnyRot) && cand.ID < excludedAny.ID))))) {
+				excludedAny, excludedAnyIdx = cand, i
+				excludedAnyEff, excludedAnyLoad, excludedAnyRot = eff, load, rot
+			}
+			continue
+		}
+		if fresh {
+			if bestFresh == nil || eff < bestFreshEff ||
+				(eff == bestFreshEff && (load < bestFreshLoad ||
+					(load == bestFreshLoad && (rot.Before(bestFreshRot) ||
+						(rot.Equal(bestFreshRot) && cand.ID < bestFresh.ID))))) {
+				bestFresh, bestFreshIdx = cand, i
+				bestFreshEff, bestFreshLoad, bestFreshRot = eff, load, rot
+			}
+		}
+		if bestAny == nil || eff < bestAnyEff ||
+			(eff == bestAnyEff && (load < bestAnyLoad ||
+				(load == bestAnyLoad && (rot.Before(bestAnyRot) ||
+					(rot.Equal(bestAnyRot) && cand.ID < bestAny.ID))))) {
+			bestAny, bestAnyIdx = cand, i
+			bestAnyEff, bestAnyLoad, bestAnyRot = eff, load, rot
+		}
+	}
+	if bestFresh != nil {
+		return bestFresh, bestFreshIdx
+	}
+	if bestAny != nil {
+		return bestAny, bestAnyIdx
+	}
+	// Every candidate excluded (e.g. all quarantined): serve the least-bad
+	// excluded one rather than failing closed. Fresh-excluded wins when it
+	// exists to preserve the freshness preference.
+	if anyExcludedFresh {
+		return excludedFresh, excludedFreshIdx
+	}
+	return excludedAny, excludedAnyIdx
+}
+
+// isExcluded reports whether quarantine currently excludes cand from
+// selection. Quarantined endpoints are skipped until their hold expires
+// (lazy promotion to probation happens here, on the selection path);
+// probation holds the single probe slot; draining/closed never serve.
+// Promotion here only moves Quarantined->Probation (claiming the probe);
+// Probation->Active / Probation->Quarantined resolve on the outcome path,
+// where success/failure is known.
+func (m *MultiTorBackend) isExcluded(cand *TorInstance) bool {
+	now := time.Now()
+	switch cand.quar.State() {
+	case StateActive:
+		return false
+	case StateQuarantined:
+		if now.UnixNano() < cand.quar.quarantinedUntil.Load() {
+			return true
+		}
+		cand.quar.pollPromotion(now)
+		return false
+	case StateProbation:
+		// The probe holder serves; concurrent dials pick someone else.
+		// A stuck probe slot (holder died without reporting) would wedge
+		// the endpoint in probation: the outcome path always clears the
+		// slot on success/failure, and Close/drain transitions out, so no
+		// expiry is needed here.
+		return !cand.quar.probeInFlight.Load()
+	default:
+		return true
+	}
+}
+
 // IsHealthy returns true if at least one Tor instance is ready.
 func (m *MultiTorBackend) IsHealthy() bool {
 	return m.lifecycle.GetReadyCount() > 0
@@ -179,24 +443,233 @@ func (m *MultiTorBackend) Close() error {
 // Status returns multi-tor backend status.
 func (m *MultiTorBackend) Status() map[string]interface{} {
 	instances := m.lifecycle.GetInstances()
+	p := m.scoreParams
+	if !m.scored.Load() {
+		p = DefaultScoreParams()
+	}
 	statuses := make([]map[string]interface{}, len(instances))
 	for i, inst := range instances {
 		exitIP, _ := inst.LastExitIP()
+		ok := inst.DialSuccesses()
+		fail := inst.DialFailures()
+		ewma := inst.DialLatencyEWMA()
 		statuses[i] = map[string]interface{}{
-			"id":        inst.ID,
-			"socks":     inst.GetSocksPort(),
-			"ready":     inst.IsReady(),
-			"requests":  inst.GetRequests(),
-			"in_flight": inst.InFlight(),
-			"exit_ip":   exitIP,
+			"id":           inst.ID,
+			"socks":        inst.GetSocksPort(),
+			"ready":        inst.IsReady(),
+			"requests":     inst.GetRequests(),
+			"in_flight":    inst.InFlight(),
+			"exit_ip":      exitIP,
+			"dial_ewma_ms": ewma.Milliseconds(),
+			"dial_ok":      ok,
+			"dial_err":     fail,
+			"quality":      QualityScore(ok, fail, int64(ewma), p),
+			"state":        inst.QuarantineState().String(),
+			"consec_fails": inst.QuarantineConsecFails(),
 		}
 	}
-	return map[string]interface{}{
+	top := map[string]interface{}{
 		"type":      "multi-tor",
 		"instances": statuses,
 		"ready":     m.lifecycle.GetReadyCount(),
 		"total":     len(instances),
 	}
+	if m.scored.Load() {
+		top["scored_selection"] = true
+		top["selection"] = "weighted"
+	}
+	return top
+}
+
+// ReportOutcome records one attributed request outcome: success/failure
+// samples feed the scoring stats (failures skip EWMA), and generation-stale
+// outcomes (Gen != live CircuitGen) drop — the endpoint rotated since the
+// dial, so the sample belongs to a dead circuit, not the live one. Unknown
+// IDs drop silently (no panic): pool-slot IDs and recycled instance IDs
+// share no namespace with this lookup. Control-port I/O stays fire-and-
+// forget exactly like ReportAnomaly; only attribution is new.
+func (m *MultiTorBackend) ReportOutcome(o Outcome) {
+	if m.lifecycle == nil {
+		return
+	}
+	var target *TorInstance
+	for _, cand := range m.lifecycle.GetInstances() {
+		if cand.ID == o.ID {
+			target = cand
+			break
+		}
+	}
+	if target == nil {
+		return
+	}
+	if o.Gen != 0 && o.Gen != target.CircuitGen() {
+		return
+	}
+	p := m.scoreParams
+	if !m.scored.Load() {
+		p = DefaultScoreParams()
+	}
+	target.RecordDialOutcome(o.Success, o.Latency, p.Alpha)
+	if o.Success {
+		target.ResetFailCount()
+		m.onEndpointSuccess(target)
+		return
+	}
+	target.IncFailCount()
+	m.onEndpointFailure(target, o)
+}
+
+// quarConfig returns the live quarantine tuning (defaults when unset).
+func (m *MultiTorBackend) quarConfig() QuarantineConfig {
+	c := m.quarCfg
+	if c.AfterFails <= 0 || c.Duration <= 0 || c.MaxDuration <= 0 || c.Probes <= 0 {
+		d := DefaultQuarantineConfig()
+		if c.AfterFails <= 0 {
+			c.AfterFails = d.AfterFails
+		}
+		if c.Duration <= 0 {
+			c.Duration = d.Duration
+		}
+		if c.MaxDuration < c.Duration {
+			c.MaxDuration = d.MaxDuration
+			if c.MaxDuration < c.Duration {
+				c.MaxDuration = c.Duration
+			}
+		}
+		if c.Probes <= 0 {
+			c.Probes = d.Probes
+		}
+	}
+	return c
+}
+
+// onEndpointSuccess resolves the probation probe: the first success returns
+// the endpoint to Active (clearing backoff, keeping EWMA to decay). Plain
+// Active successes just clear consecutive failures via recordSuccess.
+func (m *MultiTorBackend) onEndpointSuccess(target *TorInstance) {
+	target.quar.recordSuccess()
+}
+
+// onEndpointFailure drives quarantine entry and probation resolution:
+//
+//   - Probation probe failure: re-quarantine with doubled backoff (the old
+//     probe slot clears inside re-enter) and issue ONE attributed NEWNYM.
+//   - Active failure: consecutive-fails gate OR success-rate gate
+//     (total>=minSamples && sr<0.3) enters quarantine with ONE attributed
+//     NEWNYM. While quarantined further failures are suppressed (no
+//     double-signal): recordFailure returns false off the Active state.
+//
+// Entry stamps LastRotated via the NEWNYM path (60s minimum >> 10s cooldown
+// and 30s health grace, so no window fights). NEWNYM is fire-and-forget,
+// exactly like ReportAnomaly; only attribution (this instance, not a guess)
+// is new. Probation successes never signal.
+func (m *MultiTorBackend) onEndpointFailure(target *TorInstance, o Outcome) {
+	cfg := m.quarConfig()
+	now := time.Now()
+	if target.quar.State() == StateProbation {
+		m.requarantine(target, cfg, now, "probation-probe-failure")
+		return
+	}
+	enter := target.quar.recordFailure(cfg.AfterFails)
+	if !enter {
+		// Success-rate gate: enough samples and sr<0.3 catches slow-sick
+		// endpoints that never trip the consecutive counter (interleaved
+		// successes). minSamples comes from the scoring params so both
+		// gates agree on what "enough data" means.
+		p := m.scoreParams
+		if !m.scored.Load() {
+			p = DefaultScoreParams()
+		}
+		ok := target.DialSuccesses()
+		fail := target.DialFailures()
+		if total := ok + fail; total >= p.MinSamples && total > 0 &&
+			float64(ok)/float64(total) < 0.3 {
+			enter = target.quar.State() == StateActive
+			// recordFailure already bumped consecFail; entering on the rate
+			// gate alone must not double-count — it didn't (one Add above).
+		}
+	}
+	if !enter {
+		return
+	}
+	m.enterQuarantine(target, cfg, now, "consec-fails")
+}
+
+// enterQuarantine moves Active->Quarantined (winner-only), fires the entry
+// metric + ONE attributed NEWNYM, and resets the rotation request counter
+// on a won rotation (mirroring ReportAnomaly's won-rotation path).
+func (m *MultiTorBackend) enterQuarantine(target *TorInstance, cfg QuarantineConfig, now time.Time, reason string) {
+	if _, entered := target.quar.enterQuarantine(now, cfg.Duration, cfg.MaxDuration); !entered {
+		return
+	}
+	m.logf("multi-tor: instance %d quarantined (%s), holding %v", target.ID, reason, cfg.Duration)
+	metrics.Default().Inc("lano_quarantine_total", map[string]string{
+		"instance": strconv.Itoa(target.ID),
+		"reason":   reason,
+	})
+	go func(t *TorInstance) {
+		if rotated, err := m.lifecycle.requestNewCircuitResult(t); err != nil {
+			m.logf("multi-tor: quarantine NEWNYM failed for instance %d: %v", t.ID, err)
+		} else if rotated {
+			t.ResetRequests()
+			if m.OnRotate != nil {
+				m.OnRotate()
+			}
+		}
+	}(target)
+}
+
+// requarantine moves Probation->Quarantined with doubled backoff (the
+// backoff exponent survives: recordSuccess only clears on Active return).
+// Exactly one NEWNYM fires; the stale probe slot clears on entry.
+func (m *MultiTorBackend) requarantine(target *TorInstance, cfg QuarantineConfig, now time.Time, reason string) {
+	// Direct CAS Probation->Quarantined: enterQuarantine only fires from
+	// Active, and the probe failure must not be lost to a concurrent success
+	// that already returned the endpoint to Active (then there is nothing to
+	// re-quarantine — the success won the race and cleared backoff).
+	if !target.quar.state.CompareAndSwap(int32(StateProbation), int32(StateQuarantined)) {
+		return
+	}
+	target.quar.probeInFlight.Store(false)
+	n := target.quar.quarantineCount.Add(1)
+	d := cfg.Duration
+	for i := int64(1); i < n && d < cfg.MaxDuration; i++ {
+		d *= 2
+		if d > cfg.MaxDuration || d <= 0 {
+			d = cfg.MaxDuration
+			break
+		}
+	}
+	target.quar.quarantinedUntil.Store(now.Add(d).UnixNano())
+	m.logf("multi-tor: instance %d re-quarantined (%s), holding %v", target.ID, reason, d)
+	metrics.Default().Inc("lano_quarantine_total", map[string]string{
+		"instance": strconv.Itoa(target.ID),
+		"reason":   reason,
+	})
+	go func(t *TorInstance) {
+		if rotated, err := m.lifecycle.requestNewCircuitResult(t); err != nil {
+			m.logf("multi-tor: re-quarantine NEWNYM failed for instance %d: %v", t.ID, err)
+		} else if rotated {
+			t.ResetRequests()
+			if m.OnRotate != nil {
+				m.OnRotate()
+			}
+		}
+	}(target)
+}
+
+// getInstanceByID returns the live instance with the given ID, or nil.
+// Outcome-path lookup only; selection uses the ready snapshot.
+func (m *MultiTorBackend) getInstanceByID(id int) *TorInstance {
+	if m.lifecycle == nil {
+		return nil
+	}
+	for _, cand := range m.lifecycle.GetInstances() {
+		if cand.ID == id {
+			return cand
+		}
+	}
+	return nil
 }
 
 // ReportAnomaly triggers circuit rotation when a 429 or network error occurs on an instance.
@@ -211,28 +684,80 @@ func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
 	if slotIdx >= 0 && slotIdx < len(instances) {
 		target = instances[slotIdx]
 	} else {
-		// If slotIdx is unknown (-1), prefer an instance that hasn't been rotated in the last 10s
-		idx := int(m.counter.Add(1)&0x7fffffffffffffff) % len(instances)
-		target = instances[idx]
-		for i := 0; i < len(instances); i++ {
-			cand := instances[(idx+i)%len(instances)]
-			if time.Since(cand.GetLastRotated()) >= 10*time.Second {
-				target = cand
-				break
+		// If slotIdx is unknown (-1), prefer the most recently served instance
+		// among cooldown-ok ones (it most likely served the failed request);
+		// fall back to the existing counter logic when none has served yet.
+		var best *TorInstance
+		var bestServed int64
+		for _, cand := range instances {
+			served := cand.LastServed()
+			if served <= 0 {
+				continue
+			}
+			if time.Since(cand.GetLastRotated()) < 10*time.Second {
+				continue
+			}
+			if best == nil || served > bestServed {
+				best = cand
+				bestServed = served
+			}
+		}
+		if best != nil {
+			target = best
+		} else {
+			idx := int(m.counter.Add(1)&0x7fffffffffffffff) % len(instances)
+			target = instances[idx]
+			for i := 0; i < len(instances); i++ {
+				cand := instances[(idx+i)%len(instances)]
+				if time.Since(cand.GetLastRotated()) >= 10*time.Second {
+					target = cand
+					break
+				}
 			}
 		}
 	}
 
 	m.logf("multi-tor: anomaly reported (slot %d), triggering circuit rotation on instance %d", slotIdx, target.ID)
-	if err := m.lifecycle.RequestNewCircuit(target); err != nil {
-		m.logf("multi-tor: NEWNYM failed for instance %d: %v", target.ID, err)
-	} else {
-		m.logf("multi-tor: instance %d circuit rotated", target.ID)
-		target.ResetRequests()
+	// Cold backend (no instance has EVER served in the CURRENT generation):
+	// no culprit attribution exists, so skip the NEWNYM dispatch entirely —
+	// no evidence, no rotation. Pre-serve anomalies must not churn circuits,
+	// reset counters, or fire OnRotate. Once anything has been served,
+	// attribution below is unchanged.
+	//
+	// everServed is consulted only through hasServedCurrent: the flag is
+	// latched on first serve and re-armed by CheckRecycled (called on
+	// kill/spawn replacement paths) so a full instance recycle back to an
+	// unserved generation reads cold again. Without the re-arm, a stale
+	// everServed=true from a dead generation would force a dispatch against
+	// a fresh generation with no culprit — demonstrated by
+	// TestMultiTor_RecycleRearmsColdBackend.
+	cold := slotIdx < 0 && !m.hasServedCurrent()
+	for _, cand := range instances {
+		if cand.LastServed() > 0 {
+			cold = false
+			break
+		}
 	}
-
-	// Clear connection pool so new connections use new circuits
-	if m.OnRotate != nil {
-		m.OnRotate()
+	if cold {
+		m.logf("multi-tor: cold backend (nothing ever served), skipping NEWNYM dispatch for pre-serve anomaly")
+		return
 	}
+	// Fire-and-forget: the request path must not block on control-port I/O
+	// (TCP connect + AUTH + NEWNYM round-trips). Rotation ordering is still
+	// safe — requestNewCircuitResult claims the 10s cooldown atomically, so
+	// concurrent triggers collapse onto one NEWNYM and losers get
+	// ErrNymCooldown. ResetRequests/OnRotate run only when this trigger
+	// actually won the rotation.
+	go func(t *TorInstance) {
+		if rotated, err := m.lifecycle.requestNewCircuitResult(t); err != nil {
+			m.logf("multi-tor: NEWNYM failed for instance %d: %v", t.ID, err)
+		} else if rotated {
+			m.logf("multi-tor: instance %d circuit rotated", t.ID)
+			t.ResetRequests()
+			// Clear connection pool so new connections use new circuits
+			if m.OnRotate != nil {
+				m.OnRotate()
+			}
+		}
+	}(target)
 }

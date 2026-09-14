@@ -1,104 +1,71 @@
-# =============================================================================
 # Prometheus Metrics for local-relay
-#
-# Add these metrics to cmd/relay/main.go or create a new metrics package.
-# This file defines the metrics schema — implementation is separate.
-# =============================================================================
 
-# =============================================================================
-# 1. REQUEST LATENCY
-# =============================================================================
-# Histogram: proxy_request_duration_seconds
-# Labels: backend_type, target_host, method, status_code
-# Buckets: 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
-#
-# Usage:
-#   proxy_request_duration_seconds_bucket{backend_type="tor",target_host="api.openai.com",method="POST",status_code="200",le="0.5"} 1234
-#   proxy_request_duration_seconds_sum{backend_type="tor",target_host="api.openai.com",method="POST",status_code="200"} 617.0
-#   proxy_request_duration_seconds_count{backend_type="tor",target_host="api.openai.com",method="POST",status_code="200"} 2468
+This file reconciles the metrics schema against what the code actually emits.
+Series listed under "Implemented" are emitted today; series under "Planned"
+do not exist in code and are aspirational.
 
-# =============================================================================
-# 2. THROUGHPUT
-# =============================================================================
-# Counter: proxy_requests_total
-# Labels: backend_type, target_host, method, status_code
-#
-# Counter: proxy_bytes_sent_total
-# Labels: backend_type, target_host
-#
-# Counter: proxy_bytes_received_total
-# Labels: backend_type, target_host
+Sources: `internal/metrics.Registry` (counters/gauges rendered by
+`internal/health.handleMetrics`), `internal/health.handleMetrics` direct
+`Fprintf` series, `cmd/relay.startMetricsServer` (separate Prometheus
+listener on `metrics.address` + `metrics.path`, default `/metrics`).
 
-# =============================================================================
-# 3. CONNECTIONS
-# =============================================================================
-# Gauge: proxy_active_connections
-# Labels: backend_type
-#
-# Gauge: proxy_idle_connections
-# Labels: backend_type
-#
-# Counter: proxy_connections_created_total
-# Labels: backend_type
-#
-# Counter: proxy_connections_reused_total
-# Labels: backend_type
+## Implemented series (real code)
 
-# =============================================================================
-# 4. BACKEND HEALTH
-# =============================================================================
-# Gauge: proxy_backend_healthy
-# Labels: backend_id, backend_type
-# Values: 1 (healthy), 0 (unhealthy)
-#
-# Gauge: proxy_backend_latency_seconds
-# Labels: backend_id, backend_type
-#
-# Counter: proxy_backend_failures_total
-# Labels: backend_id, backend_type, error_type
+### Counters (`internal/metrics` registry)
 
-# =============================================================================
-# 5. ROTATION
-# =============================================================================
-# Histogram: proxy_newnym_duration_seconds
-# Buckets: 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5
-#
-# Counter: proxy_newnym_total
-# Labels: success (true/false)
-#
-# Gauge: proxy_circuit_age
-# Labels: slot_id
-#
-# Gauge: proxy_circuit_healthy
-# Labels: slot_id
+| Series | Labels | Written at |
+|---|---|---|
+| `lano_requests_total` | `instance` | `internal/backend/multitor.go` (`IncKey`, per dial) |
+| `lano_rotations_total` | `instance`, `trigger` (`anomaly`, `health`) | `internal/backend/torlifecycle.go` (after NEWNYM) |
 
-# =============================================================================
-# 6. RESOURCE USAGE
-# =============================================================================
-# Gauge: proxy_goroutines
-#
-# Gauge: proxy_memory_alloc_bytes
-#
-# Gauge: proxy_memory_sys_bytes
-#
-# Counter: proxy_gc_cycles_total
-#
-# Gauge: proxy_open_fds
+### Gauges (`internal/health.handleMetrics` + registry `Set`)
 
-# =============================================================================
-# 7. ERRORS
-# =============================================================================
-# Counter: proxy_errors_total
-# Labels: error_type (timeout, dns, tls, connection_refused, connection_reset, 429, 503)
-#
-# Counter: proxy_retries_total
-# Labels: backend_type
+| Series | Labels | Source |
+|---|---|---|
+| `relay_healthy` | none | `handleMetrics`: 1 = healthy, 0 = degraded |
+| `lano_in_flight` | `instance` | per-instance in-flight count from multi-tor `Status()` |
+| `lano_exit_ip` | `instance`, `ip` | info-style gauge (`1`), observed exit IP per instance |
+| `relay_pool_slots_total` | none | circuit-pool `Status().total_slots` |
+| `relay_pool_slots_healthy` | none | circuit-pool `Status().healthy_slots` |
+| `relay_pool_requests_total` | none | circuit-pool `Status().total_requests` |
+| `relay_pool_nym_backoff` | none | circuit-pool `Status().nym_backoff` |
+| `relay_rotation_requests` | none | rotation request count (counter semantics) |
 
-# =============================================================================
-# 8. RATE LIMITING
-# =============================================================================
-# Counter: proxy_rate_limit_hits_total
-# Labels: status_code (429, 503)
-#
-# Gauge: proxy_throttle_tokens
-# Labels: backend_id
+### Separate Prometheus listener (`cmd/relay.startMetricsServer`)
+
+Served only when `metrics.enabled: true` at `metrics.address` +
+`metrics.path` (default `/metrics`):
+
+| Series | Labels | Source |
+|---|---|---|
+| `lano_up` | none | constant `1` |
+| `lano_tor_instances` | none | `TorLifecycle.GetReadyCount()` |
+
+## Planned series (NOT implemented — do not query)
+
+The following `proxy_*` names appear in old drafts/dashboards but have no
+emitter in code. They are retained here as a build list, not a schema:
+
+- `proxy_request_duration_seconds` (histogram) + `_bucket/_sum/_count`
+- `proxy_requests_total`, `proxy_bytes_sent_total`, `proxy_bytes_received_total`
+- `proxy_active_connections`, `proxy_idle_connections`,
+  `proxy_connections_created_total`, `proxy_connections_reused_total`
+- `proxy_backend_healthy`, `proxy_backend_latency_seconds`,
+  `proxy_backend_failures_total`
+- `proxy_newnym_duration_seconds` (histogram), `proxy_newnym_total`,
+  `proxy_circuit_age`, `proxy_circuit_healthy`
+- `proxy_goroutines`, `proxy_memory_alloc_bytes`, `proxy_memory_sys_bytes`,
+  `proxy_gc_cycles_total`, `proxy_open_fds`
+- `proxy_errors_total`, `proxy_retries_total`
+- `proxy_rate_limit_hits_total`, `proxy_throttle_tokens`
+
+Example real exposition (labels vary):
+
+```
+relay_healthy 1
+lano_in_flight{instance="1"} 3
+lano_exit_ip{instance="1",ip="185.220.100.1"} 1
+lano_requests_total{instance="1"} 42
+lano_rotations_total{instance="1",trigger="anomaly"} 2
+relay_pool_slots_total 3
+```

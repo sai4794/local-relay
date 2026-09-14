@@ -24,7 +24,11 @@ func CopySSE(w http.ResponseWriter, body io.ReadCloser, statusCode int) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	// NOTE: the "Connection: keep-alive" hop header is intentionally NOT set
+	// here. It describes this proxy hop only (Go's net/http owns connection
+	// management, including HTTP/2 where the header is illegal); emitting it
+	// would forward hop-scoped state to the client. Previously set — removed
+	// as hygiene; body bytes and status are unchanged.
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(statusCode)
 	flusher.Flush()
@@ -117,5 +121,8 @@ func Relay(ctx context.Context, dst io.ReadWriteCloser, src io.ReadWriteCloser) 
 }
 
 func HasSSEContentType(header http.Header) bool {
-	return strings.Contains(header.Get("Content-Type"), "text/event-stream")
+	// Case-insensitive to match the live forward path in internal/proxy/http.go
+	// (strings.ToLower before Contains); MIME types are case-insensitive per
+	// RFC 2045, so "Text/Event-Stream" from an upstream must also match.
+	return strings.Contains(strings.ToLower(header.Get("Content-Type")), "text/event-stream")
 }

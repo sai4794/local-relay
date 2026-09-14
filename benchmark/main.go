@@ -23,7 +23,7 @@ import (
 
 const (
 	defaultBaseURL   = "http://localhost:20128/v1"
-	defaultAPIKey    = "sk-4bbacb838df7c7f2-tqywyx-9fb9e9be"
+	defaultAPIKey    = "" // empty: require -key flag or BENCH_API_KEY env
 	defaultModel     = "oc/deepseek-v4-flash-free(max)"
 	defaultRelayHTTP = "http://127.0.0.1:18080"
 	defaultRelayS5   = "socks5://127.0.0.1:11080"
@@ -33,11 +33,15 @@ const (
 
 // ---------- Data types ----------
 
+// RequestRecord is one benchmarked request. TorInstance/ExitIP are
+// approximate: a single exit IP is cached per proxy configuration
+// (see refreshExitIP) and stamped on every record, and TorInstance is
+// derived as requestID % torCount rather than the instance that served it.
 type RequestRecord struct {
 	RequestID   int       `json:"request_id"`
 	Timestamp   time.Time `json:"timestamp"`
-	TorInstance int       `json:"tor_instance"`
-	ExitIP      string    `json:"exit_ip"`
+	TorInstance int       `json:"tor_instance"` // approximate: idx % TorCount, not observed
+	ExitIP      string    `json:"exit_ip"`      // approximate: single cached IP per config
 	HTTPStatus  int       `json:"http_status"`
 	LatencyMs   float64   `json:"latency_ms"`
 	Is429       bool      `json:"is_429"`
@@ -83,6 +87,9 @@ type Summary struct {
 // ---------- Exit IP cache ----------
 
 var (
+	// exitIPCache holds ONE cached exit IP per proxy address. Records stamp
+	// this single value, so per-record TorInstance/ExitIP columns are
+	// approximate, not per-request observations.
 	exitIPCache   = make(map[string]string) // proxyAddr -> exitIP
 	exitIPCacheMu sync.Mutex
 )
@@ -373,8 +380,15 @@ func mean(vals []float64) float64 {
 
 // ---------- CSV writer ----------
 
+// openResultFile creates a result file owner-only (0600): benchmark outputs
+// derive from runs that handle API keys, so results must never be
+// world-readable.
+func openResultFile(filename string) (*os.File, error) {
+	return os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+}
+
 func writeCSV(filename string, summaries []Summary) error {
-	f, err := os.Create(filename)
+	f, err := openResultFile(filename)
 	if err != nil {
 		return err
 	}
@@ -414,7 +428,7 @@ func writeCSV(filename string, summaries []Summary) error {
 }
 
 func writeDetailCSV(filename string, summaries []Summary) error {
-	f, err := os.Create(filename)
+	f, err := openResultFile(filename)
 	if err != nil {
 		return err
 	}
@@ -453,7 +467,7 @@ func writeDetailCSV(filename string, summaries []Summary) error {
 // ---------- Report generator ----------
 
 func writeReport(filename string, summaries []Summary) error {
-	f, err := os.Create(filename)
+	f, err := openResultFile(filename)
 	if err != nil {
 		return err
 	}
@@ -505,11 +519,11 @@ func writeReport(filename string, summaries []Summary) error {
 				bestP50 = s.P50
 			}
 		}
-		_ = best429Rate
-		_ = bestP50
 		fmt.Fprintf(f, "| %d | %.2f | %.1f%% | %.0fms |\n",
-			t.torCount, bestRPS, float64(0), float64(0))
+			t.torCount, bestRPS, best429Rate, bestP50)
 	}
+
+	fmt.Fprintf(f, "\n> Note: TorInstance/ExitIP columns are approximate (single cached IP per configuration, instance derived as requestID %% TorCount).\n\n")
 
 	// Detailed results per configuration
 	fmt.Fprintf(f, "\n## Detailed Results\n\n")
@@ -649,10 +663,21 @@ func writeReport(filename string, summaries []Summary) error {
 }
 
 func maskKey(key string) string {
-	if len(key) <= 8 {
-		return key
+	if key == "" {
+		return ""
 	}
-	return key[:4] + "..." + key[len(key)-4:]
+	return "[REDACTED]"
+}
+
+// redactRecords drops per-record error text (may echo key material) before
+// persisting benchmark results to disk.
+func redactRecords(records []RequestRecord) []RequestRecord {
+	out := make([]RequestRecord, len(records))
+	for i, r := range records {
+		r.ErrorMsg = ""
+		out[i] = r
+	}
+	return out
 }
 
 func pct(part, total int) float64 {
@@ -742,7 +767,7 @@ func findBestConfig(summaries []Summary) Summary {
 // ---------- Chart generator ----------
 
 func writeChartHTML(filename string, summaries []Summary) error {
-	f, err := os.Create(filename)
+	f, err := openResultFile(filename)
 	if err != nil {
 		return err
 	}
@@ -808,7 +833,7 @@ th { background: #f5f5f5; }
 
 func main() {
 	baseURL := flag.String("url", defaultBaseURL, "API base URL")
-	apiKey := flag.String("key", defaultAPIKey, "API key")
+	apiKey := flag.String("key", defaultAPIKey, "API key (or BENCH_API_KEY env)")
 	model := flag.String("model", defaultModel, "Model name")
 	totalReqs := flag.Int("n", 500, "Total requests per test")
 	conc := flag.String("conc", "1,5,20", "Comma-separated concurrency levels")
@@ -816,6 +841,15 @@ func main() {
 	mode := flag.String("mode", "direct", "Test mode: direct, http_proxy, socks5_proxy, all")
 	outputDir := flag.String("out", "benchmark/results", "Output directory prefix")
 	flag.Parse()
+
+	// API key must come from -key or BENCH_API_KEY; never bake a default.
+	if *apiKey == "" {
+		*apiKey = os.Getenv("BENCH_API_KEY")
+	}
+	if *apiKey == "" {
+		fmt.Fprintf(os.Stderr, "missing API key: provide -key flag or BENCH_API_KEY env\n")
+		os.Exit(2)
+	}
 
 	os.MkdirAll(*outputDir, 0755)
 
@@ -909,10 +943,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Chart error: %v\n", err)
 	}
 
-	// Also write raw JSON
+	// Also write raw JSON. Persist a redacted copy: Summary embeds the full
+	// BenchConfig (incl. Config.APIKey), so strip key material before writing
+	// and keep result files owner-only.
 	jsonFile := *outputDir + "_raw.json"
-	jsonData, _ := json.MarshalIndent(allSummaries, "", "  ")
-	os.WriteFile(jsonFile, jsonData, 0644)
+	redacted := make([]Summary, len(allSummaries))
+	for i, s := range allSummaries {
+		s.Config.APIKey = ""
+		s.Records = redactRecords(s.Records)
+		redacted[i] = s
+	}
+	jsonData, _ := json.MarshalIndent(redacted, "", "  ")
+	os.WriteFile(jsonFile, jsonData, 0600)
 
 	fmt.Printf("\n=== ALL OUTPUTS ===\n")
 	fmt.Printf("  Summary CSV:    %s\n", csvFile)

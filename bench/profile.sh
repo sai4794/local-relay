@@ -7,25 +7,42 @@
 #   go install golang.org/x/tools/cmd/pprof@latest
 #
 # Usage:
-#   ./bench/profile.sh [binary_path] [duration_seconds]
+#   ./bench/profile.sh [binary_path] [duration_seconds] [--pprof[=port]]
 #
 # Examples:
 #   ./bench/profile.sh ./relay 30
-#   ./bench/profile.sh ./relay 60
+#   ./bench/profile.sh ./relay 60 --pprof
+#   ./bench/profile.sh ./relay 60 --pprof=6060
 #
 # This script:
-#   1. Starts the relay with pprof enabled on :6060
+#   1. Starts the relay
 #   2. Runs a load test against it
-#   3. Collects CPU, memory, goroutine, and block profiles
-#   4. Generates flamegraphs
-#   5. Opens the pprof web UI
+#   3. Collects Go benchmark CPU/memory profiles locally
+#   4. Optionally collects live pprof profiles (--pprof only)
+#   5. Generates flamegraphs
+#   6. Opens the pprof web UI
+#
+# Profiling note: the relay exposes NO pprof endpoint, so live-profile
+# collection is OFF by default. Pass --pprof to start a local
+# net/http/pprof listener and exercise the collection plumbing against it
+# (intended for pprof-enabled relay builds listening on that port).
 # =============================================================================
 
 set -euo pipefail
 
 BINARY="${1:-./relay}"
 DURATION="${2:-30}"
+PPROF=0
 PPROF_PORT=6060
+for arg in "$@"; do
+    case "$arg" in
+        --pprof) PPROF=1 ;;
+        --pprof=*) PPROF=1; PPROF_PORT="${arg#--pprof=}" ;;
+    esac
+done
+# Shift off binary/duration positionals when present so extra flags parse.
+if [[ "${1:-}" == --pprof* ]]; then BINARY="./relay"; fi
+if [[ "${2:-}" == --pprof* ]]; then DURATION="30"; fi
 RESULTS_DIR="bench/profiles/$(date +%Y%m%d_%H%M%S)"
 
 mkdir -p "$RESULTS_DIR"
@@ -33,15 +50,15 @@ mkdir -p "$RESULTS_DIR"
 echo "=== Profiling Configuration ==="
 echo "Binary:   $BINARY"
 echo "Duration: ${DURATION}s"
-echo "Pprof:    :$PPROF_PORT"
+echo "Pprof:    $([ "$PPROF" -eq 1 ] && echo ":$PPROF_PORT" || echo "disabled (pass --pprof to collect)")"
 echo "Results:  $RESULTS_DIR"
 echo ""
 
 # =============================================================================
-# Step 1: Start the relay with pprof
+# Step 1: Start the relay
 # =============================================================================
-echo "=== Starting relay with pprof ==="
-GOEXPERIMENT=synctest $BINARY \
+echo "=== Starting relay ==="
+"$BINARY" \
     -c config.yaml \
     -v \
     &> "$RESULTS_DIR/relay.log" &
@@ -61,19 +78,32 @@ echo "Relay PID: $RELAY_PID"
 echo "Relay log: $RESULTS_DIR/relay.log"
 
 # =============================================================================
+# Step 1b: Local Go benchmark profiles (no live endpoint needed)
+# =============================================================================
+echo ""
+echo "=== Go benchmark profiles ==="
+go test -bench=. -benchmem -run=NONE \
+    -cpuprofile="$RESULTS_DIR/cpu.prof" \
+    -memprofile="$RESULTS_DIR/heap.prof" \
+    ./internal/... \
+    2>&1 | tee "$RESULTS_DIR/go_bench.txt" || echo "Go benchmark profiles failed"
+
+# =============================================================================
 # Step 2: Run load test in background
 # =============================================================================
 echo ""
 echo "=== Running load test ==="
 if command -v hey &> /dev/null; then
+    # hey has no CONNECT support: exercise the header-forward path
+    # (x-target-url) through the proxy instead of the bare liveness path.
     hey -z "${DURATION}s" \
         -c 50 \
         -disable-keepalive \
-        http://127.0.0.1:18080 \
+        -H "x-target-url: http://api.ipify.org/" http://127.0.0.1:18080 \
         &> "$RESULTS_DIR/loadtest.log" &
     LOAD_PID=$!
 elif command -v vegeta &> /dev/null; then
-    echo "GET http://127.0.0.1:18080" | vegeta attack \
+    echo "GET http://127.0.0.1:18080" | vegeta attack -header "x-target-url: http://api.ipify.org/" \
         -duration="${DURATION}s" \
         -rate=500 \
         -connections=50 \
@@ -85,7 +115,7 @@ else
 fi
 
 # =============================================================================
-# Step 3: Collect profiles
+# Step 3: Collect live profiles (--pprof only)
 # =============================================================================
 echo ""
 echo "=== Collecting profiles ==="
@@ -93,40 +123,65 @@ echo "=== Collecting profiles ==="
 # Wait for load to ramp up
 sleep 5
 
-# CPU Profile (30 seconds)
-echo "Collecting CPU profile (30s)..."
-curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/profile?seconds=30" \
-    -o "$RESULTS_DIR/cpu.prof" 2>/dev/null || echo "CPU profile failed"
+if [ "$PPROF" -eq 1 ]; then
+    echo "Starting local pprof listener on :$PPROF_PORT..."
+    cat > "$RESULTS_DIR/pprof_helper.go" <<EOF
+package main
 
-# Memory Profile
-echo "Collecting memory profile..."
-curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/heap" \
-    -o "$RESULTS_DIR/heap.prof" 2>/dev/null || echo "Heap profile failed"
+import (
+	"net/http"
 
-# Goroutine Profile
-echo "Collecting goroutine profile..."
-curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/goroutine" \
-    -o "$RESULTS_DIR/goroutine.prof" 2>/dev/null || echo "Goroutine profile failed"
+	_ "net/http/pprof"
+)
 
-# Block Profile
-echo "Collecting block profile..."
-curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/block" \
-    -o "$RESULTS_DIR/block.prof" 2>/dev/null || echo "Block profile failed"
+func main() {
+	_ = http.ListenAndServe("127.0.0.1:$PPROF_PORT", nil)
+}
+EOF
+    go run "$RESULTS_DIR/pprof_helper.go" &> "$RESULTS_DIR/pprof_helper.log" &
+    PPROF_PID=$!
+    sleep 2
 
-# Mutex Profile
-echo "Collecting mutex profile..."
-curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/mutex" \
-    -o "$RESULTS_DIR/mutex.prof" 2>/dev/null || echo "Mutex profile failed"
+    # CPU Profile (30 seconds)
+    echo "Collecting CPU profile (30s)..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/profile?seconds=30" \
+        -o "$RESULTS_DIR/cpu_live.prof" 2>/dev/null || echo "CPU profile failed"
 
-# Threadcreate Profile
-echo "Collecting threadcreate profile..."
-curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/threadcreate" \
-    -o "$RESULTS_DIR/threadcreate.prof" 2>/dev/null || echo "Threadcreate profile failed"
+    # Memory Profile
+    echo "Collecting memory profile..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/heap" \
+        -o "$RESULTS_DIR/heap_live.prof" 2>/dev/null || echo "Heap profile failed"
 
-# 5-second CPU profile for flamegraph
-echo "Collecting 5s CPU profile for flamegraph..."
-curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/profile?seconds=5" \
-    -o "$RESULTS_DIR/flamegraph.prof" 2>/dev/null || echo "Flamegraph profile failed"
+    # Goroutine Profile
+    echo "Collecting goroutine profile..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/goroutine" \
+        -o "$RESULTS_DIR/goroutine.prof" 2>/dev/null || echo "Goroutine profile failed"
+
+    # Block Profile
+    echo "Collecting block profile..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/block" \
+        -o "$RESULTS_DIR/block.prof" 2>/dev/null || echo "Block profile failed"
+
+    # Mutex Profile
+    echo "Collecting mutex profile..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/mutex" \
+        -o "$RESULTS_DIR/mutex.prof" 2>/dev/null || echo "Mutex profile failed"
+
+    # Threadcreate Profile
+    echo "Collecting threadcreate profile..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/threadcreate" \
+        -o "$RESULTS_DIR/threadcreate.prof" 2>/dev/null || echo "Threadcreate profile failed"
+
+    # 5-second CPU profile for flamegraph
+    echo "Collecting 5s CPU profile for flamegraph..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/profile?seconds=5" \
+        -o "$RESULTS_DIR/flamegraph.prof" 2>/dev/null || echo "Flamegraph profile failed"
+
+    kill $PPROF_PID 2>/dev/null || true
+    wait $PPROF_PID 2>/dev/null || true
+else
+    echo "Skipping live pprof collection (relay exposes no pprof endpoint; re-run with --pprof to start a local listener and collect)."
+fi
 
 # =============================================================================
 # Step 4: Generate reports

@@ -2,7 +2,7 @@
   {
     "Config": {
       "BaseURL": "http://localhost:20128/v1",
-      "APIKey": "sk-4bbacb838df7c7f2-tqywyx-9fb9e9be",
+      "APIKey": "REDACTED",
       "Model": "oc/deepseek-v4-flash-free(max)",
       "ProxyURL": "http://127.0.0.1:18080",
       "Concurrency": 1,

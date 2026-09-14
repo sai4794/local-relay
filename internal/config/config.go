@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"time"
@@ -10,16 +12,17 @@ import (
 )
 
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Backend  BackendConfig  `yaml:"backend"`
-	MultiTor MultiTorConfig `yaml:"multi_tor"`
-	Bypass   BypassConfig   `yaml:"bypass"`
-	Rotation RotationConfig `yaml:"rotation"`
-	Auth     AuthConfig     `yaml:"auth"`
-	Security SecurityConfig `yaml:"security"`
-	Logging  LoggingConfig  `yaml:"logging"`
-	Health   HealthConfig   `yaml:"health"`
-	Metrics  MetricsConfig  `yaml:"metrics"`
+	Server   ServerConfig     `yaml:"server"`
+	Backend  BackendConfig    `yaml:"backend"`
+	MultiTor MultiTorConfig   `yaml:"multi_tor"`
+	Pool     PoolTuningConfig `yaml:"pool"`
+	Bypass   BypassConfig     `yaml:"bypass"`
+	Rotation RotationConfig   `yaml:"rotation"`
+	Auth     AuthConfig       `yaml:"auth"`
+	Security SecurityConfig   `yaml:"security"`
+	Logging  LoggingConfig    `yaml:"logging"`
+	Health   HealthConfig     `yaml:"health"`
+	Metrics  MetricsConfig    `yaml:"metrics"`
 }
 
 type ServerConfig struct {
@@ -52,6 +55,25 @@ type MultiTorConfig struct {
 	LibraryPath string `yaml:"library_path"`
 }
 
+// PoolTuningConfig tunes scored selection + outcome feedback + quarantine
+// (the [pool] section). Zero values mean defaults (see defaults.go); the
+// kill-switch Enabled=false restores pure least-inflight selection while
+// stats keep recording. No ports or binds — usedPorts/loopback validation
+// is untouched.
+type PoolTuningConfig struct {
+	Enabled              bool    `yaml:"enabled"`
+	EWMAAlpha            float64 `yaml:"ewma_alpha"`
+	LatencyRefMs         int64   `yaml:"latency_ref_ms"`
+	MinSamples           int64   `yaml:"min_samples"`
+	MinQuality           float64 `yaml:"min_quality"`
+	Selection            string  `yaml:"selection"`
+	Po2Samples           int     `yaml:"po2_samples"`
+	QuarantineAfterFails int     `yaml:"quarantine_after_fails"`
+	QuarantineSecs       int64   `yaml:"quarantine_secs"`
+	MaxQuarantineSecs    int64   `yaml:"max_quarantine_secs"`
+	ProbationProbes      int     `yaml:"probation_probes"`
+}
+
 type BypassConfig struct {
 	Hosts []string `yaml:"hosts"`
 }
@@ -72,6 +94,10 @@ type SecurityConfig struct {
 	MaxBodySize     int64    `yaml:"max_body_size"`
 	RateLimit       int      `yaml:"rate_limit"` // requests/sec per destination host
 	RateBurst       int      `yaml:"rate_burst"`
+	// FailClosedDNS, when true, blocks hosts that cannot be resolved locally
+	// instead of the default advisory fail-open (which keeps Tor-routable
+	// domains reachable when the local resolver cannot see them).
+	FailClosedDNS bool `yaml:"fail_closed_dns"`
 }
 
 type LoggingConfig struct {
@@ -102,8 +128,30 @@ func Load(path string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading config file: %w", err)
 		}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
+		// Strict decoding: unknown keys are rejected instead of silently
+		// dropped. config.yaml is proven strict-clean by
+		// TestStrict_ProductionConfigHasOnlyKnownFields. A second YAML
+		// document after "---" is also rejected: silently loading only the
+		// first would leave an operator's appended override dead with no
+		// signal, so fail fast instead.
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(cfg); err != nil {
 			return nil, fmt.Errorf("parsing config file: %w", err)
+		}
+		var extra interface{}
+		if err := dec.Decode(&extra); err != io.EOF {
+			// err == nil with a non-nil extra: a real second document —
+			// silently loading only the first would leave an operator's
+			// appended override dead with no signal, so fail fast instead.
+			// err != nil (and not EOF): the trailing document marker "---" is
+			// followed by unscannable content — also fail fast rather than
+			// ignoring operator content we could not even parse. err == nil
+			// with a nil extra is just a trailing "---" marker with an empty
+			// document, which stays valid.
+			if err != nil || extra != nil {
+				return nil, fmt.Errorf("parsing config file: multiple YAML documents are not allowed")
+			}
 		}
 	}
 

@@ -72,6 +72,13 @@ func (c *SOCKS5Client) handshake(conn net.Conn, targetAddr, isoUser string) erro
 		}
 	} else if resp[1] != 0x00 {
 		return fmt.Errorf("auth method not accepted: %d", resp[1])
+	} else if isoUser != "" {
+		// The server answered no-auth to a request that offered
+		// no-auth+user/pass with an isolation identity. Accepting that
+		// would silently drop IsolateSOCKSAuth circuit isolation — every
+		// stream would share one circuit and rotations would stop
+		// isolating. Fail the dial instead of downgrading.
+		return fmt.Errorf("SOCKS5 isolation auth downgraded to no-auth by server")
 	}
 
 	host, portStr, err := net.SplitHostPort(targetAddr)

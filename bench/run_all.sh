@@ -3,20 +3,35 @@
 # run_all.sh — Run the complete benchmark and profiling suite
 #
 # Usage:
-#   ./bench/run_all.sh
+#   ./bench/run_all.sh [--pprof[=port]]
 #
 # This script:
 #   1. Builds the relay binary
 #   2. Runs Go benchmarks (with allocation and CPU profiling)
 #   3. Starts the relay and runs load tests
-#   4. Collects CPU, memory, goroutine, and block profiles
+#   4. Optionally collects live pprof profiles (--pprof only)
 #   5. Generates flamegraphs
 #   6. Analyzes results and produces recommendations
+#
+# Profiling note: the relay exposes NO pprof endpoint, so live-profile
+# collection is OFF by default. Pass --pprof to start a local
+# net/http/pprof listener and exercise the collection plumbing against it
+# (intended for pprof-enabled relay builds listening on that port).
 # =============================================================================
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+PPROF=0
+PPROF_PORT=6060
+for arg in "$@"; do
+    case "$arg" in
+        --pprof) PPROF=1 ;;
+        --pprof=*) PPROF=1; PPROF_PORT="${arg#--pprof=}" ;;
+        *) echo "Unknown argument: $arg" >&2; echo "Usage: $0 [--pprof[=port]]" >&2; exit 2 ;;
+    esac
+done
 
 RESULTS_DIR="bench/results/$(date +%Y%m%d_%H%M%S)"
 PROFILES_DIR="bench/profiles/$(date +%Y%m%d_%H%M%S)"
@@ -29,6 +44,7 @@ echo "============================================"
 echo ""
 echo "Results:   $RESULTS_DIR"
 echo "Profiles:  $PROFILES_DIR"
+echo "Pprof:     $([ "$PPROF" -eq 1 ] && echo "enabled (:$PPROF_PORT)" || echo "disabled (pass --pprof to collect)")"
 echo ""
 
 # =============================================================================
@@ -47,7 +63,7 @@ echo "Running benchmarks with allocation profiling..."
 go test -bench=. -benchmem -count=1 \
     -cpuprofile="$RESULTS_DIR/go_cpu.prof" \
     -memprofile="$RESULTS_DIR/go_mem.prof" \
-    ./bench/... \
+    ./internal/... \
     2>&1 | tee "$RESULTS_DIR/go_bench.txt"
 echo ""
 
@@ -56,7 +72,7 @@ echo "Running benchmarks 3x for variance analysis..."
 for i in 1 2 3; do
     echo "--- Run $i ---"
     go test -bench=. -benchmem -count=1 \
-        ./bench/... \
+        ./internal/... \
         2>&1 | tee "$RESULTS_DIR/go_bench_run${i}.txt"
 done
 echo ""
@@ -83,11 +99,14 @@ echo "Relay PID: $RELAY_PID"
 # Run load test in background
 echo "Starting load test..."
 if command -v hey &> /dev/null; then
-    hey -z 30s -c 50 -disable-keepalive http://127.0.0.1:18080 \
+    # hey has no CONNECT support: exercise the header-forward path
+    # (x-target-url) through the proxy instead of the bare liveness path.
+    hey -z 30s -c 50 -disable-keepalive \
+        -H "x-target-url: http://api.ipify.org/" http://127.0.0.1:18080 \
         &> "$PROFILES_DIR/loadtest.log" &
     LOAD_PID=$!
 elif command -v vegeta &> /dev/null; then
-    echo "GET http://127.0.0.1:18080" | vegeta attack \
+    echo "GET http://127.0.0.1:18080" | vegeta attack -header "x-target-url: http://api.ipify.org/" \
         -duration=30s -rate=500 -connections=50 \
         &> "$PROFILES_DIR/loadtest.log" &
     LOAD_PID=$!
@@ -99,26 +118,51 @@ fi
 # Wait for load to stabilize
 sleep 5
 
-# Collect profiles
-echo "Collecting CPU profile (30s)..."
-curl -s "http://127.0.0.1:6060/debug/pprof/profile?seconds=30" \
-    -o "$PROFILES_DIR/cpu.prof" 2>/dev/null || echo "CPU profile failed"
+# Collect profiles (opt-in only: the relay exposes no pprof endpoint).
+if [ "$PPROF" -eq 1 ]; then
+    echo "Starting local pprof listener on :$PPROF_PORT..."
+    cat > "$PROFILES_DIR/pprof_helper.go" <<EOF
+package main
 
-echo "Collecting heap profile..."
-curl -s "http://127.0.0.1:6060/debug/pprof/heap" \
-    -o "$PROFILES_DIR/heap.prof" 2>/dev/null || echo "Heap profile failed"
+import (
+	"net/http"
 
-echo "Collecting goroutine profile..."
-curl -s "http://127.0.0.1:6060/debug/pprof/goroutine" \
-    -o "$PROFILES_DIR/goroutine.prof" 2>/dev/null || echo "Goroutine profile failed"
+	_ "net/http/pprof"
+)
 
-echo "Collecting block profile..."
-curl -s "http://127.0.0.1:6060/debug/pprof/block" \
-    -o "$PROFILES_DIR/block.prof" 2>/dev/null || echo "Block profile failed"
+func main() {
+	_ = http.ListenAndServe("127.0.0.1:$PPROF_PORT", nil)
+}
+EOF
+    go run "$PROFILES_DIR/pprof_helper.go" &> "$PROFILES_DIR/pprof_helper.log" &
+    PPROF_PID=$!
+    sleep 2
 
-echo "Collecting 5s CPU profile for flamegraph..."
-curl -s "http://127.0.0.1:6060/debug/pprof/profile?seconds=5" \
-    -o "$PROFILES_DIR/flamegraph.prof" 2>/dev/null || echo "Flamegraph profile failed"
+    echo "Collecting CPU profile (30s)..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/profile?seconds=30" \
+        -o "$PROFILES_DIR/cpu.prof" 2>/dev/null || echo "CPU profile failed"
+
+    echo "Collecting heap profile..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/heap" \
+        -o "$PROFILES_DIR/heap.prof" 2>/dev/null || echo "Heap profile failed"
+
+    echo "Collecting goroutine profile..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/goroutine" \
+        -o "$PROFILES_DIR/goroutine.prof" 2>/dev/null || echo "Goroutine profile failed"
+
+    echo "Collecting block profile..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/block" \
+        -o "$PROFILES_DIR/block.prof" 2>/dev/null || echo "Block profile failed"
+
+    echo "Collecting 5s CPU profile for flamegraph..."
+    curl -s "http://127.0.0.1:$PPROF_PORT/debug/pprof/profile?seconds=5" \
+        -o "$PROFILES_DIR/flamegraph.prof" 2>/dev/null || echo "Flamegraph profile failed"
+
+    kill $PPROF_PID 2>/dev/null || true
+    wait $PPROF_PID 2>/dev/null || true
+else
+    echo "Skipping live pprof collection (relay exposes no pprof endpoint; re-run with --pprof to start a local listener and collect)."
+fi
 
 # Cleanup
 if [ -n "${LOAD_PID:-}" ]; then
@@ -185,11 +229,11 @@ echo "Profiles:  $PROFILES_DIR"
 echo ""
 echo "Key files:"
 echo "  - $RESULTS_DIR/go_bench.txt        (Go benchmark results)"
-echo "  - $PROFILES_DIR/cpu.prof            (CPU profile)"
-echo "  - $PROFILES_DIR/heap.prof           (Memory profile)"
-echo "  - $PROFILES_DIR/goroutine.prof      (Goroutine profile)"
-echo "  - $PROFILES_DIR/block.prof          (Block profile)"
-echo "  - $PROFILES_DIR/flamegraph.svg      (Flamegraph)"
+echo "  - $PROFILES_DIR/cpu.prof            (CPU profile, --pprof only)"
+echo "  - $PROFILES_DIR/heap.prof           (Memory profile, --pprof only)"
+echo "  - $PROFILES_DIR/goroutine.prof      (Goroutine profile, --pprof only)"
+echo "  - $PROFILES_DIR/block.prof          (Block profile, --pprof only)"
+echo "  - $PROFILES_DIR/flamegraph.svg      (Flamegraph, --pprof only)"
 echo ""
 echo "To view profiles interactively:"
 echo "  go tool pprof -http=:8080 $PROFILES_DIR/cpu.prof"

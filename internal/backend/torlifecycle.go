@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,21 +23,28 @@ import (
 
 // TorInstance represents a single managed Tor daemon process.
 type TorInstance struct {
-	ID            int
-	SocksPort     int
-	ControlPort   int
-	Cmd           *exec.Cmd
-	DataDir       string
-	Ready         bool
-	StartedAt     time.Time
-	Requests      int64
-	FailCount     int
-	LastRotated   time.Time
+	ID          int
+	SocksPort   int
+	ControlPort int
+	Cmd         *exec.Cmd
+	DataDir     string
+	Ready       bool
+	StartedAt   time.Time
+	Requests    atomic.Int64
+	FailCount   int
+	LastRotated time.Time
+	// nymClaim is the monotonic id of the cooldown-window claim that stamped
+	// LastRotated (see claimNymWindow): guarded by TorLifecycle.nymMu with
+	// the instance lock held. Only the owning claim may refund the window.
+	nymClaim      int64
 	lastHealed    time.Time
-	inFlight      int64
+	inFlight      atomic.Int64
 	circuitGen    atomic.Int64
-	lastExitIP    string    // last observed Tor exit for this instance
-	exitIPChecked time.Time // when lastExitIP was last refreshed
+	lastServed    atomic.Int64       // UnixNano of last DialContext serve; 0 = never served
+	stats         EndpointStats      // lock-free dial latency/quality scoring (score.go); cold-zero is neutral
+	quar          endpointQuarantine // lock-free quarantine/probation lifecycle (quarantine.go); zero = Active
+	lastExitIP    string             // last observed Tor exit for this instance
+	exitIPChecked time.Time          // when lastExitIP was last refreshed
 	mu            sync.RWMutex
 }
 
@@ -48,14 +56,41 @@ func (i *TorInstance) GetSocksPort() int {
 }
 
 // IsReady returns readiness status (thread-safe and checks process liveness).
+// The kill(0) liveness syscall runs WITHOUT the instance lock held: only the
+// Ready flag and process handle are snapshotted under RLock, so a slow or
+// wedged syscall can never stall other readers/writers on the hot dial path.
+// Semantics are identical — a dead process still reports not-ready.
+// A zombie (exited but not yet reaped) still passes kill(0), so a
+// non-blocking Wait4(WNOHANG) follows a successful kill(0): a reaped/exited
+// PID reports not-ready. killInstance's Cmd.Wait error path is harmless when
+// the child was already reaped here (Wait returns promptly with ECHILD, which
+// unblocks the done channel without triggering the Kill branch).
 func (i *TorInstance) IsReady() bool {
 	i.mu.RLock()
-	defer i.mu.RUnlock()
-	if !i.Ready {
+	ready := i.Ready
+	var proc *os.Process
+	if i.Cmd != nil {
+		proc = i.Cmd.Process
+	}
+	i.mu.RUnlock()
+	if !ready {
 		return false
 	}
-	if i.Cmd != nil && i.Cmd.Process != nil {
-		if err := i.Cmd.Process.Signal(syscall.Signal(0)); err != nil {
+	if proc != nil && proc.Pid > 0 {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return false
+		}
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(proc.Pid, &ws, syscall.WNOHANG, nil)
+		if err != nil {
+			if err == syscall.ECHILD {
+				// Already reaped (e.g. a prior IsReady reaped it, or
+				// killInstance waited): no live process backs this instance.
+				return false
+			}
+			// Any other Wait4 error leaves the kill(0) verdict intact.
+		} else if pid == proc.Pid {
+			// Child exited (now reaped): zombie means not-ready.
 			return false
 		}
 	}
@@ -69,26 +104,42 @@ func (i *TorInstance) SetReady(r bool) {
 	i.Ready = r
 }
 
-// IncRequests increments request counter (thread-safe).
+// IncRequests increments request counter (lock-free atomic: hot dial path).
 func (i *TorInstance) IncRequests() {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	i.Requests++
+	i.Requests.Add(1)
 }
 
-// GetRequests returns request count (thread-safe).
+// GetRequests returns request count (lock-free atomic).
 func (i *TorInstance) GetRequests() int64 {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return i.Requests
+	return i.Requests.Load()
 }
 
-// ResetRequests zeroes the request counter (thread-safe). Used after a
+// ResetRequests zeroes the request counter (lock-free atomic). Used after a
 // rotation so the next rotation window starts from zero.
 func (i *TorInstance) ResetRequests() {
-	i.mu.Lock()
-	i.Requests = 0
-	i.mu.Unlock()
+	i.Requests.Store(0)
+}
+
+// ClaimRotation atomically checks the request counter against the threshold
+// and zeroes it when reached, so exactly one concurrent dialer wins the
+// rotation for each window (no NEWNYM stampede).
+func (i *TorInstance) ClaimRotation(threshold int64) bool {
+	// Lock-free CAS loop: the check-and-zero must be atomic so exactly one
+	// concurrent dialer wins each rotation window (no NEWNYM stampede).
+	// ClaimRotation is the only writer that zeroes on threshold (ResetRequests
+	// zeroes unconditionally after a won rotation), so CAS retry is bounded.
+	if threshold <= 0 {
+		return false
+	}
+	for {
+		cur := i.Requests.Load()
+		if cur < threshold {
+			return false
+		}
+		if i.Requests.CompareAndSwap(cur, 0) {
+			return true
+		}
+	}
 }
 
 // GetFailCount returns consecutive fail count (thread-safe).
@@ -120,6 +171,48 @@ func (i *TorInstance) SetLastRotated(t time.Time) {
 	i.LastRotated = t
 }
 
+// claimNymWindow atomically claims the 10s NEWNYM cooldown window for one
+// caller and returns its monotonic claim id (0 = cooldown skip, caller gets
+// ErrNymCooldown). The health path (dropGuards=true) bypasses the cooldown
+// check — stuck guards outrank rate-limit politeness — but still takes a
+// claim so a concurrent anomaly failure cannot refund away its window.
+// Exactly one non-bypass caller per window proceeds; losers skip.
+func (tl *TorLifecycle) claimNymWindow(inst *TorInstance, dropGuards bool) int64 {
+	tl.nymMu.Lock()
+	defer tl.nymMu.Unlock()
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if !dropGuards && time.Since(inst.LastRotated) < 10*time.Second {
+		return 0
+	}
+	tl.nymNext++
+	inst.LastRotated = time.Now()
+	inst.nymClaim = tl.nymNext
+	return inst.nymClaim
+}
+
+// refundNymWindow re-opens the cooldown window after a failed SIGNAL, but
+// only when the failing caller still owns it (claim matches): a newer claim
+// — including a dropGuards bypass that claimed after us — owns the window,
+// and rolling it back would wrongly admit a third caller. A refunded window
+// behaves exactly like natural expiry (lastRotated 11s ago).
+func (tl *TorLifecycle) refundNymWindow(inst *TorInstance, claim int64) {
+	// Claim 0 is the cooldown-skip sentinel, never owned: without this guard
+	// a refund(0) would match the zero-value nymClaim of a fresh instance
+	// and stamp a cooldown window nobody claimed.
+	if claim == 0 {
+		return
+	}
+	tl.nymMu.Lock()
+	defer tl.nymMu.Unlock()
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if inst.nymClaim == claim {
+		inst.LastRotated = time.Now().Add(-11 * time.Second)
+		inst.nymClaim = 0
+	}
+}
+
 // GetStartedAt returns the spawn timestamp (thread-safe). StartedAt is
 // written once under tl.mu during spawnInstance before the instance is
 // published, but accessors keep the lock discipline uniform.
@@ -132,26 +225,27 @@ func (i *TorInstance) GetStartedAt() time.Time {
 // IncInFlight increments the in-flight (active long-lived request) counter
 // used by least-inflight selection. DecInFlight MUST be called when the
 // request finishes (typically via the dial wrapper's Close hook).
+// Lock-free atomic: read on every dial during least-inflight selection.
 func (i *TorInstance) IncInFlight() {
-	i.mu.Lock()
-	i.inFlight++
-	i.mu.Unlock()
+	i.inFlight.Add(1)
 }
 
-// DecInFlight decrements in-flight; safe to call on zero.
+// DecInFlight decrements in-flight; clamps at zero (safe to call on zero).
 func (i *TorInstance) DecInFlight() {
-	i.mu.Lock()
-	if i.inFlight > 0 {
-		i.inFlight--
+	for {
+		cur := i.inFlight.Load()
+		if cur <= 0 {
+			return
+		}
+		if i.inFlight.CompareAndSwap(cur, cur-1) {
+			return
+		}
 	}
-	i.mu.Unlock()
 }
 
-// InFlight returns the current in-flight count (thread-safe).
+// InFlight returns the current in-flight count (lock-free atomic).
 func (i *TorInstance) InFlight() int64 {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return i.inFlight
+	return i.inFlight.Load()
 }
 
 // CircuitGen returns the current circuit generation for SOCKS auth isolation.
@@ -190,6 +284,47 @@ func (i *TorInstance) GetLastRotated() time.Time {
 	return i.LastRotated
 }
 
+// --- additive served-recency tracking ---
+
+// RecordServed stamps this instance as the most recently dialed target.
+// Called on the picked instance in MultiTorBackend.DialContext so a later
+// ReportAnomaly(-1) can attribute the error to the instance that served it.
+func (i *TorInstance) RecordServed() {
+	i.lastServed.Store(time.Now().UnixNano())
+}
+
+// LastServed returns the UnixNano timestamp of the last successful dial
+// through this instance, or 0 when it has never served traffic.
+func (i *TorInstance) LastServed() int64 {
+	return i.lastServed.Load()
+}
+
+// --- additive latency/quality scoring (score.go) ---
+
+// RecordDialOutcome logs one dial outcome into the lock-free scoring stats.
+// Success samples feed the latency EWMA with the given alpha; failures move
+// only the error counter. Safe on the hot dial path (atomics only, no I/O).
+func (i *TorInstance) RecordDialOutcome(success bool, latency time.Duration, alpha float64) {
+	i.stats.Record(success, latency, alpha)
+}
+
+// DialSuccesses returns the scored success count (cold = 0, neutral).
+func (i *TorInstance) DialSuccesses() int64 { return i.stats.Successes() }
+
+// DialFailures returns the scored failure count.
+func (i *TorInstance) DialFailures() int64 { return i.stats.Failures() }
+
+// DialLatencyEWMA returns the success-only EWMA dial latency (0 = no samples).
+func (i *TorInstance) DialLatencyEWMA() time.Duration { return i.stats.LatencyEWMA() }
+
+// --- additive quarantine/probation lifecycle (quarantine.go) ---
+
+// QuarantineState returns the endpoint lifecycle state (Active cold default).
+func (i *TorInstance) QuarantineState() EndpointState { return i.quar.State() }
+
+// QuarantineConsecFails returns the consecutive failure count.
+func (i *TorInstance) QuarantineConsecFails() int64 { return i.quar.ConsecFails() }
+
 // TryStartHeal checks if auto-heal can run (enforcing a 2-minute cooldown).
 func (i *TorInstance) TryStartHeal() bool {
 	i.mu.Lock()
@@ -215,6 +350,35 @@ type TorLifecycle struct {
 	logf         func(string, ...interface{})
 	cookieCache  map[int][]byte // instance ID -> cached control cookie
 	cookieMu     sync.RWMutex
+	// generation is bumped on every ShutdownAll/Start cycle. waitReady
+	// goroutines and CheckHealth restarts capture the generation they were
+	// spawned in and refuse to touch instances from another generation, so a
+	// stale waiter can never mark a replacement instance ready after a full
+	// stack restart. healthMu serializes CheckHealth restarts against
+	// ShutdownAll/Start. generation is atomic because waitReady goroutines
+	// read it without holding healthMu.
+	generation atomic.Int64
+	healthMu   sync.Mutex
+	// stopMu/stopCh implement stop propagation for waitReady goroutines:
+	// every ShutdownAll/Start cycle closes the previous channel and mints a
+	// fresh one, so waiters spawned in an older generation wake up promptly
+	// instead of polling a dead port for up to 2 minutes. The channel for a
+	// generation is captured by waiters via stopChFor; the mutex only guards
+	// the swap, never blocking probes.
+	stopMu sync.RWMutex
+	stopCh chan struct{}
+	// notReadyObs counts consecutive CheckHealth observations in which a
+	// ready instance's SOCKS greeting probe failed (keyed by instance ID).
+	// A single failed probe is transient (NEWNYM churn, guard rebuild); the
+	// persistent-failure path (kill/spawn) only fires after repeats.
+	// Guarded by notReadyMu: CheckHealth probes run without healthMu, so the
+	// counter map needs its own lock.
+	notReadyObs map[int]int
+	notReadyMu  sync.Mutex
+	// nymMu serializes NEWNYM cooldown-window claims; nymNext mints the
+	// monotonic claim ids recorded per instance (see claimNymWindow).
+	nymMu   sync.Mutex
+	nymNext int64
 }
 
 // TorLifecycleConfig configures the Tor lifecycle manager.
@@ -246,12 +410,52 @@ func NewTorLifecycle(cfg TorLifecycleConfig) *TorLifecycle {
 		libraryPath:  cfg.LibraryPath,
 		logf:         cfg.Logf,
 		cookieCache:  make(map[int][]byte),
+		notReadyObs:  make(map[int]int),
+		stopCh:       make(chan struct{}),
 	}
 }
 
+// stopChFor returns the stop channel belonging to generation gen's cycle.
+// Callers must hold no locks; it returns the current channel when gen is the
+// live generation, or an already-closed channel when gen is superseded (so a
+// stale waiter exits immediately instead of hanging).
+func (tl *TorLifecycle) stopChFor(gen int64) <-chan struct{} {
+	tl.stopMu.RLock()
+	defer tl.stopMu.RUnlock()
+	if tl.generation.Load() != gen {
+		closed := make(chan struct{})
+		close(closed)
+		return closed
+	}
+	return tl.stopCh
+}
+
+// bumpStopLocked closes the current stop channel and mints a fresh one,
+// waking every waiter from older generations. Callers must hold healthMu.
+func (tl *TorLifecycle) bumpStopLocked() {
+	tl.stopMu.Lock()
+	close(tl.stopCh)
+	tl.stopCh = make(chan struct{})
+	tl.stopMu.Unlock()
+}
+
 // Start launches all Tor instances in parallel and waits for bootstrap.
+// It returns an error when zero instances are ready after the 60s bootstrap
+// timeout: proceeding with no egress would only serve fail-closed errors, so
+// the caller must surface the failure instead of logging readiness.
+//
+// Lock scope: healthMu is taken only for the spawn phase (generation bump,
+// instance registration). The 60s bootstrap poll runs WITHOUT healthMu so
+// CheckHealth/ShutdownAll callers are never wedged behind a full-minute
+// wait; the completion check re-takes the lock briefly at the deadline.
 func (tl *TorLifecycle) Start(ctx context.Context) error {
+	tl.healthMu.Lock()
+
+	tl.generation.Add(1)
+	tl.bumpStopLocked()
+
 	if err := os.MkdirAll(tl.dataDir, 0700); err != nil {
+		tl.healthMu.Unlock()
 		return fmt.Errorf("create tor data dir: %w", err)
 	}
 
@@ -279,13 +483,24 @@ func (tl *TorLifecycle) Start(ctx context.Context) error {
 	wg.Wait()
 	close(errCh)
 
-	if err := <-errCh; err != nil {
-		tl.ShutdownAll()
-		return fmt.Errorf("spawn tor instances: %w", err)
+	var spawnErrs []error
+	for err := range errCh {
+		spawnErrs = append(spawnErrs, err)
 	}
+	if len(spawnErrs) > 0 {
+		tl.shutdownAllLocked()
+		tl.healthMu.Unlock()
+		return fmt.Errorf("spawn tor instances: %w", errors.Join(spawnErrs...))
+	}
+	tl.healthMu.Unlock()
 
-	// Wait for bootstrap by polling SOCKS ports
+	// Wait for bootstrap by polling SOCKS ports.
+	// Runs WITHOUT healthMu: the poll is up to 60s of blocking I/O plus a
+	// Gen check on exit so a ShutdownAll/Start that raced us owns the result.
+	// The ctx parameter lets the caller abort the wait (process shutdown);
+	// when ctx fires we return its error without touching instance state.
 	tl.logf("Waiting for Tor instances to bootstrap...")
+	bootstrapGen := tl.generation.Load()
 	deadline := time.After(60 * time.Second)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -295,12 +510,26 @@ func (tl *TorLifecycle) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
+			tl.mu.RLock()
+			ready := tl.readyCountLocked()
+			total := len(tl.snapshotLocked())
+			tl.mu.RUnlock()
+			if ready == 0 {
+				tl.logf("Tor bootstrap timeout with zero ready instances — failing startup")
+				return fmt.Errorf("tor bootstrap timeout: zero of %d instances ready after 60s", total)
+			}
 			tl.logf("Tor bootstrap timeout reached — proceeding with currently ready instances")
 			return nil
 		case <-ticker.C:
 			allReady := true
-			tl.mu.RLock()
-			for _, inst := range tl.instances {
+			for _, inst := range tl.GetInstances() {
+				if tl.generation.Load() != bootstrapGen {
+					// A ShutdownAll/Start recycled the stack mid-bootstrap:
+					// these instances belong to a superseded generation, so
+					// stop marking them ready and let the new cycle own it.
+					tl.logf("Tor bootstrap superseded by newer generation — abandoning wait")
+					return fmt.Errorf("tor bootstrap superseded by newer generation")
+				}
 				if !inst.IsReady() {
 					if tl.isSocksPortReady(inst.GetSocksPort()) {
 						inst.SetReady(true)
@@ -310,9 +539,8 @@ func (tl *TorLifecycle) Start(ctx context.Context) error {
 					}
 				}
 			}
-			tl.mu.RUnlock()
 			if allReady {
-				tl.logf("All %d Tor instances bootstrapped", len(tl.instances))
+				tl.logf("All %d Tor instances bootstrapped", len(tl.GetInstances()))
 				return nil
 			}
 		}
@@ -422,19 +650,17 @@ func (tl *TorLifecycle) cachedCookie(inst *TorInstance) func() ([]byte, bool) {
 	}
 }
 
-// GetInstances returns a snapshot of all instances.
-func (tl *TorLifecycle) GetInstances() []*TorInstance {
-	tl.mu.RLock()
-	defer tl.mu.RUnlock()
+// snapshotLocked returns a copy of the instance list. Callers must hold at
+// least tl.mu.RLock.
+func (tl *TorLifecycle) snapshotLocked() []*TorInstance {
 	result := make([]*TorInstance, len(tl.instances))
 	copy(result, tl.instances)
 	return result
 }
 
-// GetReadyCount returns the number of ready instances.
-func (tl *TorLifecycle) GetReadyCount() int {
-	tl.mu.RLock()
-	defer tl.mu.RUnlock()
+// readyCountLocked counts ready instances. Callers must hold at least
+// tl.mu.RLock.
+func (tl *TorLifecycle) readyCountLocked() int {
 	count := 0
 	for _, inst := range tl.instances {
 		if inst.IsReady() {
@@ -444,20 +670,78 @@ func (tl *TorLifecycle) GetReadyCount() int {
 	return count
 }
 
+// GetInstances returns a snapshot of all instances.
+func (tl *TorLifecycle) GetInstances() []*TorInstance {
+	tl.mu.RLock()
+	defer tl.mu.RUnlock()
+	return tl.snapshotLocked()
+}
+
+// GetReadyCount returns the number of ready instances.
+func (tl *TorLifecycle) GetReadyCount() int {
+	tl.mu.RLock()
+	defer tl.mu.RUnlock()
+	return tl.readyCountLocked()
+}
+
 // CheckHealth restarts instances whose SOCKS port is no longer accepting
 // connections after multiple consecutive probe failures, while honoring a grace
 // period after NEWNYM rotation so healthy instances aren't churned.
 // Fixed: uses SOCKS5 handshake (not bare TCP) and checks consensus freshness
 // to catch "circuit-established but no exit" stall observed at 15:54.
+//
+// Serialized against ShutdownAll/Start via healthMu so a restart cannot race
+// a full stack recycle. Instances that stay not-ready across consecutive
+// observations are healed via kill/spawn (not-ready observation counter in
+// notReadyObs); transient single-probe failures only bump FailCount.
+//
+// Lock scope: healthMu is held only to snapshot the instance list (and the
+// generation) plus the kill/spawn section at the end. All blocking probes
+// (SOCKS handshakes, file stats) run WITHOUT healthMu so a wedged daemon
+// cannot stall Start/ShutdownAll callers behind a 5s-per-instance probe.
 func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
-	tl.mu.RLock()
-	instances := make([]*TorInstance, len(tl.instances))
-	copy(instances, tl.instances)
-	tl.mu.RUnlock()
+	tl.healthMu.Lock()
+	instances := tl.GetInstances()
+	gen := tl.generation.Load()
+	tl.healthMu.Unlock()
+
+	// bumpNotReady records one more consecutive not-ready observation for id
+	// and reports the new count. resetNotReady clears it.
+	bumpNotReady := func(id int) int {
+		tl.notReadyMu.Lock()
+		defer tl.notReadyMu.Unlock()
+		tl.notReadyObs[id]++
+		return tl.notReadyObs[id]
+	}
+	resetNotReady := func(id int) {
+		tl.notReadyMu.Lock()
+		tl.notReadyObs[id] = 0
+		tl.notReadyMu.Unlock()
+	}
+	clearNotReady := func(id int) {
+		tl.notReadyMu.Lock()
+		delete(tl.notReadyObs, id)
+		tl.notReadyMu.Unlock()
+	}
 
 	var unhealthy []*TorInstance
 	for _, inst := range instances {
+		// Heal not-ready instances: a ready instance that stops answering
+		// (killed process, wedged daemon) flips IsReady() false via the
+		// liveness check. Re-probe it here — a single miss is transient, but
+		// consecutive not-ready observations re-run kill/spawn so a wedged
+		// daemon is recycled instead of sitting not-ready forever.
 		if !inst.IsReady() {
+			if tl.isSocksPortReady(inst.GetSocksPort()) {
+				resetNotReady(inst.ID)
+				inst.ResetFailCount()
+				continue
+			}
+			obs := bumpNotReady(inst.ID)
+			tl.logf("Tor instance %d not-ready (consecutive not-ready observations: %d/3)", inst.ID, obs)
+			if obs >= 3 {
+				unhealthy = append(unhealthy, inst)
+			}
 			continue
 		}
 		// 30s grace period after spawn or NEWNYM: Tor SOCKS port may be busy negotiating
@@ -478,6 +762,14 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 			if fails >= 3 {
 				unhealthy = append(unhealthy, inst)
 			} else if inst.TryStartHeal() {
+				// Quarantined endpoints skip the proactive DROPGUARDS heal:
+				// quarantine entry already issued ONE attributed NEWNYM, and
+				// a second proactive signal would double-signal the same
+				// sickness (plus fight the 60s hold). SOCKS liveness probes
+				// above still run regardless of state.
+				if inst.quar.State() == StateQuarantined || inst.quar.State() == StateProbation {
+					continue
+				}
 				// Proactively clear stuck guards & trigger fresh circuit to auto-heal before hard restart
 				go func(target *TorInstance) {
 					if !target.IsReady() {
@@ -489,6 +781,7 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 			}
 		} else {
 			inst.ResetFailCount()
+			resetNotReady(inst.ID)
 			// Opportunistic exit-IP refresh: priming at startup can race the
 			// fresh-Tor bootstrap (SOCKS answers before the first circuit is
 			// buildable), so backfill here until the exit is known and keep it
@@ -503,17 +796,35 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 	}
 
 	restarted := 0
+	// Kill/spawn is serialized against ShutdownAll/Start via healthMu so a
+	// restart cannot race a full stack recycle. Probes above already ran
+	// lock-free; only the mutation section takes the lock.
+	tl.healthMu.Lock()
+	defer tl.healthMu.Unlock()
+	if tl.generation.Load() != gen {
+		// A ShutdownAll/Start cycled while we were probing: the snapshot is
+		// stale, and kill/spawn here would operate on a superseded stack.
+		tl.logf("CheckHealth snapshot from superseded generation — skipping restarts")
+		return 0
+	}
 	for _, inst := range unhealthy {
 		tl.logf("Tor instance %d SOCKS port %d down after 3 consecutive failures, restarting...", inst.ID, inst.GetSocksPort())
 		deadID := inst.ID
+		// Capture the replacement pointer up front: waitReady validates
+		// identity (plus generation) before SetReady so a stale waiter from a
+		// superseded generation can never flip the wrong instance ready.
 		tl.killInstance(inst)
-		if _, err := tl.spawnInstance(deadID); err != nil {
+		replacement, err := tl.spawnInstance(deadID)
+		if err != nil {
 			tl.logf("Failed to restart Tor instance %d: %v", deadID, err)
 			continue
 		}
 		restarted++
-		// Mark the replacement ready once it starts answering on SOCKS.
-		go tl.waitReady(deadID)
+		clearNotReady(deadID)
+		// Mark the replacement ready once it answers two consecutive SOCKS5
+		// greeting handshakes (a single success can be a half-open bootstrap
+		// socket; two in a row means the daemon is actually serving).
+		go tl.waitReady(replacement, gen)
 	}
 	return restarted
 }
@@ -545,25 +856,66 @@ func (tl *TorLifecycle) isConsensusStale(inst *TorInstance) bool {
 	return false
 }
 
-// waitReady polls a respawned instance until it can route through its SOCKS
-// port, then marks it ready. Strictly avoids marking unbootstrapped instances ready.
-func (tl *TorLifecycle) waitReady(id int) {
-	port := tl.basePort + id - 1
+// waitReady polls a respawned instance until it answers two consecutive
+// SOCKS5 greeting handshakes, then marks it ready. It captures the
+// *TorInstance pointer (not just the ID) plus the lifecycle generation and
+// validates identity before SetReady: the pointer must still be the
+// registered instance for that ID and the generation must be unchanged.
+// Otherwise a stale waiter from a superseded Start/ShutdownAll cycle could
+// flip an unrelated replacement ready. Strictly avoids marking
+// unbootstrapped instances ready.
+//
+// Stop propagation: waiters also watch stopCh (closed by ShutdownAll/Start
+// via bumpStopLocked). A waiter from a superseded generation exits promptly
+// instead of polling for up to 2 minutes against a dead port.
+func (tl *TorLifecycle) waitReady(target *TorInstance, gen int64) {
+	id := target.ID
+	port := target.GetSocksPort()
+	stop := tl.stopChFor(gen)
 	deadline := time.Now().Add(2 * time.Minute)
+	consecutive := 0
 	for {
-		if tl.isSocksPortReady(port) {
-			if inst := tl.getInstance(id); inst != nil {
-				inst.SetReady(true)
-				inst.ResetFailCount()
-				tl.logf("Tor instance %d ready after restart", id)
-			}
+		if tl.generation.Load() != gen {
+			tl.logf("Tor instance %d ready probe from superseded generation — ignoring", id)
 			return
+		}
+		select {
+		case <-stop:
+			tl.logf("Tor instance %d waiter stopped (stack recycled) — ignoring", id)
+			return
+		default:
+		}
+		if tl.isSocksPortReady(port) {
+			consecutive++
+			if consecutive >= 2 {
+				if tl.generation.Load() != gen {
+					tl.logf("Tor instance %d ready probe from superseded generation — ignoring", id)
+					return
+				}
+				if inst := tl.getInstance(id); inst != nil {
+					if inst != target {
+						tl.logf("Tor instance %d replaced since restart — stale waiter ignoring", id)
+						return
+					}
+					inst.SetReady(true)
+					inst.ResetFailCount()
+					tl.logf("Tor instance %d ready after restart", id)
+				}
+				return
+			}
+		} else {
+			consecutive = 0
 		}
 		if time.Now().After(deadline) {
 			tl.logf("Tor instance %d restart timed out after 2 minutes — keeping not-ready", id)
 			return
 		}
-		time.Sleep(2 * time.Second)
+		select {
+		case <-stop:
+			tl.logf("Tor instance %d waiter stopped (stack recycled) — ignoring", id)
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 
@@ -613,15 +965,38 @@ func (tl *TorLifecycle) killInstance(inst *TorInstance) {
 
 // ShutdownAll stops all Tor instances.
 func (tl *TorLifecycle) ShutdownAll() {
+	tl.healthMu.Lock()
+	defer tl.healthMu.Unlock()
+	tl.generation.Add(1)
+	tl.bumpStopLocked()
+
+	instances := tl.GetInstances()
+
+	for _, inst := range instances {
+		tl.logf("Stopping Tor instance %d...", inst.ID)
+		tl.killInstance(inst)
+	}
+	tl.notReadyMu.Lock()
+	tl.notReadyObs = make(map[int]int)
+	tl.notReadyMu.Unlock()
+}
+
+// shutdownAllLocked stops all Tor instances. Callers must hold healthMu.
+func (tl *TorLifecycle) shutdownAllLocked() {
+	tl.generation.Add(1)
+	tl.bumpStopLocked()
+
 	tl.mu.RLock()
-	instances := make([]*TorInstance, len(tl.instances))
-	copy(instances, tl.instances)
+	instances := tl.snapshotLocked()
 	tl.mu.RUnlock()
 
 	for _, inst := range instances {
 		tl.logf("Stopping Tor instance %d...", inst.ID)
 		tl.killInstance(inst)
 	}
+	tl.notReadyMu.Lock()
+	tl.notReadyObs = make(map[int]int)
+	tl.notReadyMu.Unlock()
 }
 
 // RequestNewCircuit rotates the instance's circuits: SIGNAL NEWNYM builds
@@ -629,13 +1004,38 @@ func (tl *TorLifecycle) ShutdownAll() {
 // A 10-second cooldown is enforced to match Tor's native NEWNYM rate-limit.
 // Cookie auth uses the per-instance cache to avoid re-reading the cookie file on every rotation.
 func (tl *TorLifecycle) RequestNewCircuit(inst *TorInstance) error {
-	return tl.RequestNewCircuitWithDropGuards(inst, false)
+	_, err := tl.requestNewCircuitResult(inst)
+	return err
 }
 
 // RequestNewCircuitWithDropGuards requests a new circuit, optionally clearing guards on recovery.
+// A cooldown skip returns (false, ErrNymCooldown) — callers MUST NOT treat it
+// as a rotation (no counter reset, no pool clear).
 func (tl *TorLifecycle) RequestNewCircuitWithDropGuards(inst *TorInstance, dropGuards bool) error {
-	if !dropGuards && time.Since(inst.GetLastRotated()) < 10*time.Second {
-		return nil
+	_, err := tl.requestNewCircuitResultWithDropGuards(inst, dropGuards)
+	return err
+}
+
+// requestNewCircuitResult is RequestNewCircuit reporting whether a NEWNYM was
+// actually issued (true) or skipped by the cooldown (false, ErrNymCooldown).
+func (tl *TorLifecycle) requestNewCircuitResult(inst *TorInstance) (bool, error) {
+	return tl.requestNewCircuitResultWithDropGuards(inst, false)
+}
+
+func (tl *TorLifecycle) requestNewCircuitResultWithDropGuards(inst *TorInstance, dropGuards bool) (bool, error) {
+	// Atomic cooldown claim: the read-then-act check admits a NEWNYM stampede
+	// under concurrent anomaly reports (all pass the check before any one
+	// stamps lastRotated). Claim under the instance write lock with a re-check
+	// so exactly one caller per window proceeds; losers get ErrNymCooldown.
+	// The cooldown claim records WHO owns the window (monotonic claim id),
+	// not just when: on SIGNAL failure only the owning claim refunds, and
+	// only its own claim — a newer claim (including the health path's
+	// dropGuards bypass, which skips the cooldown check) always survives.
+	// Rolling time back instead would re-open the window for a third caller
+	// whenever claims interleave (anomaly T1 fails after health T2 claimed).
+	claim := tl.claimNymWindow(inst, dropGuards)
+	if claim == 0 {
+		return false, ErrNymCooldown
 	}
 
 	controlAddr := fmt.Sprintf("127.0.0.1:%d", inst.ControlPort)
@@ -643,7 +1043,8 @@ func (tl *TorLifecycle) RequestNewCircuitWithDropGuards(inst *TorInstance, dropG
 	client.Logf = tl.logf
 
 	if err := client.SignalNEWNYM(dropGuards); err != nil {
-		return err
+		tl.refundNymWindow(inst, claim)
+		return false, err
 	}
 
 	inst.NextCircuitGen()
@@ -663,7 +1064,37 @@ func (tl *TorLifecycle) RequestNewCircuitWithDropGuards(inst *TorInstance, dropG
 	// the exit IP changed after NEWNYM and record it for observability.
 	go tl.RefreshExitIP(inst, 5*time.Second)
 
+	return true, nil
+}
+
+// VerifyControls checks control-port authentication on every known instance
+// without changing state: per instance it connects, AUTHENTICATEs with that
+// instance's cached cookie provider, and closes. No SIGNAL is issued.
+// It returns the first failure; callers run it at startup to fail fast on
+// bad/stale control cookies instead of discovering them lazily on NEWNYM.
+func (tl *TorLifecycle) VerifyControls() error {
+	instances := tl.GetInstances()
+	if len(instances) == 0 {
+		return fmt.Errorf("tor control port not configured: no instances")
+	}
+	for _, inst := range instances {
+		controlAddr := fmt.Sprintf("127.0.0.1:%d", inst.ControlPort)
+		client := NewTorControlClient(controlAddr, "", tl.cachedCookie(inst))
+		client.Logf = tl.logf
+		if err := client.VerifyAuth(); err != nil {
+			return fmt.Errorf("instance %d control auth: %w", inst.ID, err)
+		}
+	}
 	return nil
+}
+
+// exitProbeUser builds the SOCKS5 isolation identity the exit-IP probe must
+// assert: the SAME "relay:<id>:<gen>" identity production traffic dials with
+// (see MultiTorBackend.DialContext). Dialing the probe with an empty user
+// would ride the daemon's default circuit and misattribute that exit to this
+// instance.
+func exitProbeUser(inst *TorInstance) string {
+	return "relay:" + strconv.Itoa(inst.ID) + ":" + strconv.FormatInt(inst.CircuitGen(), 10)
 }
 
 // RefreshExitIP dials through this instance's SOCKS port to the Tor Project
@@ -671,12 +1102,13 @@ func (tl *TorLifecycle) RequestNewCircuitWithDropGuards(inst *TorInstance, dropG
 // stale value intact and is logged but non-fatal.
 func (tl *TorLifecycle) RefreshExitIP(inst *TorInstance, maxWait time.Duration) {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(inst.GetSocksPort()))
+	isoUser := exitProbeUser(inst)
 	client := &http.Client{
 		Timeout: maxWait,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				sc := transport.NewSOCKS5Client(10 * time.Second)
-				return sc.Connect(ctx, addr, "check.torproject.org:443", "")
+				return sc.Connect(ctx, addr, "check.torproject.org:443", isoUser)
 			},
 			DisableKeepAlives: true,
 		},

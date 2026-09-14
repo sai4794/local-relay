@@ -60,4 +60,3 @@ func TestValidate_RejectsPortCollisions(t *testing.T) {
 		t.Error("expected port collision error between multi_tor and server.http")
 	}
 }
-

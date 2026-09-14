@@ -26,6 +26,19 @@ var defaultConfig = &Config{
 		MaxInstances: 3,
 		RotateAfter:  50,
 	},
+	Pool: PoolTuningConfig{
+		Enabled:              true,
+		EWMAAlpha:            0.2,
+		LatencyRefMs:         2000,
+		MinSamples:           5,
+		MinQuality:           0.1,
+		Selection:            "weighted",
+		Po2Samples:           2,
+		QuarantineAfterFails: 3,
+		QuarantineSecs:       60,
+		MaxQuarantineSecs:    300,
+		ProbationProbes:      1,
+	},
 	Rotation: RotationConfig{
 		Enabled:  true,
 		Interval: 10,
@@ -41,9 +54,21 @@ var defaultConfig = &Config{
 			"172.16.0.0/12",
 			"192.168.0.0/16",
 			"169.254.0.0/16",
+			"0.0.0.0/8",
+			"100.64.0.0/10",
+			"198.18.0.0/15",
 			"::1/128",
 			"fc00::/7",
 			"fe80::/10",
+			// IPv6 transition / special-use and multicast, mirroring the
+			// firewall default ranges (TS relay parity): these never carry
+			// Tor-routed public traffic, so blocking them is behavior-safe.
+			"fec0::/10",
+			"2002::/16",
+			"2001::/32",
+			"2001:db8::/32",
+			"224.0.0.0/4",
+			"ff00::/8",
 		},
 		MaxBodySize: 32 << 20, // 32MB
 		RateLimit:   50,
@@ -59,7 +84,7 @@ var defaultConfig = &Config{
 	},
 	Metrics: MetricsConfig{
 		Enabled: false,
-		Path:    "/_/metrics",
+		Path:    "/metrics",
 		Address: "127.0.0.1:9090",
 	},
 }

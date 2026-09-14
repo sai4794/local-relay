@@ -18,7 +18,7 @@ CLIENT ─┬─ HTTP :18080 ──► auth → SSRF/firewall → Router ─┐
         │                                    ├─ tor instance 2 (:9151)
         │                                    └─ tor instance 3 (:9152)
         │
-        └─ bypass hosts (localhost, *.codebuff.com) → direct, never through Tor
+        └─ bypass hosts (localhost, 127.0.0.1, codebuff.com, www.codebuff.com, api.codebuff.com) → direct, never through Tor
 
 Router is FAIL-CLOSED: if no proxy backend is healthy, traffic is blocked,
 never leaked outside Tor.
@@ -38,11 +38,11 @@ never leaked outside Tor.
 
 ## Exit-IP change conditions (multi-tor mode)
 
-1. An instance serves **200 requests** (`multi_tor.rotate_after`) → NEWNYM on that instance.
+1. `multi_tor.rotate_after` is **0 (disabled)** — threshold rotation is off; instances only rotate on the feedback paths below.
 2. A non-SSE **429/503** response → NEWNYM on the current round-robin instance.
 3. A CONNECT tunnel dying within 2 s (dead pooled conn heuristic) → same path as 2.
 4. Health monitor probe failures → DROPGUARDS auto-heal; 3 consecutive failures → instance respawned fresh.
-5. Tor's own `MaxCircuitDirtiness 180` rebuilds circuits every ~3 min natively.
+5. Tor's own `MaxCircuitDirtiness 20` rebuilds circuits natively (code: `internal/backend/torlifecycle.go`).
 
 SSE streams are never rotated mid-flight. Established tunnels keep their IP until closed.
 
@@ -87,11 +87,12 @@ curl --socks5-hostname 127.0.0.1:11080 https://api.ipify.org
 | `-http` | — | Override HTTP proxy listen address |
 | `-socks5` | — | Override SOCKS5 listen address |
 | `-log-level` | — | `debug`, `info`, `warn`, `error` |
-| `-v` | — | Shortcut for `-log-level debug` |
+| `-v` | — | Shortcut for `-log-level debug` (overrides `--log-level`) |
 | `-version` | — | Print build info |
 
 Env overrides: `PROXY_HTTP`, `PROXY_SOCKS5`, `PROXY_BACKEND_ADDR`,
-`PROXY_AUTH_KEY`, `PROXY_LOG_LEVEL`, `PROXY_HEALTH_ADDR`, `TOR_BINARY`.
+`PROXY_AUTH_KEY`, `PROXY_LOG_LEVEL`, `PROXY_HEALTH_ADDR`, `TOR_BINARY`,
+`TOR_LIBRARY_PATH` (exported as `LD_LIBRARY_PATH` for spawned Tor children; see `multi_tor.library_path` in `config.yaml`).
 
 ## Configuration reference (config.yaml)
 
@@ -107,7 +108,7 @@ multi_tor:                      # preferred mode: N managed tor daemons
   base_port: 9150               # SOCKS ports: base_port .. base_port+N-1
   control_base: 9160            # control ports likewise
   max_instances: 3
-  rotate_after: 200             # NEWNYM after N requests per instance
+  rotate_after: 0               # 0 disables threshold rotation (rotate on 429/feedback only)
 
 backend:                        # fallback single-tor mode
   type: "tor"
@@ -118,7 +119,7 @@ backend:                        # fallback single-tor mode
   control_cookie_path: "/home/stb/tor/data/control_auth_cookie"
 
 bypass:
-  hosts: ["localhost", "127.0.0.1"]   # routed DIRECT, fail-closed
+  hosts: ["localhost", "127.0.0.1", "codebuff.com", "www.codebuff.com", "api.codebuff.com"]   # routed DIRECT, fail-closed
 
 rotation:
   enabled: false                # global request-count rotation (Rotator)
@@ -136,17 +137,18 @@ security:
 
 logging:   { level: info, format: text }     # text | json
 health:    { enabled: true, address: "127.0.0.1:18888" }
-metrics:   { enabled: false, address: "127.0.0.1:9090", path: "/_/metrics" }
+metrics:   { enabled: false, address: "127.0.0.1:9090", path: "/metrics" }
 ```
 
 ## Endpoints
 
 | URL | Purpose |
 |---|---|
-| `GET :18080/health` | quick liveness (`{"status":"ok","mode":"..."}`) |
-| `GET :18888/health` | full status incl. per-instance/per-slot detail |
-| `GET :18888/readyz` | readiness gate |
-| `GET :18888/metrics` | Prometheus gauges |
+| `GET :18080/health` | proxy health reflecting router state: 200 `{"status":"ok","mode":"..."}` when a backend is healthy, else 503 `{"status":"degraded","mode":"..."}` (requires auth key when `auth.enabled: true`) |
+| `GET :18888/health` (alias `/healthz`) | full status incl. per-instance/per-slot detail; 503 `{"status":"degraded",...}` when unhealthy |
+| `GET :18888/readyz` | readiness gate: 200 `{"status":"ready"}` when healthy, else 503 `{"status":"not ready"}` |
+| `GET :18888/metrics` | Prometheus gauges (only when `metrics.enabled: true`; gated by `SetMetricsEnabled`) |
+| `GET <metrics.address><metrics.path>` | separate Prometheus listener (`/metrics` on `127.0.0.1:9090` when `metrics.enabled: true`): `lano_up`, `lano_tor_instances` |
 
 ## Development
 

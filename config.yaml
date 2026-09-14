@@ -20,6 +20,23 @@ backend:
   circuit_count: 3
   max_circuit_age: 50
 
+# Scored selection + outcome feedback + quarantine tuning. Defaults shown;
+# pool.enabled:false restores pure least-inflight selection (kill-switch)
+# while stats keep recording. Strict decoding is on: keys here must match
+# PoolTuningConfig exactly (see TestStrict_ProductionConfigHasOnlyKnownFields).
+pool:
+  enabled: true
+  ewma_alpha: 0.2
+  latency_ref_ms: 2000
+  min_samples: 5
+  min_quality: 0.1
+  selection: "weighted"
+  po2_samples: 2
+  quarantine_after_fails: 3
+  quarantine_secs: 60
+  max_quarantine_secs: 300
+  probation_probes: 1
+
 bypass:
   hosts:
     - "localhost"
@@ -38,15 +55,28 @@ auth:
   api_key: ""
 
 security:
+  # blocked_networks is the SSRF enforcement list. Keep it in sync with the
+  # firewall defaults (internal/security/firewall.go) and config defaults
+  # (internal/config/defaults.go); the yaml list replaces (not merges with)
+  # the defaults, so ranges omitted here are NOT enforced at runtime.
   blocked_networks:
     - "127.0.0.0/8"
     - "10.0.0.0/8"
     - "172.16.0.0/12"
     - "192.168.0.0/16"
     - "169.254.0.0/16"
+    - "0.0.0.0/8"
+    - "100.64.0.0/10"
+    - "198.18.0.0/15"
     - "::1/128"
     - "fc00::/7"
     - "fe80::/10"
+    - "fec0::/10"
+    - "2002::/16"
+    - "2001::/32"
+    - "2001:db8::/32"
+    - "224.0.0.0/4"
+    - "ff00::/8"
   max_body_size: 33554432  # 32MB
 
 logging:

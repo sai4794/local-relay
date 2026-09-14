@@ -57,6 +57,13 @@ func TestHasSSEContentType(t *testing.T) {
 	if !HasSSEContentType(h) {
 		t.Error("expected true for text/event-stream with charset")
 	}
+
+	// Live-path parity: the forward path lowercases before matching, so an
+	// oddly-cased upstream Content-Type must also match here (RFC 2045).
+	h.Set("Content-Type", "Text/Event-Stream; charset=utf-8")
+	if !HasSSEContentType(h) {
+		t.Error("expected true for mixed-case text/event-stream")
+	}
 }
 
 func TestCopySSE(t *testing.T) {
@@ -72,6 +79,9 @@ func TestCopySSE(t *testing.T) {
 	}
 	if ct := res.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("Content-Type = %q; want text/event-stream", ct)
+	}
+	if conn := res.Header.Get("Connection"); conn != "" {
+		t.Errorf("Connection = %q; want unset (hop header must not be emitted)", conn)
 	}
 	if rec.Body.String() != content {
 		t.Errorf("body = %q; want %q", rec.Body.String(), content)

@@ -12,7 +12,16 @@
 #
 # Examples:
 #   ./bench/loadtest.sh http://127.0.0.1:18080 30s 50
-#   ./bench/loadtest.sh socks5://127.0.0.1:11080 60s 100
+#   ./bench/loadtest.sh https://api.ipify.org 30s 50   # CONNECT tunnel via :18080
+#
+# Semantics: the relay is a forward proxy, not an origin server. Plain-HTTP
+# modes drive it via CONNECT or the x-target-url header form; raw
+# "GET http://127.0.0.1:18080/" only exercises the proxy's own liveness path
+# (and SOCKS5 needs a CONNECT-aware client, not plain HTTP tools).
+#
+#   HTTP forward (header mode): curl -H "x-target-url: <url>" http://127.0.0.1:18080/
+#   CONNECT tunnel:             curl -x http://127.0.0.1:18080 <https-url>
+#   SOCKS5 tunnel:              curl --socks5-hostname 127.0.0.1:11080 <url>
 # =============================================================================
 
 set -euo pipefail
@@ -30,12 +39,21 @@ echo "Duration:    $DURATION"
 echo "Concurrency: $CONCURRENCY"
 echo "Results:     $RESULTS_DIR"
 echo ""
+# Forward-proxy semantics: translate the requested target into the form the
+# relay actually serves (CONNECT authority or x-target-url header). A bare
+# "GET <proxy-addr>" would only hit the liveness path, not an upstream fetch.
+PROXY="http://127.0.0.1:18080"
+if [[ "$TARGET" == socks5://* ]]; then
+    echo "NOTE: plain HTTP load tools cannot drive SOCKS5; use a CONNECT-aware"
+    echo "client instead: curl --socks5-hostname 127.0.0.1:11080 $TARGET"
+    echo ""
+fi
 
 # =============================================================================
 # Test 1: Vegeta (constant rate load test)
 # =============================================================================
-echo "=== Vegeta: Constant Rate ==="
-echo "GET $TARGET" | vegeta attack \
+echo "=== Vegeta: Constant Rate (x-target-url header mode via proxy) ==="
+echo "GET $PROXY" | vegeta attack -header "x-target-url: $TARGET" \
   -duration="$DURATION" \
   -rate="$(( CONCURRENCY * 10 ))" \
   -connections="$CONCURRENCY" \
@@ -53,11 +71,13 @@ cat "$RESULTS_DIR/vegeta_histogram.txt"
 # Test 2: Hey (concurrent connections)
 # =============================================================================
 echo ""
-echo "=== Hey: Concurrent Connections ==="
-hey -z "$DURATION" \
-    -c "$CONCURRENCY" \
-    -disable-keepalive \
-    "$TARGET" \
+echo "=== Hey: Concurrent Connections (CONNECT tunnel via proxy) ==="
+echo "NOTE: hey has no CONNECT proxy mode; driving CONNECT tunnels with curl."
+echo "Equivalent hey form (direct-origin baseline only):"
+echo "  hey -z \"$DURATION\" -c \"$CONCURRENCY\" -disable-keepalive \"$TARGET\""
+seq 1 "$CONCURRENCY" | xargs -P "$CONCURRENCY" -I{} \
+    curl -sS -o /dev/null -w "%{http_code} %{time_total}\n" \
+    -x "http://127.0.0.1:18080" --max-time 30 "$TARGET" \
     | tee "$RESULTS_DIR/hey_report.txt"
 
 # =============================================================================
@@ -66,6 +86,8 @@ hey -z "$DURATION" \
 if command -v wrk &> /dev/null; then
     echo ""
     echo "=== Wrk: High Throughput ==="
+    # NOTE: wrk speaks raw HTTP only (no CONNECT proxy support); it hits
+    # the origin directly for baseline comparison, not via the relay.
     wrk -t4 \
         -c"$CONCURRENCY" \
         -d"$DURATION" \
@@ -78,30 +100,28 @@ fi
 # Test 4: Connection churn (tests keep-alive behavior)
 # =============================================================================
 echo ""
-echo "=== Connection Churn Test ==="
-echo "Testing with DisableKeepAlives=true (current behavior)"
-hey -n 1000 \
-    -c "$CONCURRENCY" \
-    -disable-keepalive \
-    "$TARGET" \
+echo "=== Connection Churn Test (CONNECT tunnel via proxy) ==="
+echo "Testing CONNECT tunnel reuse (sequential curl via proxy keeps the client side warm)"
+seq 1 1000 | xargs -P "$CONCURRENCY" -I{} \
+    curl -sS -o /dev/null -w "%{http_code} %{time_total}\n" \
+    -x "http://127.0.0.1:18080" --max-time 30 "$TARGET" \
     | tee "$RESULTS_DIR/hey_no_keepalive.txt"
 
 echo ""
-echo "Testing with keep-alive enabled"
-hey -n 1000 \
-    -c "$CONCURRENCY" \
-    "$TARGET" \
+echo "Testing direct-origin baseline (no proxy)"
+seq 1 1000 | xargs -P "$CONCURRENCY" -I{} \
+    curl -sS -o /dev/null -w "%{http_code} %{time_total}\n" \
+    --max-time 30 "$TARGET" \
     | tee "$RESULTS_DIR/hey_keepalive.txt"
 
 # =============================================================================
 # Test 5: Latency distribution
 # =============================================================================
 echo ""
-echo "=== Latency Distribution ==="
-hey -n 10000 \
-    -c "$CONCURRENCY" \
-    -disable-keepalive \
-    "$TARGET" \
+echo "=== Latency Distribution (CONNECT tunnel via proxy) ==="
+seq 1 10000 | xargs -P "$CONCURRENCY" -I{} \
+    curl -sS -o /dev/null -w "%{time_total}\n" \
+    -x "http://127.0.0.1:18080" --max-time 30 "$TARGET" \
     | tee "$RESULTS_DIR/hey_latency_dist.txt"
 
 echo ""

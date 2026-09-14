@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"github.com/local-relay/proxy/internal/backend"
 	"github.com/local-relay/proxy/internal/config"
 	"github.com/local-relay/proxy/internal/health"
+	"github.com/local-relay/proxy/internal/metrics"
 	"github.com/local-relay/proxy/internal/proxy"
 	"github.com/local-relay/proxy/internal/rotate"
 	"github.com/local-relay/proxy/internal/security"
@@ -54,6 +58,10 @@ func main() {
 		os.Exit(1)
 	}
 	applyFlagOverrides(cfg, httpAddr, socks5Addr, logLevel, verbose)
+	if err := config.Validate(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid config after CLI overrides: %v\n", err)
+		os.Exit(1)
+	}
 
 	logger := setupLogger(cfg.Logging.Level, cfg.Logging.Format)
 	logger.Info("Starting local-relay",
@@ -72,6 +80,11 @@ func main() {
 	firewall, ssrfBlocker := setupSecurity(ctx, cfg, logger)
 	rotator := buildRotator(cfg, stack, logger)
 
+	if err := verifyControlAuthAtStartup(stack, logger); err != nil {
+		logger.Error("Control-port auth verification failed at startup", "error", err)
+		failExit(stack, 1)
+	}
+
 	httpProxy, socks5Proxy := buildProxies(router, stack.usePool, cfg, logger,
 		authMiddlewareOrNil(cfg), firewall, rotator, ssrfBlocker)
 
@@ -82,14 +95,57 @@ func main() {
 		}
 	}
 
-	startServers(ctx, stop, cfg, logger, httpProxy, socks5Proxy, stack.torLifecycle)
-	healthSrv := startHealthServer(cfg, stack, rotator, logger)
+	// Fail fast before the ready log: health Bind (real bind via the exported
+	// Bind/StartListener split, with SetVersion/SetAuth/SetMetricsEnabled
+	// wiring) plus probe-binds for HTTP/SOCKS5/metrics. Every failure path
+	// failExits (ShutdownAll Tor daemons, then os.Exit).
+	authMw := authMiddlewareOrNil(cfg)
+	healthSrv, healthLn, herr := bindHealthServer(cfg, stack, rotator, logger, authMw)
+	if herr != nil {
+		logger.Error("Health server bind failed", "addr", cfg.Health.Address, "error", herr)
+		if healthLn != nil {
+			_ = healthLn.Close()
+		}
+		failExit(stack, 1)
+	}
+	if perr := preBindProxies(cfg, logger); perr != nil {
+		if healthLn != nil {
+			_ = healthLn.Close()
+		}
+		failExit(stack, 1)
+	}
+	if cfg.Metrics.Enabled {
+		if merr := probeBind(cfg.Metrics.Address); merr != nil {
+			logger.Error("Metrics server bind failed", "addr", cfg.Metrics.Address, "error", merr)
+			if healthLn != nil {
+				_ = healthLn.Close()
+			}
+			failExit(stack, 1)
+		}
+	}
+	// HealthServer.Stop is nil-safe via the server-nil check inside Stop, and
+	// the pre-bound health listener closes on shutdown. Proxy shutdown (10s
+	// deadline) stays in shutdown(); admin shutdown stays 5s via Stop.
+	// Metrics shutdown (5s budget) runs via the signal-ctx goroutine in
+	// startMetricsServer plus an explicit stop in shutdown(); both are
+	// nil-safe and idempotent.
 	if healthSrv != nil {
 		defer healthSrv.Stop()
 	}
-	startMetricsServer(ctx, cfg, stack.torLifecycle, logger)
+	defer stopMetricsServer()
+	if healthLn != nil {
+		defer healthLn.Close()
+	}
+
+	// Binds already succeeded so no fail-fast path remains past this point.
+	startServers(ctx, stop, cfg, logger, stack, httpProxy, socks5Proxy)
+	startHealthListener(healthSrv, healthLn, logger)
+	startMetricsServer(ctx, cfg, stack.torLifecycle, authMw, logger)
 
 	logger.Info("Local relay is ready")
+	if !router.IsHealthy() {
+		logger.Warn("degraded: no healthy proxied backend — traffic fails closed until Tor recovers")
+	}
 
 	<-ctx.Done()
 
@@ -147,6 +203,7 @@ func buildBackendStack(ctx context.Context, cfg *config.Config, logger *slog.Log
 		s.multiTor = backend.NewMultiTorBackend(s.torLifecycle, cfg.ConnectionTimeout(), func(format string, args ...interface{}) {
 			logger.Debug("[multi-tor] "+format, args...)
 		})
+		applyPoolTuning(s.multiTor, cfg, logger)
 
 		if err := s.torLifecycle.Start(ctx); err != nil {
 			logger.Error("Failed to start Tor instances (traffic will fail closed until Tor is healthy)", "error", err)
@@ -205,6 +262,37 @@ func buildBackendStack(ctx context.Context, cfg *config.Config, logger *slog.Log
 	return s
 }
 
+// applyPoolTuning converts cfg.Pool into backend ScoreParams +
+// QuarantineConfig and installs them on the multi-tor backend. The
+// kill-switch (pool.enabled:false) passes the zero ScoreParams, which
+// SetScoreParams reads as "disable steering" — stats still record, so
+// re-enabling later starts warm. buildRouter, monitorBackends, and the
+// OnRotate→ClearIdleConns wiring are untouched.
+func applyPoolTuning(m *backend.MultiTorBackend, cfg *config.Config, logger *slog.Logger) {
+	if !cfg.Pool.Enabled {
+		m.SetScoreParams(backend.ScoreParams{})
+		logger.Info("pool scoring disabled (kill-switch): pure least-inflight selection")
+		return
+	}
+	m.SetScoreParams(backend.ScoreParams{
+		Alpha:      cfg.Pool.EWMAAlpha,
+		LatencyRef: time.Duration(cfg.Pool.LatencyRefMs) * time.Millisecond,
+		MinSamples: cfg.Pool.MinSamples,
+		MinQuality: cfg.Pool.MinQuality,
+	})
+	m.SetQuarantineConfig(backend.QuarantineConfig{
+		AfterFails:  int64(cfg.Pool.QuarantineAfterFails),
+		Duration:    time.Duration(cfg.Pool.QuarantineSecs) * time.Second,
+		MaxDuration: time.Duration(cfg.Pool.MaxQuarantineSecs) * time.Second,
+		Probes:      int64(cfg.Pool.ProbationProbes),
+	})
+	logger.Info("pool scoring enabled",
+		"selection", cfg.Pool.Selection,
+		"ewma_alpha", cfg.Pool.EWMAAlpha,
+		"quarantine_secs", cfg.Pool.QuarantineSecs,
+	)
+}
+
 // buildRouter wires the direct (bypass) backend with the selected proxied backend.
 func buildRouter(s *backendStack, cfg *config.Config, logger *slog.Logger) *backend.Router {
 	directBackend := backend.NewDirectBackend(cfg.ConnectionTimeout())
@@ -231,6 +319,11 @@ func buildRouter(s *backendStack, cfg *config.Config, logger *slog.Logger) *back
 
 // setupSecurity constructs SSRF protection and the per-host firewall/rate limiter,
 // sharing a single DNS cache and singleflight deduplicator between them.
+// Custom blocked_networks are appended to the firewall's defaults (union, never
+// weakened); unparseable entries fail validation at load time, and any residual
+// AddBlockedRange error is logged instead of silently skipped. FailClosedDNS
+// is propagated to both guards; the .onion exemption precedes it inside each
+// guard and is preserved.
 func setupSecurity(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*security.Firewall, *security.SSRFBlocker) {
 	sharedResolver := security.NewResolver()
 	sharedResolver.StartCleanup(ctx, cleanupInterval)
@@ -240,13 +333,175 @@ func setupSecurity(ctx context.Context, cfg *config.Config, logger *slog.Logger)
 		blocker = security.NewSSRFBlockerWithResolver(cfg.Security.BlockedNetworks, sharedResolver)
 		logger.Info("SSRF protection enabled", "blocked_networks", len(cfg.Security.BlockedNetworks))
 	}
+	if blocker != nil {
+		blocker.FailClosedDNS = cfg.Security.FailClosedDNS
+	}
 
 	fw := security.NewFirewallWithResolver(security.FirewallConfig{
-		RateLimit: cfg.Security.RateLimit,
-		RateBurst: cfg.Security.RateBurst,
+		RateLimit:     cfg.Security.RateLimit,
+		RateBurst:     cfg.Security.RateBurst,
+		FailClosedDNS: cfg.Security.FailClosedDNS,
 	}, sharedResolver)
+	for _, cidr := range cfg.Security.BlockedNetworks {
+		if err := fw.AddBlockedRange(cidr); err != nil {
+			logger.Error("invalid blocked_networks CIDR skipped by firewall", "cidr", cidr, "error", err)
+		}
+	}
+	if cfg.Security.FailClosedDNS {
+		logger.Info("fail-closed DNS enabled: unresolvable hosts are blocked")
+	}
 	fw.StartCleanup(ctx, cleanupInterval)
 	return fw, blocker
+}
+
+// failExit shuts down spawned Tor daemons (when any) before exiting with code.
+// Nil-safe: a nil stack or nil lifecycle simply skips the shutdown. Callers
+// use it only for post-spawn fail-fast exits (bind/auth failures after Tor
+// daemons may be running); pre-spawn exits (flags, config load) exit directly.
+func failExit(stack *backendStack, code int) {
+	if stack != nil && stack.torLifecycle != nil {
+		stack.torLifecycle.ShutdownAll()
+	}
+	os.Exit(code)
+}
+
+// verifyControlAuthAtStartup fails fast when a configured control port rejects
+// our credentials: without working control auth every later NEWNYM silently
+// fails, so surfacing it before serving beats discovering it on first rotation.
+// It authenticates only (no SIGNAL, no state change) via the existing
+// VerifyControl/VerifyControls exported APIs. Fail-fast is reserved for a
+// definitive "auth rejected" reply; "not configured" (no control endpoint),
+// "failed to connect" (Tor down at startup), timeouts, and transport-level
+// "auth failed" (read errors under a wedged daemon) degrade fail-closed with
+// a warning — matching the existing buildBackendStack behavior — and the 30s
+// monitor recovers them.
+// Direct-only stacks verify nothing.
+func verifyControlAuthAtStartup(stack *backendStack, logger *slog.Logger) error {
+	if stack == nil {
+		return nil
+	}
+	verify := func(name string, fn func() error) error {
+		if err := fn(); err != nil {
+			msg := err.Error()
+			switch {
+			case strings.Contains(msg, "not configured"):
+				// No control endpoint (unconfigured backend or zero
+				// instances): a bootstrap outcome, not an auth failure —
+				// startup already logged it and degrades.
+				logger.Warn("Skipping control-auth verification: no control endpoint", "backend", name, "error", err)
+				return nil
+			case strings.Contains(msg, "auth rejected"):
+				// Definitive bad credentials — the only fail-fast case.
+				return err
+			case strings.Contains(msg, "failed to connect"),
+				strings.Contains(msg, "auth failed"),
+				isTimeoutErr(err):
+				// Tor down or wedged at startup: keep serving degraded
+				// (fail-closed) and let the 30s monitor recover it
+				// without a restart.
+				logger.Warn("Control port unreachable at startup — serving degraded until Tor recovers (fail-closed)",
+					"backend", name, "error", err)
+				return nil
+			default:
+				return err
+			}
+		}
+		logger.Info("Control-port auth verified", "backend", name)
+		return nil
+	}
+	switch {
+	case stack.multiTor != nil && stack.torLifecycle != nil:
+		return verify("multi-tor", stack.torLifecycle.VerifyControls)
+	case stack.pool != nil:
+		return verify("circuit-pool", stack.pool.VerifyControl)
+	case stack.torBackend != nil:
+		return verify("single-tor", stack.torBackend.VerifyControl)
+	default:
+		return nil
+	}
+}
+
+// isTimeoutErr reports whether err is (or wraps) a network timeout: a wedged
+// control daemon that never answers must degrade, not fail fast.
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// probeSingleTorRecovery re-probes a degraded single-tor backend: CheckHealth
+// flips the cached healthy flag when the Tor endpoint answers again. It is a
+// no-op when there is no single-tor backend or it is already healthy.
+func probeSingleTorRecovery(logger *slog.Logger, stack *backendStack) {
+	if stack == nil || stack.torBackend == nil {
+		return
+	}
+	if stack.torBackend.IsHealthy() {
+		return
+	}
+	if stack.torBackend.CheckHealth() {
+		logger.Info("Single-Tor backend recovered")
+	}
+}
+
+// probePoolRecovery re-probes a degraded circuit pool: when Tor is reachable
+// again it issues a ForceRotate which resets slots on success. On failure (or
+// while Tor stays unreachable) the pool stays degraded, fail-closed. It is a
+// no-op when there is no pool or it is already healthy.
+func probePoolRecovery(logger *slog.Logger, stack *backendStack) {
+	if stack == nil || stack.pool == nil {
+		return
+	}
+	if stack.pool.IsHealthy() {
+		return
+	}
+	if !stack.pool.CheckTorReachable() {
+		return
+	}
+	if err := stack.pool.ForceRotate(); err != nil {
+		if errors.Is(err, backend.ErrNymCooldown) {
+			// Rotation already happened inside the cooldown window — slots
+			// were reset by the in-flight NEWNYM, so this is informational
+			// and the pool retries on the next tick.
+			logger.Info("Circuit pool recovery skipped — inside NEWNYM cooldown, retrying next tick")
+			return
+		}
+		logger.Warn("Circuit pool recovery rotate failed — staying degraded (fail-closed)", "error", err)
+		return
+	}
+	logger.Info("Circuit pool recovered")
+}
+
+// probeBind checks that addr can be bound right now (fail-fast for taken
+// ports) by opening and immediately closing a probe listener. It closes the
+// probe before returning so the real server's Start remains the single
+// Listen+Serve owner — no double-bind, no behavior change on the success path.
+//
+// There is an inherent probe-vs-serve TOCTOU (another process could grab the
+// port between probe and Start), but that race already existed and the serving
+// goroutines still cancel the process via stop() on failure; the probe only
+// converts the common taken-port case into a fail-fast failExit before the
+// ready log.
+func probeBind(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return ln.Close()
+}
+
+// preBindProxies fail-fasts on taken proxy ports before the ready log. Each
+// failure logs and returns the error — the caller then failExits (ShutdownAll
+// Tor daemons, then os.Exit).
+func preBindProxies(cfg *config.Config, logger *slog.Logger) error {
+	if err := probeBind(cfg.Server.HTTP); err != nil {
+		logger.Error("HTTP proxy bind failed", "addr", cfg.Server.HTTP, "error", err)
+		return err
+	}
+	if err := probeBind(cfg.Server.SOCKS5); err != nil {
+		logger.Error("SOCKS5 proxy bind failed", "addr", cfg.Server.SOCKS5, "error", err)
+		return err
+	}
+	return nil
 }
 
 // authMiddlewareOrNil returns nil unless API-key auth is explicitly enabled.
@@ -276,7 +531,8 @@ func buildRotator(cfg *config.Config, s *backendStack, logger *slog.Logger) *rot
 	case s.pool != nil:
 		onRotate = func() {
 			logger.Info("Rotation triggered — rotating circuit pool")
-			s.pool.RotateRandomSlot()
+			// ForceRotate alone: on a successful NEWNYM it resets all
+			// slots via resetAll, so no pre-marking is needed.
 			if err := s.pool.ForceRotate(); err != nil {
 				logger.Error("Failed to force rotate circuit pool", "error", err)
 			}
@@ -286,17 +542,6 @@ func buildRotator(cfg *config.Config, s *backendStack, logger *slog.Logger) *rot
 			logger.Info("Rotation triggered — requesting new Tor circuit")
 			if err := s.torBackend.RequestNewCircuit(); err != nil {
 				logger.Error("Failed to request new Tor circuit", "error", err)
-			}
-		}
-	case s.torLifecycle != nil:
-		onRotate = func() {
-			instances := s.torLifecycle.GetInstances()
-			if len(instances) > 0 {
-				target := instances[0]
-				logger.Info("Rotation triggered — rotating Tor instance", "id", target.ID)
-				if err := s.torLifecycle.RequestNewCircuit(target); err != nil {
-					logger.Error("Failed to rotate instance", "id", target.ID, "error", err)
-				}
 			}
 		}
 	}
@@ -350,81 +595,121 @@ func startServerGoroutine(name string, logger *slog.Logger, stop context.CancelF
 	}()
 }
 
-// startServers launches the two proxy listeners plus the multi-tor health monitor.
+// monitorBackends runs the 30s recovery/monitor loop: the existing multi-tor
+// CheckHealth + full-restart dead-man's switch, plus single-tor and pool
+// recovery probes. Direct-only stacks have no Tor backend and get no goroutine
+// (caller guards on hasTorBackend). No Tor fallback, no fail-open: probes only
+// flip cached health / reset slots, routing stays fail-closed via Router.
+func monitorBackends(
+	ctx context.Context,
+	logger *slog.Logger,
+	stack *backendStack,
+) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	// allDownSince escalates to a full Tor stack restart when every
+	// instance has been continuously unhealthy.
+	var allDownSince time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			probeSingleTorRecovery(logger, stack)
+			probePoolRecovery(logger, stack)
+			if stack.torLifecycle == nil {
+				continue
+			}
+			restarted := stack.torLifecycle.CheckHealth(ctx)
+			if restarted > 0 {
+				logger.Info("Restarted dead Tor instances", "count", restarted)
+			}
+			// Dead-man's switch: if every instance has been down for
+			// >2 minutes individual heals aren't cutting it — recycle
+			// the whole Tor stack once (guards/consensus preserved).
+			ready := stack.torLifecycle.GetReadyCount()
+			if ready == 0 {
+				if allDownSince.IsZero() {
+					allDownSince = time.Now()
+				} else if time.Since(allDownSince) > 2*time.Minute {
+					logger.Error("FATAL: all Tor instances unhealthy > 2m — full multi-Tor restart",
+						"since", allDownSince)
+					stack.torLifecycle.ShutdownAll()
+					if err := stack.torLifecycle.Start(ctx); err != nil {
+						logger.Error("multi-Tor full restart failed", "error", err)
+					}
+					allDownSince = time.Time{} // re-arm
+				}
+			} else {
+				allDownSince = time.Time{}
+			}
+		}
+	}
+}
+
+// hasTorBackend reports whether the stack owns any Tor backend needing the
+// monitor goroutine. Direct-only stacks (no torBackend/pool/lifecycle) skip it.
+func hasTorBackend(stack *backendStack) bool {
+	return stack != nil && (stack.torBackend != nil || stack.pool != nil || stack.torLifecycle != nil)
+}
+
+// startServers launches the two proxy listeners via their existing Start
+// entry points plus the backend monitor. Proxy binds that fail inside the
+// serving goroutines still cancel the process via stop(); the pre-bind probes
+// in main convert the common taken-port case into a fail-fast failExit before
+// the ready log.
 func startServers(
 	ctx context.Context,
 	stop context.CancelFunc,
 	cfg *config.Config,
 	logger *slog.Logger,
+	stack *backendStack,
 	httpProxy *proxy.HTTPProxy,
 	socks5Proxy *proxy.SOCKS5Proxy,
-	torLifecycle *backend.TorLifecycle,
 ) {
 	startServerGoroutine("HTTP proxy", logger, stop, func() error { return httpProxy.Start(cfg.Server.HTTP) })
 	startServerGoroutine("SOCKS5 proxy", logger, stop, func() error { return socks5Proxy.Start(cfg.Server.SOCKS5) })
 
-	if torLifecycle != nil {
-		go func() {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			// allDownSince escalates to a full Tor stack restart when every
-			// instance has been continuously unhealthy.
-			var allDownSince time.Time
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					restarted := torLifecycle.CheckHealth(ctx)
-					if restarted > 0 {
-						logger.Info("Restarted dead Tor instances", "count", restarted)
-					}
-					// Dead-man's switch: if every instance has been down for
-					// >2 minutes individual heals aren't cutting it — recycle
-					// the whole Tor stack once (guards/consensus preserved).
-					ready := torLifecycle.GetReadyCount()
-					if ready == 0 {
-						if allDownSince.IsZero() {
-							allDownSince = time.Now()
-						} else if time.Since(allDownSince) > 2*time.Minute {
-							logger.Error("FATAL: all Tor instances unhealthy > 2m — full multi-Tor restart",
-								"since", allDownSince)
-							torLifecycle.ShutdownAll()
-							if err := torLifecycle.Start(ctx); err != nil {
-								logger.Error("multi-Tor full restart failed", "error", err)
-							}
-							allDownSince = time.Time{} // re-arm
-						}
-					} else {
-						allDownSince = time.Time{}
-					}
-				}
-			}
-		}()
+	if hasTorBackend(stack) {
+		go monitorBackends(ctx, logger, stack)
 	}
 }
 
-// startHealthServer exposes /health, /readyz and Prometheus-style metrics on
-// a dedicated admin port. Returns nil when disabled; otherwise the caller
-// owns stopping the returned server.
-func startHealthServer(cfg *config.Config, s *backendStack, rotator *rotate.Rotator, logger *slog.Logger) *health.HealthServer {
+// stackHealthy reports cached backend health for the /health IsHealthy
+// probe. Single-tor uses the cached IsHealthy value — active probing is
+// owned by the 30s probeSingleTorRecovery loop, so a per-scrape CheckHealth
+// dial must not run here (it could flip health under load). Pool and
+// multi-tor branches use their own cheap cached-status reads, unchanged.
+func stackHealthy(s *backendStack) bool {
+	switch {
+	case s.multiTor != nil:
+		return s.multiTor.IsHealthy()
+	case s.pool != nil:
+		return s.pool.IsHealthy()
+	case s.torBackend != nil:
+		return s.torBackend.IsHealthy()
+	default:
+		return true
+	}
+}
+
+// bindHealthServer builds the admin health server with version/auth/metrics
+// wiring (SetVersion/SetAuth/SetMetricsEnabled). Binding is done by the
+// caller via Bind so taken ports fail fast before the ready log; when health
+// is disabled it returns (nil, nil, nil).
+func bindHealthServer(
+	cfg *config.Config,
+	s *backendStack,
+	rotator *rotate.Rotator,
+	logger *slog.Logger,
+	authMw *auth.APIKeyAuth,
+) (*health.HealthServer, net.Listener, error) {
 	if !cfg.Health.Enabled {
-		return nil
+		return nil, nil, nil
 	}
 
 	checker := health.NewSimpleHealthChecker(
-		func() bool {
-			switch {
-			case s.multiTor != nil:
-				return s.multiTor.IsHealthy()
-			case s.pool != nil:
-				return s.pool.IsHealthy()
-			case s.torBackend != nil:
-				return s.torBackend.CheckHealth()
-			default:
-				return true
-			}
-		},
+		func() bool { return stackHealthy(s) },
 		func() map[string]interface{} {
 			info := map[string]interface{}{
 				"type": cfg.Backend.Type,
@@ -455,15 +740,66 @@ func startHealthServer(cfg *config.Config, s *backendStack, rotator *rotate.Rota
 	)
 
 	healthSrv := health.NewHealthServer(cfg.Health.Address, checker, logger)
+	healthSrv.SetVersion(Version)
+	healthSrv.SetAuth(authMw)
 	healthSrv.SetMetricsEnabled(cfg.Metrics.Enabled)
-	go runComponent("health server", logger, healthSrv.Start)
-	return healthSrv
+	ln, err := healthSrv.Bind()
+	if err != nil {
+		return nil, nil, err
+	}
+	return healthSrv, ln, nil
 }
 
-// startMetricsServer optionally serves minimal Prometheus counters.
-func startMetricsServer(_ context.Context, cfg *config.Config, torLifecycle *backend.TorLifecycle, logger *slog.Logger) {
+// startHealthListener serves a pre-bound admin listener in the background with
+// panic containment. Nil-safe: disabled health leaves nil server/listener.
+func startHealthListener(healthSrv *health.HealthServer, healthLn net.Listener, logger *slog.Logger) {
+	if healthSrv == nil || healthLn == nil {
+		return
+	}
+	go runComponent("health server", logger, func() error { return healthSrv.StartListener(healthLn) })
+}
+
+// metricsServer owns the standalone Prometheus listener so shutdown can
+// close it gracefully. Nil when metrics is disabled.
+var metricsSrv *http.Server
+
+// startMetricsServer optionally serves minimal Prometheus counters. The bind
+// is pre-checked by preBindAll so a taken metrics port fails fast before the
+// ready log; here a late bind race only logs (metrics must never take down
+// serving traffic). Timeouts mirror the admin health server (5s read/write,
+// 60s idle); shutdown is graceful via Stop with the same 5s budget.
+func startMetricsServer(ctx context.Context, cfg *config.Config, torLifecycle *backend.TorLifecycle, authMw *auth.APIKeyAuth, logger *slog.Logger) {
 	if !cfg.Metrics.Enabled {
 		return
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(cfg.Metrics.Path, func(w http.ResponseWriter, r *http.Request) {
+		// Same per-request gate as the admin health handlers
+		// (health.go checkAuth): when auth is enabled the metrics port
+		// must not expose instance counts without a key. When auth is
+		// disabled (nil) the handler stays open — local-only behavior
+		// unchanged.
+		if authMw != nil && !authMw.Check(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintf(w, "# LANO local-relay metrics\n")
+		fmt.Fprintf(w, "lano_up 1\n")
+		if torLifecycle != nil {
+			fmt.Fprintf(w, "lano_tor_instances %d\n", torLifecycle.GetReadyCount())
+		}
+		// Both ports agree: the standalone port renders the same shared
+		// registry the health-port /metrics path serves (handleMetrics).
+		metrics.Default().Render(w)
+	})
+
+	metricsSrv = &http.Server{
+		Addr:         cfg.Metrics.Address,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
@@ -472,21 +808,31 @@ func startMetricsServer(_ context.Context, cfg *config.Config, torLifecycle *bac
 				logger.Error("Panic in metrics server", "error", r)
 			}
 		}()
-		mux := http.NewServeMux()
-		mux.HandleFunc(cfg.Metrics.Path, func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/plain")
-			fmt.Fprintf(w, "# LANO local-relay metrics\n")
-			fmt.Fprintf(w, "lano_up 1\n")
-			if torLifecycle != nil {
-				fmt.Fprintf(w, "lano_tor_instances %d\n", torLifecycle.GetReadyCount())
-			}
-		})
 
 		logger.Info("Prometheus metrics enabled", "path", cfg.Metrics.Path, "addr", cfg.Metrics.Address)
-		if err := http.ListenAndServe(cfg.Metrics.Address, mux); err != nil {
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("Metrics server failed", "error", err)
 		}
 	}()
+
+	// Context-scoped graceful shutdown (5s budget, same as the admin Stop
+	// path). Production wires main's signal ctx; shutdown() also stops the
+	// server explicitly for non-signal exits.
+	go func() {
+		<-ctx.Done()
+		stopMetricsServer()
+	}()
+}
+
+// stopMetricsServer gracefully shuts down the standalone metrics listener.
+// Nil-safe: disabled metrics leaves a nil server.
+func stopMetricsServer() {
+	if metricsSrv == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = metricsSrv.Shutdown(ctx)
 }
 
 // runComponent runs a blocking component, containing panics so one bad
@@ -516,6 +862,8 @@ func shutdown(logger *slog.Logger, rotator *rotate.Rotator, socks5Proxy *proxy.S
 	if err := httpProxy.Stop(shutdownCtx); err != nil {
 		logger.Error("HTTP proxy shutdown error", "error", err)
 	}
+
+	stopMetricsServer()
 
 	if torLifecycle != nil {
 		torLifecycle.ShutdownAll()

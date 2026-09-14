@@ -67,3 +67,19 @@ func containsStr(s, substr string) bool {
 	}
 	return false
 }
+
+// Regression (demonstration): userinfo credentials must not survive log
+// sanitization — absolute-form targets can carry user:password.
+func TestRegression_SanitizeURLRedactsUserinfo(t *testing.T) {
+	u, _ := url.Parse("http://user:hunter2@example.com/path?x=1")
+	got := sanitizeURL(u)
+	if contains(got, "hunter2") {
+		t.Errorf("sanitizeURL(%q) = %q; password must not appear in logs", u, got)
+	}
+	if contains(got, "user@") {
+		t.Errorf("sanitizeURL(%q) = %q; userinfo must be redacted", u, got)
+	}
+	if !contains(got, "example.com/path") {
+		t.Errorf("sanitizeURL(%q) = %q; host/path must survive redaction", u, got)
+	}
+}
