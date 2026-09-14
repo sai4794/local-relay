@@ -23,8 +23,8 @@ func TestPool_CheckoutCarriesEntryGeneration(t *testing.T) {
 		t.Fatal("expected pooled conn")
 	}
 	defer conn.Close()
-	if gen != 0 {
-		t.Fatalf("fresh-pool entry gen = %d, want 0 (no resetAll yet)", gen)
+	if gen != 1 {
+		t.Fatalf("fresh-pool entry gen = %d, want 1 (poolGen starts at 1; Gen 0 is the exempt unknown)", gen)
 	}
 
 	// Re-pool, rotate, then check out: entry stamped pre-bump must come

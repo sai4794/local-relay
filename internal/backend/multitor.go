@@ -493,6 +493,16 @@ func better(a, b candidateView) bool {
 // pickBest folds views into best-fresh / best-any / least-bad-excluded
 // winners with the freshness preference (fresh = no rotation within 5s).
 func (m *MultiTorBackend) pickBest(views []candidateView) (*TorInstance, int) {
+	got, idx, _ := m.pickBestEx(views)
+	return got, idx
+}
+
+// pickBestEx is pickBest with a third return reporting whether the winner
+// came from the excluded (least-bad quarantined) set — i.e. no clean
+// candidate won. The Po2 path uses it to decide whether a complement scan
+// outside the sample may find a clean winner; nil winners (all probes held)
+// report false.
+func (m *MultiTorBackend) pickBestEx(views []candidateView) (*TorInstance, int, bool) {
 	var bestFresh, bestAny, excludedFresh, excludedAny *candidateView
 	anyExcludedFresh := false
 	for i := range views {
@@ -530,10 +540,10 @@ func (m *MultiTorBackend) pickBest(views []candidateView) (*TorInstance, int) {
 		}
 	}
 	if bestFresh != nil {
-		return bestFresh.cand, bestFresh.idx
+		return bestFresh.cand, bestFresh.idx, false
 	}
 	if bestAny != nil {
-		return bestAny.cand, bestAny.idx
+		return bestAny.cand, bestAny.idx, false
 	}
 	// Every candidate excluded: serve the least-bad quarantined one
 	// rather than failing closed — but NEVER a probation-claimed probe
@@ -543,12 +553,12 @@ func (m *MultiTorBackend) pickBest(views []candidateView) (*TorInstance, int) {
 	// resolve the endpoints. Fresh-excluded wins when it exists to
 	// preserve the freshness preference.
 	if anyExcludedFresh {
-		return excludedFresh.cand, excludedFresh.idx
+		return excludedFresh.cand, excludedFresh.idx, true
 	}
 	if excludedAny != nil {
-		return excludedAny.cand, excludedAny.idx
+		return excludedAny.cand, excludedAny.idx, true
 	}
-	return nil, -1
+	return nil, -1, false
 }
 
 // selectInstanceWeighted is the full-scan least-effective-load selection.
@@ -569,8 +579,13 @@ func (m *MultiTorBackend) selectInstanceWeighted(ready []*TorInstance, _ []int) 
 // indexes and pickBest applies quarantine exclusion inside the sample —
 // same order of operations as the pool twin (which strides its eligible
 // list): a quarantined candidate inside the sample loses to a healthy one
-// inside the same sample. Cross-sample exclusion (healthy outside an
-// all-quarantined sample) still serves least-bad via the fallback.
+// inside the same sample. When the sample yields only an excluded
+// (least-bad quarantined) winner while candidates outside the sample may
+// be clean, the complement is scanned once for a clean winner: serving a
+// quarantined endpoint while an idle healthy one sits outside the sample
+// would send traffic to a known-sick endpoint inside its NEWNYM hold. A
+// whole-pool-excluded (or all-probes-held nil) result stands — the
+// fallback/closed semantics are unchanged.
 func (m *MultiTorBackend) selectInstancePo2(ready []*TorInstance) (*TorInstance, int) {
 	scored := m.scored.Load()
 	p := m.scoreParams
@@ -593,7 +608,60 @@ func (m *MultiTorBackend) selectInstancePo2(ready []*TorInstance) (*TorInstance,
 	for j := 0; j < k; j++ {
 		sample = append(sample, (base+j)%n)
 	}
-	return m.pickBest(m.viewCandidates(ready, p, sample))
+	got, idx, excludedFallback := m.pickBestEx(m.viewCandidates(ready, p, sample))
+	if !excludedFallback || len(sample) >= len(ready) {
+		return got, idx
+	}
+	// Sample all-excluded: clean candidates may sit outside it. Fast path:
+	// if NO outside candidate is even claim-free eligible, skip the
+	// complement scan entirely — the excluded fallback stands and no probe
+	// slot moves. Otherwise scan the complement once for a clean winner and
+	// serve it. The complement pass is the single claiming pass for those
+	// candidates (promotion + probe claim run inside isExcluded there), and
+	// the sample set is never re-viewed, so each candidate sees at most one
+	// side-effectful selection call per dial.
+	inSample := make(map[int]bool, len(sample))
+	for _, i := range sample {
+		inSample[i] = true
+	}
+	rest := make([]int, 0, len(ready)-len(sample))
+	anyEligible := false
+	for i := range ready {
+		if inSample[i] {
+			continue
+		}
+		rest = append(rest, i)
+		if !anyEligible && m.eligibleNoClaim(ready[i]) {
+			anyEligible = true
+		}
+	}
+	if !anyEligible {
+		return got, idx
+	}
+	if got2, idx2, fb2 := m.pickBestEx(m.viewCandidates(ready, p, rest)); got2 != nil && !fb2 {
+		return got2, idx2
+	}
+	return got, idx
+}
+
+// eligibleNoClaim is the side-effect-free twin of isExcluded: it reports
+// whether cand could serve WITHOUT promoting, claiming, or releasing
+// anything. The Po2 complement scan uses it as a fast path — when a clean
+// candidate sits outside an all-excluded sample, it is served via the normal
+// claiming pickBestEx over the complement (which performs the one true
+// claim). Probation reports ineligible here even when this caller could
+// claim: the complement scan must not guess slot ownership — the claiming
+// pass decides the single winner. Quarantined reports eligible only after
+// its hold expired (promotion happens in the claiming pass).
+func (m *MultiTorBackend) eligibleNoClaim(cand *TorInstance) bool {
+	switch cand.quar.State() {
+	case StateActive:
+		return true
+	case StateQuarantined:
+		return time.Now().UnixNano() >= cand.quar.quarantinedUntil.Load()
+	default:
+		return false
+	}
 }
 
 // isExcluded reports whether quarantine currently excludes cand from
@@ -751,6 +819,23 @@ func (m *MultiTorBackend) quarConfig() QuarantineConfig {
 // Active successes just clear consecutive failures via recordSuccess.
 func (m *MultiTorBackend) onEndpointSuccess(target *TorInstance) {
 	target.quar.recordSuccess()
+}
+
+// RenewProbe heartbeats a live probation probe claim: while a tunnel served
+// by this endpoint is provably alive (bytes flowing), the probe expiry
+// budget extends so a legitimate long tunnel is never mistaken for a wedged
+// holder and stolen mid-stream. Gen-gated like ReportOutcome (stale gens
+// drop); unknown IDs drop; renewProbe no-ops unless the endpoint is in
+// Probation with the slot actually held, so all other traffic is identical.
+func (m *MultiTorBackend) RenewProbe(id int, gen int64) bool {
+	target := m.getInstanceByID(id)
+	if target == nil {
+		return false
+	}
+	if gen != 0 && gen != target.CircuitGen() {
+		return false
+	}
+	return target.quar.renewProbe(time.Now())
 }
 
 // onEndpointFailure drives quarantine entry and probation resolution:

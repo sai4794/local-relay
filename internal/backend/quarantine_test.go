@@ -473,3 +473,66 @@ func TestQuarantine_AllProbationClaimedFailsClosed(t *testing.T) {
 		t.Fatalf("all-probation-claimed selection = %d; want nil (fail-closed, no herd)", got.ID)
 	}
 }
+
+// Po2 complement rescan: with k=2 over [sick-quarantined x2, healthy], an
+// all-excluded sample must not serve the quarantined loser while a healthy
+// candidate sits outside the sample. Pre-fix the sample fallback served
+// least-bad quarantined without looking outside it.
+func TestSelect_Po2ExcludedSampleRescansComplement(t *testing.T) {
+	var m *MultiTorBackend
+	insts := selectTestLifecycle(t, &m)
+	p := DefaultScoreParams()
+	m.SetScoreParams(p)
+	m.SetQuarantineConfig(QuarantineConfig{AfterFails: 3, Duration: time.Hour, MaxDuration: time.Hour, Probes: 1})
+	m.SetSelection("po2", 2)
+	// Quarantine instances 1 and 2 directly with long holds (no NEWNYM
+	// wiring needed — selectTestLifecycle uses no control port).
+	now := time.Now()
+	for _, inst := range insts[:2] {
+		if _, entered := inst.quar.enterQuarantine(now, time.Hour, time.Hour); !entered {
+			t.Fatalf("setup: enterQuarantine failed for inst %d", inst.ID)
+		}
+	}
+	// Every dial must serve the healthy instance 3, regardless of window.
+	for i := 0; i < 12; i++ {
+		got, _ := m.selectInstance(insts)
+		if got == nil {
+			t.Fatalf("dial %d: selection = nil; want healthy 3 (complement rescan)", i)
+		}
+		if got.ID != 3 {
+			t.Fatalf("dial %d: selection = %d; want 3 (healthy outside excluded sample)", i, got.ID)
+		}
+	}
+}
+
+// Complement fast path: when the whole pool is excluded (all quarantined
+// with active holds), the Po2 all-excluded sample must stand on its
+// least-bad fallback WITHOUT promoting, claiming, or releasing anything —
+// the fast path skips the complement scan, so no probe slot moves.
+func TestSelect_Po2AllExcludedNoSideEffects(t *testing.T) {
+	var m *MultiTorBackend
+	insts := selectTestLifecycle(t, &m)
+	m.SetScoreParams(DefaultScoreParams())
+	m.SetQuarantineConfig(QuarantineConfig{AfterFails: 3, Duration: time.Hour, MaxDuration: time.Hour, Probes: 1})
+	m.SetSelection("po2", 2)
+	now := time.Now()
+	for _, inst := range insts {
+		if _, entered := inst.quar.enterQuarantine(now, time.Hour, time.Hour); !entered {
+			t.Fatalf("setup: enterQuarantine failed for inst %d", inst.ID)
+		}
+	}
+	got, _ := m.selectInstance(insts)
+	if got == nil {
+		t.Fatal("all-excluded selection = nil; want least-bad fallback")
+	}
+	// No side effects: every instance still Quarantined with an active hold,
+	// nothing promoted to Probation, no probe claimed.
+	for _, inst := range insts {
+		if st := inst.QuarantineState(); st != StateQuarantined {
+			t.Fatalf("inst %d state = %v after all-excluded pick; want quarantined (no promotion)", inst.ID, st)
+		}
+		if inst.quar.probeInFlight.Load() {
+			t.Fatalf("inst %d probe claimed during all-excluded pick; want untouched", inst.ID)
+		}
+	}
+}

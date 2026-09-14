@@ -170,9 +170,7 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		if p.rotator != nil && isDialFailureErr(err) {
 			p.logger.Warn("CONNECT dial failure, triggering rotation", "host", host)
 			p.rotator.ForceRotate()
-			if p.router != nil {
-				p.router.ReportAnomaly(-1)
-			}
+			reportAnomalyForTor(p.router, hostOnly, &claim)
 		}
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
@@ -224,6 +222,16 @@ func (p *HTTPProxy) relayConn(host string, destConn, clientConn net.Conn, claim 
 	relayCtx, relayCancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer relayCancel()
 
+	// Heartbeat the serving probe claim while the tunnel lives: a
+	// probation probe serving a long stream (LLM completion, download)
+	// would otherwise outlive the probe expiry budget (2x base, min 60s)
+	// and be stolen mid-tunnel by releaseStaleProbe. No-op (nil) unless
+	// the claim is probe-eligible; the relay ctx bounds the goroutine.
+	stopHeartbeat := startProbeHeartbeat(relayCtx, p.router, claim)
+	if stopHeartbeat != nil {
+		defer stopHeartbeat()
+	}
+
 	start := time.Now()
 	clientToUpstream, upstreamToClient := stream.Relay(relayCtx, destConn, clientConn)
 
@@ -231,7 +239,7 @@ func (p *HTTPProxy) relayConn(host string, destConn, clientConn net.Conn, claim 
 		if upstreamToClient == 0 {
 			p.logger.Warn("dead tunnel detected (no bytes returned), triggering rotation",
 				"host", host, "duration", elapsed, "client_sent", clientToUpstream)
-			p.rotateForDeadTunnel()
+			p.rotateForDeadTunnel(host, claim)
 			reportOutcome(p.router, claim, false, 0, clientToUpstream, upstreamToClient)
 		} else {
 			p.logger.Debug("short tunnel completed with data — no rotation",
@@ -248,7 +256,10 @@ func (p *HTTPProxy) relayConn(host string, destConn, clientConn net.Conn, claim 
 
 const (
 	// deadTunnelWindow bounds how long after tunnel start a zero-byte close is
-	// still attributed to a dead pooled connection.
+	// still attributed to a dead pooled connection. Shared by the HTTP
+	// relayConn and SOCKS5 post-tunnel paths (same package): both classify
+	// zero-byte short tunnels identically, so the threshold must stay one
+	// const, never two literals that can drift.
 	deadTunnelWindow = 2 * time.Second
 
 	// responseHeaderTimeout caps waiting for upstream response headers.
@@ -259,11 +270,16 @@ const (
 	responseHeaderTimeout = 120 * time.Second
 )
 
-func (p *HTTPProxy) rotateForDeadTunnel() {
+func (p *HTTPProxy) rotateForDeadTunnel(host string, claim *backend.EndpointClaim) {
 	if p.rotator != nil {
 		p.rotator.ForceRotate()
 	}
-	p.router.ReportAnomaly(-1)
+	// Nil-router safe AND bypass-safe: reportAnomalyForTor drops nil
+	// routers (sibling sites all nil-guard) and direct claims (a dead
+	// bypass tunnel proves nothing about Tor exits). Previously a bare
+	// ReportAnomaly(-1) with no nil check — a nil-router dead tunnel
+	// panicked inside Router.ReportAnomaly.
+	reportAnomalyForTor(p.router, stripSchemeAndPath(host), claim)
 }
 
 // singleLookupVerdict runs the firewall guard once (the single shared
@@ -664,7 +680,9 @@ retryLoop:
 			// attributed sample for this client request (see the final-429
 			// branch). Reporting a failure sample per attempt would let one
 			// transient blip trip quarantine_after_fails alone.
-			p.router.ReportAnomaly(-1)
+			// Dial failed: claim unfilled, so the host fallback inside
+			// decides (bypass hosts skip — direct failures never churn Tor).
+			reportAnomalyForTor(p.router, r.URL.Hostname(), &claim)
 			select {
 			case <-time.After(retryDelay(attempt)):
 			case <-r.Context().Done():
@@ -675,8 +693,7 @@ retryLoop:
 
 		// Got response – check for rate-limit that should trigger retry on fresh exit
 		isSSEtmp := stream.HasSSEContentType(resp.Header)
-		if !isSSEtmp && (resp.StatusCode == http.StatusTooManyRequests ||
-			resp.StatusCode == http.StatusServiceUnavailable) {
+		if !isSSEtmp && !claimSuccess(resp.StatusCode) {
 			if attempt < maxUpstreamAttempts && bodyRetryable(bodyOverCap) && r.Context().Err() == nil {
 				p.logger.Warn("rate-limit detected, rotating exit and retrying",
 					"status", resp.StatusCode,
@@ -686,8 +703,11 @@ retryLoop:
 				)
 				resp.Body.Close()
 				// Rotation-only (see connect-phase branch): the terminal
-				// attempt carries the single attributed sample.
-				p.router.ReportAnomaly(-1)
+				// attempt carries the single attributed sample. 429s arrive
+				// over Tor here (bypass 429s fail the dial first and never
+				// reach a proxied response), but the claim gate is the
+				// cheapest correct check — direct claims skip.
+				reportAnomalyForTor(p.router, r.URL.Hostname(), &claim)
 				select {
 				case <-time.After(retryDelay(attempt)):
 				case <-r.Context().Done():
@@ -706,14 +726,15 @@ retryLoop:
 				"status", resp.StatusCode,
 				"url", sanitizeURL(r.URL),
 			)
-			p.router.ReportAnomaly(-1)
+			reportAnomalyForTor(p.router, r.URL.Hostname(), &claim)
 			reportOutcome(p.router, &claim, false, resp.StatusCode, 0, 0)
 		} else if !isSSEtmp {
-			// Non-SSE terminal response: any non-429/503 status proves the
-			// circuit works (other 4xx/5xx are upstream verdicts, not dead
-			// circuits) — the missing success path. SSE success is recorded
-			// after forwardResponse returns (stream completed).
-			reportOutcome(p.router, &claim, resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusServiceUnavailable, resp.StatusCode, 0, 0)
+			// Non-SSE terminal response: claimSuccess proves the circuit
+			// works for any non-429/503 status (other 4xx/5xx are upstream
+			// verdicts, not dead circuits) — the missing success path. SSE
+			// success is recorded after forwardResponse returns (stream
+			// completed).
+			reportOutcome(p.router, &claim, claimSuccess(resp.StatusCode), resp.StatusCode, 0, 0)
 		}
 		break
 	}
@@ -729,11 +750,17 @@ retryLoop:
 
 	isSSE := stream.HasSSEContentType(resp.Header)
 
+	// Same probe-steal hazard as relayConn: an SSE token stream can outlive
+	// the probe expiry budget, so heartbeat the claim across forwardResponse.
+	stopHeartbeat := startProbeHeartbeat(r.Context(), p.router, &claim)
+	if stopHeartbeat != nil {
+		defer stopHeartbeat()
+	}
 	p.forwardResponse(w, resp, isSSE)
 	if isSSE {
 		// SSE stream completed: survival proves the circuit works. 429/503
 		// SSE stays excluded (gated above, same as the retry path).
-		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusServiceUnavailable {
+		if claimSuccess(resp.StatusCode) {
 			reportOutcome(p.router, &claim, true, resp.StatusCode, 0, 0)
 		}
 	}
@@ -1041,16 +1068,34 @@ func (p *HTTPProxy) isWaiverHost(host string) bool {
 // so octal/hex/integer/short/trailing-dot spellings (0177.0.0.1,
 // 2130706433, 127.1, 0x7f.0.0.1, 127.0.0.1.) match their canonical form.
 // An unspecified target (0.0.0.0 or ::) dials this host's own stack, so it
-// counts as loopback on the target side too; portless targets still return
-// false (no port, no socket identity to compare).
+// counts as loopback on the target side too; portless targets assume the
+// scheme default (:80 http, :443 https — the dial planet the target will
+// actually reach), so a waived portless "localhost" against a :80 listen
+// still trips instead of silently dialing self.
+//
+// LAN self-dial (e.g. 192.168.x.x:port against a 0.0.0.0:port listener) is
+// NOT matched here by design; it is denied by the firewall/SSRF blocked
+// ranges (10/8, 172.16/12, 192.168/16, link-local) — do not add LAN hosts to
+// bypass.hosts when listening unspecified on the same port.
 func (p *HTTPProxy) isSelfDial(target string) bool {
 	addr, _ := p.listenAddr.Load().(string)
 	if addr == "" {
 		return false
 	}
-	tHost, tPort, err := net.SplitHostPort(target)
+	// SplitHostPort misparses absolute-form URLs ("http://localhost/path"
+	// splits as host="http"), so detect portless up front: strip
+	// scheme/path from the RAW target first; if that yields host:port,
+	// split it, else it is a bare host with an implicit scheme port.
+	stripped := stripSchemeAndPath(target)
+	tHost, tPort, err := net.SplitHostPort(stripped)
 	if err != nil {
-		tHost, tPort = target, ""
+		tHost = stripped
+		tPort = ""
+	}
+	if tPort == "" {
+		// Implicit-port target: the dial will use the scheme default, so
+		// compare against that (CONNECT callers already default :443).
+		tPort = defaultPortForTarget(target)
 	}
 	lHost, lPort, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1075,12 +1120,52 @@ func (p *HTTPProxy) isSelfDial(target string) bool {
 	return tLoop && lLoop
 }
 
+// stripSchemeAndPath reduces an absolute-form URL (or bare host) to its
+// hostname: "http://localhost/path" -> "localhost", "localhost" stays.
+// Query/fragment never reach isSelfDial (r.URL.Host), but tolerate them.
+func stripSchemeAndPath(target string) string {
+	if i := strings.Index(target, "://"); i >= 0 {
+		target = target[i+3:]
+	}
+	if i := strings.IndexAny(target, "/?#"); i >= 0 {
+		target = target[:i]
+	}
+	return target
+}
+
+// defaultPortForTarget maps a portless target to the port its dial will
+// actually use: https:// targets dial :443, everything else (http://,
+// bare hosts) dials :80. Callers that already defaulted (CONNECT :443)
+// never reach here with tPort == "".
+func defaultPortForTarget(target string) string {
+	rest := strings.ToLower(target)
+	if i := strings.Index(rest, "://"); i > 0 {
+		rest = rest[:i]
+	} else {
+		return "80"
+	}
+	if rest == "https" {
+		return "443"
+	}
+	return "80"
+}
+
 // isUnspecifiedHost reports whether h is the IPv4 or IPv6 unspecified
 // address (0.0.0.0 or ::, bracketed or bare): a listener bound there
-// accepts traffic on every local interface, including loopback.
+// accepts traffic on every local interface, including loopback. Canonical,
+// like isLoopbackHost: numeric spellings dialers interpret ("0",
+// "0x0.0.0.0") match via the shared security.CanonicalizeIP parser.
+// IPv6 zone IDs (fe80::1%eth0) never match here — looksNumericHost +
+// parseNumericIP reject them deterministically in both guards, so no
+// separate zone handling is needed.
 func isUnspecifiedHost(h string) bool {
-	ip := net.ParseIP(strings.Trim(h, "[]"))
-	return ip != nil && ip.IsUnspecified()
+	if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil {
+		return ip.IsUnspecified()
+	}
+	if ip := security.CanonicalizeIP(h); ip != nil {
+		return ip.IsUnspecified()
+	}
+	return false
 }
 
 // isLoopbackHost reports whether h is a loopback address in any accepted

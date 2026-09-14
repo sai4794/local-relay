@@ -105,6 +105,15 @@ type OutcomeReporter interface {
 	ReportOutcome(Outcome)
 }
 
+// RenewReporter is the optional heartbeat twin of OutcomeReporter: backends
+// that hold a probation probe claim across a long-lived tunnel renew the
+// claim's expiry budget while the tunnel is provably alive (bytes flowing).
+// Like ReportOutcome it must be non-blocking, gen-gated (stale gens drop),
+// and never panic on unknown IDs.
+type RenewReporter interface {
+	RenewProbe(id int, gen int64) bool
+}
+
 // EndpointFromConn walks the Unwrap() net.Conn chain exactly like TuneTCP
 // (tcp.go) and returns the serving endpoint's ID, generation, and dial
 // latency when the chain bottoms out at a scored wrapper (inFlightConn or

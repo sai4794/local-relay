@@ -231,6 +231,18 @@ func (r *Router) ReportOutcome(o Outcome) {
 	}
 }
 
+// RenewProbe fans a probe heartbeat out to every proxied backend
+// implementing RenewReporter. Backends self-filter by ID/gen (unknown IDs
+// and stale gens drop), so fan-out is safe with multiple backends —
+// mirroring ReportOutcome. Backends without the interface are skipped.
+func (r *Router) RenewProbe(id int, gen int64) {
+	for _, b := range r.backends {
+		if rr, ok := b.(RenewReporter); ok {
+			rr.RenewProbe(id, gen)
+		}
+	}
+}
+
 // HasAnomalyReporter reports whether dial-failure anomaly signals are
 // handled by a backend. With a single proxied backend it reports whether
 // that backend implements AnomalyReporter; with multiple backends it

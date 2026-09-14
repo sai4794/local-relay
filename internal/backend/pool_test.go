@@ -339,6 +339,10 @@ func TestPooledConnWrap_ReturnsOnClose(t *testing.T) {
 		pool:    pool,
 		slotIdx: 0,
 		addr:    "example.com:443",
+		// Fresh-pool live gen is 1 (poolGen starts at 1; Gen 0 is the
+		// exempt unknown). A zero gen here would trip the staleness gate
+		// and close instead of re-pooling.
+		gen: pool.poolGen.Load(),
 	}
 
 	pool.connPoolMu.Lock()
@@ -508,6 +512,7 @@ func BenchmarkPooledConnWrapClose(b *testing.B) {
 			pool:    pool,
 			slotIdx: 0,
 			addr:    "example.com:443",
+			gen:     pool.poolGen.Load(),
 		}
 		wrap.Close()
 	}

@@ -233,7 +233,11 @@ func TestRegression_SelfDialUnspecifiedBind(t *testing.T) {
 			"127.1:" + port,      // short-form loopback
 			"0x7f.0.0.1:" + port, // hex loopback
 			"127.0.0.1.:" + port, // trailing-dot loopback
+			"LOCALHOST:" + port,  // case-insensitive alias
+			"localhost.:" + port, // trailing-dot alias
+			"[::1]:" + port,      // bracketed loopback (bracketed form only; bare ::1 needs brackets to split host/port)
 			"[::]:" + port,       // unspecified target dials local stack
+			"0:" + port,          // canonical unspecified ("0" = 0.0.0.0)
 		} {
 			if !p.isSelfDial(target) {
 				t.Errorf("isSelfDial(%q) with listen %q = false; want true", target, listen)
@@ -255,5 +259,37 @@ func TestRegression_SelfDialUnspecifiedBind(t *testing.T) {
 		if !p.isSelfDial(target) {
 			t.Errorf("isSelfDial(%q) with loopback listen = false; want true (unspecified target dials local)", target)
 		}
+	}
+}
+
+// Portless implicit-port self-dial: a waived portless "localhost" target
+// dials the scheme default (:80 http / :443 https), so against a listen on
+// that same port it IS self-dial. Pre-fix tPort=="" always returned false.
+func TestRegression_SelfDialPortlessImplicitPort(t *testing.T) {
+	router := backend.NewRouter(backend.NewDirectBackend(2 * time.Second))
+	p := testHTTPProxy(t, router)
+	// :80 listen: portless http/localhost targets dial :80 = self.
+	p.listenAddr.Store(net.JoinHostPort("127.0.0.1", "80"))
+	for _, target := range []string{
+		"localhost",
+		"http://localhost/path",
+		"127.0.0.1",
+	} {
+		if !p.isSelfDial(target) {
+			t.Errorf("isSelfDial(%q) with :80 listen = false; want true (implicit :80)", target)
+		}
+	}
+	if p.isSelfDial("https://localhost/path") {
+		t.Error("isSelfDial(https://localhost) with :80 listen = true; want false (implicit :443)")
+	}
+	// :443 listen: portless https targets dial :443 = self.
+	p.listenAddr.Store(net.JoinHostPort("127.0.0.1", "443"))
+	if !p.isSelfDial("https://localhost/path") {
+		t.Error("isSelfDial(https://localhost) with :443 listen = false; want true (implicit :443)")
+	}
+	// :18080 listen (production shape): portless targets dial :80, not self.
+	p.listenAddr.Store(net.JoinHostPort("127.0.0.1", "18080"))
+	if p.isSelfDial("localhost") {
+		t.Error("isSelfDial(localhost) with :18080 listen = true; want false (implicit :80 != :18080)")
 	}
 }

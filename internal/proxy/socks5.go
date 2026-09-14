@@ -347,10 +347,9 @@ func (p *SOCKS5Proxy) handleConnect(conn net.Conn, target string) {
 			// Close the SOCKS5 anomaly gap: route dial-failure signals
 			// to the backend anomaly path as well (HTTP does this via
 			// ReportAnomaly in its retry/rotation paths). The ForceRotate
-			// trigger above is unchanged.
-			if p.router != nil {
-				p.router.ReportAnomaly(-1)
-			}
+			// trigger above is unchanged. Dial failed: claim unfilled, so
+			// the host fallback decides (bypass targets skip).
+			reportAnomalyForTor(p.router, host, &claim)
 		}
 		p.sendReply(conn, 0x05, nil)
 		return
@@ -385,20 +384,29 @@ func (p *SOCKS5Proxy) handleConnect(conn net.Conn, target string) {
 		p.logger.Debug("SOCKS5 tunnel open past 30m (HTTP parity window)", "target", target, "open_for", time.Since(tunnelStart).String())
 	})
 
-	// Use relayCtx so client disconnect cancels the relay
+	// Use relayCtx so client disconnect cancels the relay. Heartbeat the
+	// serving probe claim across the tunnel (same probe-steal hazard as
+	// HTTP relayConn: SOCKS tunnels have no kill timeout, so a long stream
+	// would outlive the probe budget without renewal).
+	stopHeartbeat := startProbeHeartbeat(relayCtx, p.router, &claim)
+	if stopHeartbeat != nil {
+		defer stopHeartbeat()
+	}
 	up, down := stream.Relay(relayCtx, destConn, conn)
 	longTunnel.Stop()
 	// Parity with HTTP dead-tunnel (relayConn + rotateForDeadTunnel): a
 	// zero-byte short tunnel is a dead pooled tunnel — rotate so the next
 	// dial picks fresh, and report the failure sample. Anything with bytes
 	// (or surviving >= 2s) proves the circuit works.
-	if down == 0 && time.Since(tunnelStart) < 2*time.Second {
+	if down == 0 && time.Since(tunnelStart) < deadTunnelWindow {
 		p.logger.Warn("SOCKS5 dead tunnel detected (no bytes returned), triggering rotation", "target", target)
 		if p.rotator != nil {
 			p.rotator.ForceRotate()
 		}
 		if p.router != nil {
-			p.router.ReportAnomaly(-1)
+			// Tunnel served (claim filled): direct claims skip; the
+			// host fallback only matters for unfilled claims.
+			reportAnomalyForTor(p.router, host, &claim)
 		}
 		reportOutcome(p.router, &claim, false, 0, up, down)
 	} else {
@@ -446,9 +454,12 @@ func (p *SOCKS5Proxy) singleLookupVerdict(host string) ([]net.IP, bool) {
 // same port number. Unspecified counts on BOTH sides (a 0.0.0.0/:: target
 // dials the local stack). "localhost" normalizes to loopback: it has no
 // ParseIP form, so it is treated as loopback explicitly on both sides.
+// SOCKS5 targets always carry a port (ATYP framing), so unlike HTTP there
+// is no implicit-port branch — portless input fails closed below.
 // Unknown listen address (never started, e.g. unit-constructed proxies)
 // returns false. Fail-closed: a match means handleConnect replies 0x01 and
-// returns without tunneling.
+// returns without tunneling. LAN self-dial is denied by the firewall/SSRF
+// blocked ranges, not here — same division as HTTP (see HTTPProxy.isSelfDial).
 func (p *SOCKS5Proxy) isSelfDial(target string) bool {
 	addr, _ := p.listenAddr.Load().(string)
 	if addr == "" {

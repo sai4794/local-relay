@@ -318,3 +318,79 @@ func TestSOCKS5_RotationCountPurity(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// SOCKS5 unspecified-bind parity mirror of
+// TestRegression_SelfDialUnspecifiedBind (HTTP): a listener on the
+// unspecified address accepts loopback traffic on its port, so loopback and
+// unspecified targets on the same port are self-dial and must fail closed
+// with 0x01. SOCKS5 targets always carry a port (ATYP framing), so there is
+// no implicit-port branch to mirror — unit-level predicate coverage plus
+// one live unspecified-listen CONNECT asserting 0x01.
+func TestSOCKS5_SelfDialUnspecifiedBind(t *testing.T) {
+	router := backend.NewRouter(backend.NewDirectBackend(2 * time.Second))
+	router.SetBypassHosts([]string{"localhost", "127.0.0.1"})
+	p := testSOCKS5Proxy(t, router)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, listen := range []string{
+		net.JoinHostPort("0.0.0.0", port),
+		net.JoinHostPort("::", port),
+		net.JoinHostPort("127.0.0.1", port),
+	} {
+		p.listenAddr.Store(listen)
+		for _, target := range []string{
+			net.JoinHostPort("127.0.0.1", port),
+			net.JoinHostPort("localhost", port),
+			net.JoinHostPort("0.0.0.0", port),
+			"0177.0.0.1:" + port,
+			"2130706433:" + port,
+			"[::]:" + port,
+		} {
+			if !p.isSelfDial(target) {
+				t.Errorf("SOCKS5 isSelfDial(%q) with listen %q = false; want true", target, listen)
+			}
+		}
+		if external := net.JoinHostPort("93.184.216.34", port); p.isSelfDial(external) {
+			t.Errorf("SOCKS5 isSelfDial(%q) with listen %q = true; want false (public never self)", external, listen)
+		}
+	}
+}
+
+// Live end-to-end: proxy listening on 127.0.0.1, CONNECT to the unspecified
+// address on the same port must fail closed 0x01 (unspecified target dials
+// the local stack).
+func TestSOCKS5_SelfDialUnspecifiedLive(t *testing.T) {
+	router := backend.NewRouter(backend.NewDirectBackend(2 * time.Second))
+	router.SetBypassHosts([]string{"localhost", "127.0.0.1"})
+	p := testSOCKS5Proxy(t, router)
+	addr := startSOCKS5TestProxy(t, p)
+	p.listenAddr.Store(addr)
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := socks5Dial(t, addr)
+	socks5Greet(t, c)
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	target := net.JoinHostPort("0.0.0.0", port)
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4 := net.ParseIP(host).To4()
+	hi, lo := portToBytes(portStr)
+	req := []byte{0x05, 0x01, 0x00, 0x01, v4[0], v4[1], v4[2], v4[3], hi, lo}
+	if _, err := c.Write(req); err != nil {
+		t.Fatalf("connect write: %v", err)
+	}
+	if got := socks5ReadReply(t, c); got != 0x01 {
+		t.Errorf("reply = 0x%02x; want 0x01 (unspecified self-dial must fail closed)", got)
+	}
+}
