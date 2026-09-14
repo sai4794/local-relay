@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"strings"
+
 	"github.com/local-relay/proxy/internal/backend"
 )
 
@@ -50,4 +52,26 @@ func claimOutcome(claim *backend.EndpointClaim, status int) (backend.Outcome, bo
 	}
 	o.Success = status != 429 && status != 503
 	return o, true
+}
+
+// isDialFailureErr reports whether a dial error smells like a dead circuit
+// (timeout/refused/reset/exhausted) rather than a client-side error (bad
+// host, blocked target). Shared by the HTTP CONNECT and SOCKS5 dial-failure
+// rotation gates so both front-ends churn on the same signals.
+func isDialFailureErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, marker := range []string{
+		"timeout",
+		"connection refused",
+		"connection reset",
+		"no healthy proxy",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }

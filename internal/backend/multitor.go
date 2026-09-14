@@ -40,6 +40,10 @@ type MultiTorBackend struct {
 	// steering, and the kill-switch (pool.enabled:false) only disables
 	// quality ordering, never health exclusion.
 	quarCfg QuarantineConfig
+	// rotateInflight coalesces concurrent ReportAnomaly rotation triggers
+	// onto one in-flight goroutine (pool-path nymInflight equivalent):
+	// the winner's rotation covers the losers' 10s window.
+	rotateInflight atomic.Bool
 	// everServed tracks whether any DialContext has served traffic yet.
 	// A cold backend (nothing ever served) has no culprit to attribute a
 	// ReportAnomaly(-1) to, so the rotation runs WITHOUT the
@@ -867,6 +871,15 @@ func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
 		m.logf("multi-tor: cold backend (nothing ever served), skipping NEWNYM dispatch for pre-serve anomaly")
 		return
 	}
+	// Coalescing gate: at most one rotation goroutine in flight per backend.
+	// Without it every 429/503 in a storm spawns a goroutine that only then
+	// loses the 10s cooldown race inside requestNewCircuitResult — spawn
+	// churn proportional to failure RPS. The pool path already gates via
+	// nymInflight (anomalyNEWNYM); this is the multitor equivalent. Losers
+	// skip silently: the winner's rotation covers them (same 10s window).
+	if !m.rotateInflight.CompareAndSwap(false, true) {
+		return
+	}
 	// Fire-and-forget: the request path must not block on control-port I/O
 	// (TCP connect + AUTH + NEWNYM round-trips). Rotation ordering is still
 	// safe — requestNewCircuitResult claims the 10s cooldown atomically, so
@@ -874,6 +887,7 @@ func (m *MultiTorBackend) ReportAnomaly(slotIdx int) {
 	// ErrNymCooldown. ResetRequests/OnRotate run only when this trigger
 	// actually won the rotation.
 	go func(t *TorInstance) {
+		defer m.rotateInflight.Store(false)
 		if rotated, err := m.lifecycle.requestNewCircuitResult(t); err != nil {
 			m.logf("multi-tor: NEWNYM failed for instance %d: %v", t.ID, err)
 		} else if rotated {

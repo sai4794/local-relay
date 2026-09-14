@@ -31,3 +31,18 @@ func TestTorBackend_ConsecutiveDialGate(t *testing.T) {
 		t.Fatal("healthy after 3 consecutive dial failures; want unhealthy")
 	}
 }
+
+// RequestNewCircuit honors the 10s NEWNYM cooldown like the anomaly path:
+// a second call inside the window returns ErrNymCooldown without control
+// I/O; failures refund so the next attempt may proceed.
+func TestTorBackend_RequestNewCircuitCooldown(t *testing.T) {
+	b := NewTorBackend(TorConfig{Address: "127.0.0.1:1", ControlAddr: "127.0.0.1:1", Timeout: time.Second})
+	// Control port closed: first call fails with dial error (not cooldown)
+	// and refunds; second call must also attempt (not cooldown-skip).
+	if err := b.RequestNewCircuit(); err == nil {
+		t.Fatal("expected control dial failure, got nil")
+	}
+	if err := b.RequestNewCircuit(); err == nil {
+		t.Fatal("expected control dial failure on retry, got nil (cooldown was not refunded)")
+	}
+}

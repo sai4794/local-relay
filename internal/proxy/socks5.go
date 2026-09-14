@@ -341,21 +341,15 @@ func (p *SOCKS5Proxy) handleConnect(conn net.Conn, target string) {
 		// previously SOCKS5 dial failures reported nothing when rotator
 		// was nil). Legacy classifier + ForceRotate below unchanged.
 		reportOutcome(p.router, &claim, false, 0, 0, 0)
-		if p.rotator != nil {
-			errStr := err.Error()
-			if strings.Contains(errStr, "timeout") ||
-				strings.Contains(errStr, "connection refused") ||
-				strings.Contains(errStr, "connection reset") ||
-				strings.Contains(errStr, "no healthy proxy") {
-				p.logger.Warn("SOCKS5 dial failure, triggering rotation", "target", target)
-				p.rotator.ForceRotate()
-				// Close the SOCKS5 anomaly gap: route dial-failure signals
-				// to the backend anomaly path as well (HTTP does this via
-				// ReportAnomaly in its retry/rotation paths). The ForceRotate
-				// trigger above is unchanged.
-				if p.router != nil {
-					p.router.ReportAnomaly(-1)
-				}
+		if p.rotator != nil && isDialFailureErr(err) {
+			p.logger.Warn("SOCKS5 dial failure, triggering rotation", "target", target)
+			p.rotator.ForceRotate()
+			// Close the SOCKS5 anomaly gap: route dial-failure signals
+			// to the backend anomaly path as well (HTTP does this via
+			// ReportAnomaly in its retry/rotation paths). The ForceRotate
+			// trigger above is unchanged.
+			if p.router != nil {
+				p.router.ReportAnomaly(-1)
 			}
 		}
 		p.sendReply(conn, 0x05, nil)
@@ -394,9 +388,18 @@ func (p *SOCKS5Proxy) handleConnect(conn net.Conn, target string) {
 	// Use relayCtx so client disconnect cancels the relay
 	up, down := stream.Relay(relayCtx, destConn, conn)
 	longTunnel.Stop()
-	// Parity with HTTP dead-tunnel: zero-byte short tunnel is a failure,
-	// anything with bytes (or surviving >= 2s) proves the circuit works.
+	// Parity with HTTP dead-tunnel (relayConn + rotateForDeadTunnel): a
+	// zero-byte short tunnel is a dead pooled tunnel — rotate so the next
+	// dial picks fresh, and report the failure sample. Anything with bytes
+	// (or surviving >= 2s) proves the circuit works.
 	if down == 0 && time.Since(tunnelStart) < 2*time.Second {
+		p.logger.Warn("SOCKS5 dead tunnel detected (no bytes returned), triggering rotation", "target", target)
+		if p.rotator != nil {
+			p.rotator.ForceRotate()
+		}
+		if p.router != nil {
+			p.router.ReportAnomaly(-1)
+		}
 		reportOutcome(p.router, &claim, false, 0, up, down)
 	} else {
 		reportOutcome(p.router, &claim, true, 0, up, down)

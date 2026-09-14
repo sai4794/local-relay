@@ -105,15 +105,36 @@ func (t *TorBackend) DialContext(ctx context.Context, network, addr string) (net
 
 // RequestNewCircuit signals NEWNYM over the control port, replacing the
 // current circuit with a fresh one (new exit IP, subject to Tor's guard
-// rotation policy).
+// rotation policy). Tor rate-limits NEWNYM natively (~10s), so the same
+// 10s cooldown as the anomaly path applies here: without it the
+// request-count rotator (every N requests) would issue back-to-back
+// signals that Tor rejects or throttles.
 func (t *TorBackend) RequestNewCircuit() error {
+	t.mu.RLock()
+	if time.Since(t.lastRotate) < 10*time.Second {
+		t.mu.RUnlock()
+		return ErrNymCooldown
+	}
+	t.mu.RUnlock()
+	t.mu.Lock()
+	if time.Since(t.lastRotate) < 10*time.Second {
+		t.mu.Unlock()
+		return ErrNymCooldown
+	}
+	t.lastRotate = time.Now()
+	t.mu.Unlock()
+
 	if err := t.control.SignalNEWNYM(false); err != nil {
+		t.mu.Lock()
+		if time.Since(t.lastRotate) < 10*time.Second {
+			t.lastRotate = time.Time{}
+		}
+		t.mu.Unlock()
 		return err
 	}
 
 	t.mu.Lock()
 	t.circuitAge = 0
-	t.lastRotate = time.Now()
 	t.mu.Unlock()
 
 	return nil

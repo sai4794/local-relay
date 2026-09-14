@@ -245,19 +245,19 @@ func (p *CircuitPoolBackend) recordDialSuccess(slot *CircuitSlot, idx int) {
 
 // ReportAnomaly marks a slot as having a rate-limit anomaly.
 // Triggers a rate-limited NEWNYM when threshold is exceeded.
-// A slotIdx of -1 (or out of range) means "unknown slot": the most recently
-// served slot (tracked via lastSlot) is used when valid. With no serving
-// history (cold backend, lastSlot==-1) the rate-limited NEWNYM is still
-// dispatched but WITHOUT marking a random slot unhealthy and WITHOUT the
-// ResetRequests+OnRotate churn — there is no culprit to attribute yet.
+// A slotIdx of -1 (or out of range) means "unknown slot": the signal is
+// unattributed — dispatch the rate-limited NEWNYM WITHOUT marking any slot
+// unhealthy. The old lastSlot-guess fallback is gone: lastSlot is a global
+// last-writer-wins register, and under concurrency it attributes to the
+// most recent dialer instead of the failed request's slot, churning an
+// innocent slot (with maxAnomaly=2, two concurrent failures kill it) while
+// the culprit escapes. Attributed callers must pass the slot index from
+// their EndpointClaim (see ReportOutcome); only truly unclaimed transports
+// use -1. With no serving history (cold backend) behavior is unchanged.
 func (p *CircuitPoolBackend) ReportAnomaly(slotIdx int) {
 	if slotIdx < 0 || slotIdx >= len(p.slots) {
-		if last := int(p.lastSlot.Load()); last >= 0 && last < len(p.slots) {
-			slotIdx = last
-		} else {
-			p.anomalyNEWNYM(-1)
-			return
-		}
+		p.anomalyNEWNYM(-1)
+		return
 	}
 	slot := p.slots[slotIdx]
 	slot.RecordAnomaly()

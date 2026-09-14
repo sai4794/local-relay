@@ -164,6 +164,16 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		p.logger.Error("failed to dial upstream", "host", host, "error", err)
 		p.triggerRotateOnError("connect-dial-failure", host, err)
 		reportOutcome(p.router, &claim, false, 0, 0, 0)
+		// Parity with SOCKS5 dial failure: a dead circuit hit via CONNECT
+		// must rotate, not just log. Classifier-gated like SOCKS5 so
+		// client-side errors (bad host, blocked target) don't churn.
+		if p.rotator != nil && isDialFailureErr(err) {
+			p.logger.Warn("CONNECT dial failure, triggering rotation", "host", host)
+			p.rotator.ForceRotate()
+			if p.router != nil {
+				p.router.ReportAnomaly(-1)
+			}
+		}
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}

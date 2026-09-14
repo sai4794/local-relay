@@ -44,11 +44,10 @@ func TestRegression_PoolWarmAnomalyKeepsAttribution(t *testing.T) {
 		CircuitCount: 3,
 		MaxAnomaly:   1, // single anomaly trips the threshold
 	})
-	// Simulate serving history on slot 1.
-	pool.lastSlot.Store(1)
-	pool.ReportAnomaly(-1)
+	// Attributed anomaly (claim slot index from the dial) trips the slot.
+	pool.ReportAnomaly(1)
 	if got := pool.slots[1].AnomalyCount(); got != 1 {
-		t.Fatalf("slot 1 anomaly count = %d; want 1 (attributed to lastSlot)", got)
+		t.Fatalf("slot 1 anomaly count = %d; want 1 (attributed to claim slot)", got)
 	}
 	if pool.slots[1].IsHealthy() {
 		t.Error("slot 1 still healthy after reaching anomaly threshold; want unhealthy (existing attribution)")
