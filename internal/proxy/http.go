@@ -300,10 +300,61 @@ func (p *HTTPProxy) singleLookupVerdict(host string) ([]net.IP, bool) {
 	return sharedIPs, true
 }
 
+// reverdictSharedSlice re-states both guard verdicts over an already-shared
+// Lookup slice WITHOUT another Lookup or rate-limit charge: the firewall
+// verdict via AllowIPsNoLookup and the SSRF verdict via CheckHost. Used
+// for header-rewritten requests whose rewritten host matches the ingest
+// host — same IPs, same verdict, zero extra DNS/limiter cost. A nil
+// firewall still consults SSRF over the slice; a nil SSRF keeps the
+// firewall verdict alone.
+func (p *HTTPProxy) reverdictSharedSlice(host string, shared []net.IP) ([]net.IP, bool) {
+	if p.firewall != nil {
+		var ok bool
+		shared, ok = p.firewall.AllowIPsNoLookup(host, shared)
+		if !ok {
+			return shared, false
+		}
+	}
+	if p.ssrf != nil {
+		if p.firewall != nil {
+			_, blocked := p.ssrf.CheckHost(host, shared)
+			if blocked {
+				return shared, false
+			}
+			return shared, true
+		}
+		if p.ssrf.IsBlocked(host) {
+			return nil, false
+		}
+		return nil, true
+	}
+	return shared, true
+}
+
+// sameHost reports whether two host/host:port spellings name the same
+// host: case-insensitive, brackets and one trailing dot ignored, port
+// stripped. Used to decide whether a header-rewritten target reuses the
+// ingest-time shared Lookup slice.
+func sameHost(a, b string) bool {
+	if h, _, err := net.SplitHostPort(a); err == nil {
+		a = h
+	}
+	if h, _, err := net.SplitHostPort(b); err == nil {
+		b = h
+	}
+	norm := func(h string) string {
+		h = strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(h, "]"), "["), "."))
+		return h
+	}
+	return norm(a) == norm(b)
+}
+
 func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	p.recordRotation()
 
 	hasTargetHeader := false
+	var sharedHeaderIPs []net.IP
+	headerHost := ""
 	if r.URL.Host == "" {
 		targetHeader := r.Header.Get("x-target-url")
 		if targetHeader == "" {
@@ -329,8 +380,12 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			// firewall's AllowIPs performs the single Resolver.Lookup and
 			// returns the shared IP slice; the SSRF blocker re-verdicts over
 			// that SAME slice via CheckHost with no second Lookup (same
-			// pattern as singleLookupVerdict below).
-			var sharedHeaderIPs []net.IP
+			// pattern as singleLookupVerdict below). The rewritten host is
+			// re-verdicted below WITHOUT a second Lookup or rate charge
+			// (AllowIPsNoLookup/CheckHost over the same slice) when the
+			// host is unchanged; a changed host (rewrite to a new target)
+			// takes the normal single shared-Lookup guard pass.
+			headerHost = parsed.Host
 			headerAllowed := true
 			if p.firewall != nil {
 				sharedHeaderIPs, headerAllowed = p.firewall.AllowIPs(parsed.Host)
@@ -392,10 +447,15 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SSRF protection — check scheme from raw request URI
+	// SSRF protection — check scheme from raw request URI, but only for
+	// absolute-form URIs (scheme://...). Origin-form paths ("/search?q=a:b")
+	// legally contain colons; gating them on a colon false-positives a 403
+	// on legitimate requests. Absolute-form without "://" has no valid
+	// scheme separator either (CONNECT authority-form is "host:port",
+	// handled by the self-dial guard above).
 	if !isBypass && p.ssrf != nil {
 		uri := r.RequestURI
-		if idx := strings.Index(uri, ":"); idx > 0 {
+		if idx := strings.Index(uri, "://"); idx > 0 {
 			if p.ssrf.IsSchemeBlocked(uri[:idx]) {
 				p.logger.Warn("blocked request with disallowed scheme", "scheme", uri[:idx])
 				http.Error(w, "scheme not allowed", http.StatusForbidden)
@@ -409,14 +469,29 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// charge); SSRF re-verdicts over that SAME slice via CheckHost with no
 	// second Lookup. Verdicts are identical to the previous paired
 	// IsBlocked+AllowHost checks; the bypass waiver above is unchanged.
+	// Header-rewritten requests reuse the ingest-time verdict WITHOUT a
+	// second Lookup or rate charge when the rewritten host matches the
+	// ingest host (AllowIPsNoLookup/CheckHost over the ingest slice);
+	// a rewrite to a different host takes the normal single shared-Lookup
+	// pass below (one charge per distinct host, not two per request).
 	var sharedIPs []net.IP
 	if !isBypass {
-		var ok bool
-		sharedIPs, ok = p.singleLookupVerdict(r.URL.Host)
-		if !ok {
-			p.logger.Warn("blocked request to private/internal IP", "host", r.URL.Host)
-			http.Error(w, "request blocked", http.StatusForbidden)
-			return
+		if hasTargetHeader && sharedHeaderIPs != nil && sameHost(r.URL.Host, headerHost) {
+			var ok bool
+			sharedIPs, ok = p.reverdictSharedSlice(r.URL.Host, sharedHeaderIPs)
+			if !ok {
+				p.logger.Warn("blocked request to private/internal IP", "host", r.URL.Host)
+				http.Error(w, "request blocked", http.StatusForbidden)
+				return
+			}
+		} else {
+			var ok bool
+			sharedIPs, ok = p.singleLookupVerdict(r.URL.Host)
+			if !ok {
+				p.logger.Warn("blocked request to private/internal IP", "host", r.URL.Host)
+				http.Error(w, "request blocked", http.StatusForbidden)
+				return
+			}
 		}
 	}
 

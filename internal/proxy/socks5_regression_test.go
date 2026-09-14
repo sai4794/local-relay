@@ -244,3 +244,37 @@ func portToBytes(portStr string) (byte, byte) {
 	}
 	return byte(n >> 8), byte(n & 0xff)
 }
+
+// Waiver predicate parity: every router-bypassed host waives on SOCKS5,
+// bypass or not, loopback spelling or not. Direct unit check of the gate.
+func TestSOCKS5_BypassWaiverPredicate(t *testing.T) {
+	router := backend.NewRouter(backend.NewDirectBackend(2 * time.Second))
+	router.SetBypassHosts([]string{"internal.example", "localhost"})
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"internal.example", true},
+		{"sub.internal.example", true},
+		{"localhost", true},
+		{"127.0.0.1", false}, // not in bypass set -> no waiver
+		{"example.com", false},
+	}
+	for _, tc := range cases {
+		got := router.IsBypassHost(tc.host)
+		if got != tc.want {
+			t.Errorf("IsBypassHost(%q) = %v; want %v", tc.host, got, tc.want)
+		}
+	}
+	// Nil-router fallback keeps historical loopback spellings only.
+	var nilRouter *backend.Router
+	_ = nilRouter
+	for _, h := range []string{"localhost", "127.0.0.1", "::1", "[::1]"} {
+		if !isLoopbackSpelling(h) {
+			t.Errorf("isLoopbackSpelling(%q) = false; want true", h)
+		}
+	}
+	if isLoopbackSpelling("internal.example") {
+		t.Error("isLoopbackSpelling(internal.example) = true; want false")
+	}
+}

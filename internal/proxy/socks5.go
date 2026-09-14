@@ -290,19 +290,19 @@ func (p *SOCKS5Proxy) handleConnect(conn net.Conn, target string) {
 		return
 	}
 
-	// Loopback-bypass waiver (mirrors the HTTP forward path): direct
-	// localhost/127.0.0.1 requests skip the guards — these
-	// operator-configured bypass hosts resolve to loopback, which the
-	// blocked ranges would otherwise always trip. The waiver applies only
-	// when the target is actually a configured bypass host (consult the
-	// shipped Router config instead of hardcoding spellings); with a nil
-	// router there is no config to consult, so fall back to the historical
-	// localhost/127.0.0.1 spelling check. Non-bypass targets run
-	// both guards over one shared Lookup: firewall.AllowIPs performs the
-	// single Resolver.Lookup and returns the shared IP slice; SSRF
-	// CheckHost re-verdicts over that SAME slice with no second Lookup.
-	loopbackSpelling := host == "localhost" || host == "127.0.0.1"
-	isBypass := loopbackSpelling && (p.router == nil || p.router.IsBypassHost(host))
+	// Bypass waiver (mirrors the HTTP forward path): configured bypass
+	// hosts skip the guards — these operator-configured hosts (often
+	// loopback, which the blocked ranges would otherwise always trip)
+	// route direct. The waiver consults the shipped Router config exactly
+	// like HTTP does (pure IsBypassHost gate): a non-loopback bypass host
+	// must waive on SOCKS5 just as it does on HTTP, or the same config
+	// routes direct on one protocol and guard-blocks (0x02) on the other.
+	// With a nil router there is no config to consult, so fall back to
+	// the historical localhost/127.0.0.1/::1 spelling check. Non-bypass
+	// targets run both guards over one shared Lookup: firewall.AllowIPs
+	// performs the single Resolver.Lookup and returns the shared IP slice;
+	// SSRF CheckHost re-verdicts over that SAME slice with no second Lookup.
+	isBypass := p.router == nil && isLoopbackSpelling(host) || p.router != nil && p.router.IsBypassHost(host)
 	var sharedIPs []net.IP
 	if !isBypass {
 		var ok bool
@@ -477,6 +477,16 @@ func (p *SOCKS5Proxy) isSelfDial(target string) bool {
 		net.ParseIP(strings.Trim(lHost, "[]")).IsLoopback() ||
 		isUnspecifiedHost(lHost)
 	return tLoop && lLoop
+}
+
+// isLoopbackSpelling reports whether host is a loopback spelling used for
+// the nil-router waiver fallback: localhost (any case, one trailing dot),
+// 127.0.0.1, or ::1 (bracketed or bare).
+func isLoopbackSpelling(host string) bool {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return true
+	}
+	return host == "127.0.0.1" || host == "::1" || host == "[::1]"
 }
 
 func (p *SOCKS5Proxy) handleUDPAssociate(conn net.Conn) {
