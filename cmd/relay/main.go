@@ -66,6 +66,7 @@ func main() {
 	logger := setupLogger(cfg.Logging.Level, cfg.Logging.Format)
 	logger.Info("Starting local-relay",
 		"version", Version,
+		"pid", os.Getpid(),
 		"http", cfg.Server.HTTP,
 		"socks5", cfg.Server.SOCKS5,
 		"backend", cfg.Backend.Type,
