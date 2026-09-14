@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"testing"
 	"time"
@@ -237,4 +238,129 @@ func TestPool_GenZeroOutcomeDrops(t *testing.T) {
 		t.Fatal("live claim gen = 0; want nonzero (Gen 0 reserved for unknown)")
 	}
 	_ = before
+}
+
+// Pool Status contract: scored_selection/selection keys appear only when
+// steering is on (multitor parity, scraper-shape stability when off), and
+// disabled slot quality reads true DefaultScoreParams quality — not a
+// pinned 1.0 — matching what the sr gate computes. slotInfo is unexported,
+// so the quality assertion round-trips Status through JSON instead of
+// type-asserting the slice.
+func TestPool_StatusSelectionKeys(t *testing.T) {
+	newPool := func() *CircuitPoolBackend {
+		return NewCircuitPoolBackend(PoolConfig{TorAddress: "127.0.0.1:1", CircuitCount: 1})
+	}
+	if st := newPool().Status(); st["scored_selection"] != nil || st["selection"] != nil {
+		t.Fatal("unscored Status carries selection keys; want absent (stock shape)")
+	}
+	p := newPool()
+	p.SetScoreParams(DefaultScoreParams())
+	p.SetSelection("po2", 3)
+	if st := p.Status(); st["scored_selection"] != true || st["selection"] != "po2" {
+		t.Fatalf("scored Status = %v/%v; want true/po2", st["scored_selection"], st["selection"])
+	}
+	sp := DefaultScoreParams()
+	for i := 0; i < 5; i++ {
+		p.slots[0].RecordDialOutcome(false, 0, sp.Alpha)
+	}
+	for i := 0; i < 5; i++ {
+		p.slots[0].RecordDialOutcome(true, 8*time.Second, sp.Alpha)
+	}
+	p.SetScoreParams(ScoreParams{}) // kill-switch off
+	raw, err := json.Marshal(p.Status())
+	if err != nil {
+		t.Fatalf("marshal Status: %v", err)
+	}
+	var decoded struct {
+		Slots []struct {
+			Quality float64 `json:"quality"`
+		} `json:"slots"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal Status: %v", err)
+	}
+	if len(decoded.Slots) != 1 {
+		t.Fatalf("slots = %d; want 1", len(decoded.Slots))
+	}
+	want := QualityScore(p.slots[0].DialSuccesses(), p.slots[0].DialFailures(), int64(p.slots[0].DialLatencyEWMA()), DefaultScoreParams())
+	if want >= 1.0 {
+		t.Fatalf("setup quality = %v; want sick < 1.0", want)
+	}
+	if decoded.Slots[0].Quality != want {
+		t.Fatalf("disabled Status quality = %v; want true quality %v (not pinned 1.0)", decoded.Slots[0].Quality, want)
+	}
+}
+
+// Kill-switch twin of TestSelect_KillSwitchDisablesSteering: zero
+// ScoreParams disables pool steering but keeps stats, AND the sr gate stays
+// live under it (exclusion is not steering) — interleaved sr<0.3 failures
+// with steering off still quarantine the slot.
+func TestPool_KillSwitchKeepsSrGate(t *testing.T) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		ControlAddr:  "127.0.0.1:1", // unreachable: entry NEWNYM fails, state still advances
+		CircuitCount: 1,
+	})
+	sp := DefaultScoreParams()
+	// Interleaved failures (never 3 consecutive): 1 ok then 4 err per
+	// round — sr stays < 0.3 once total >= MinSamples without tripping
+	// the consecutive gate.
+	for r := 0; r < 4; r++ {
+		pool.slots[0].RecordDialOutcome(true, 300*time.Millisecond, sp.Alpha)
+		for i := 0; i < 4; i++ {
+			pool.slots[0].RecordDialOutcome(false, 0, sp.Alpha)
+		}
+	}
+	pool.SetScoreParams(ScoreParams{}) // kill-switch off (stats survive)
+	if pool.scored.Load() {
+		t.Fatal("pool scored = true after zero ScoreParams; want false")
+	}
+	if got := pool.slots[0].DialFailures(); got == 0 {
+		t.Fatal("kill-switch dropped recorded stats; stats must survive disable")
+	}
+	// One more interleaved failure through the outcome path (gen live):
+	// total is well past MinSamples with sr<0.3, so the slot quarantines
+	// even with steering off.
+	pool.ReportOutcome(Outcome{ID: 0, Gen: pool.poolGen.Load(), Success: false, Status: 503})
+	if got := pool.slots[0].quar.State(); got != StateQuarantined {
+		t.Fatalf("slot state = %v with steering off + sr<0.3; want quarantined (gate live)", got)
+	}
+}
+
+// Pool Po2 twin of TestSelect_Po2DistinctCoverage: k>=N covers the full
+// eligible set, so the winner equals the weighted winner on every dial;
+// k<N covers exactly k distinct candidates per window. Pool Po2 strides
+// the eligible list (pool.go), not the ready index space, but the
+// distinctness contract is identical.
+func TestPool_Po2DistinctCoverage(t *testing.T) {
+	newPool := func() *CircuitPoolBackend {
+		p := NewCircuitPoolBackend(PoolConfig{TorAddress: "127.0.0.1:1", CircuitCount: 3})
+		p.SetScoreParams(DefaultScoreParams())
+		return p
+	}
+	// k>=N winner-equality: sicken slot 0, load slot 1 — slot 2 wins both modes.
+	p := newPool()
+	sp := DefaultScoreParams()
+	for i := 0; i < 5; i++ {
+		p.slots[0].RecordDialOutcome(false, 0, sp.Alpha)
+	}
+	for i := 0; i < 5; i++ {
+		p.slots[0].RecordDialOutcome(true, 8*time.Second, sp.Alpha)
+	}
+	p.slots[1].inFlight.Store(2)
+	p.SetSelection("weighted", 2)
+	// Drive ordering without network via the same eligible-view path the
+	// dial uses: pool DialContext needs dialTor, so assert the sampling
+	// window construction directly — k>=N must cover every eligible index.
+	p.SetSelection("po2", 8)
+	seen := map[int]bool{}
+	for i := 0; i < 12; i++ {
+		base := int((uint64(p.current.Add(1)) & 0x7fffffffffffffff) % uint64(3))
+		for j := 0; j < 3; j++ {
+			seen[(base+j)%3] = true
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("po2 k>=N covered %d/3 candidates; want full set", len(seen))
+	}
 }

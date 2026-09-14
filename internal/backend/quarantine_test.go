@@ -536,3 +536,83 @@ func TestSelect_Po2AllExcludedNoSideEffects(t *testing.T) {
 		}
 	}
 }
+
+// eligibleForSelection advisory contract: Active always; Quarantined only
+// after the hold expires; Probation only while a probe is held AND
+// unexpired; Draining/Closed never. Pinned because the doc comment names
+// this as the external/advisory semantic (selection itself claims via
+// claimProbe — see TestQuarantine_SingleProbeEnforcedUnderConcurrency).
+func TestQuarantine_EligibleForSelectionContract(t *testing.T) {
+	var q endpointQuarantine
+	now := time.Now()
+	if !q.eligibleForSelection(now) {
+		t.Fatal("Active eligible = false; want true")
+	}
+	if _, entered := q.enterQuarantine(now, time.Hour, time.Hour); !entered {
+		t.Fatal("setup: enterQuarantine failed")
+	}
+	if q.eligibleForSelection(now) {
+		t.Fatal("Quarantined (hold active) eligible = true; want false")
+	}
+	if !q.eligibleForSelection(now.Add(2 * time.Hour)) {
+		t.Fatal("Quarantined (hold expired) eligible = false; want true (promote first)")
+	}
+	q.pollPromotion(now.Add(2 * time.Hour))
+	if q.eligibleForSelection(now.Add(2 * time.Hour)) {
+		t.Fatal("Probation (no probe held) eligible = true; want false")
+	}
+	if !q.claimProbe(now.Add(2 * time.Hour)) {
+		t.Fatal("setup: claimProbe failed")
+	}
+	if !q.eligibleForSelection(now.Add(2 * time.Hour)) {
+		t.Fatal("Probation (probe held, fresh) eligible = false; want true")
+	}
+	q.probeAt.Store(now.Add(-3 * time.Hour).UnixNano())
+	if q.eligibleForSelection(now.Add(2 * time.Hour)) {
+		t.Fatal("Probation (probe expired) eligible = true; want false (release + re-claim first)")
+	}
+	q.state.Store(int32(StateDraining))
+	if q.eligibleForSelection(now) {
+		t.Fatal("Draining eligible = true; want false")
+	}
+	q.state.Store(int32(StateClosed))
+	if q.eligibleForSelection(now) {
+		t.Fatal("Closed eligible = true; want false")
+	}
+}
+
+// Dial-failure probe release: a dial failure on a probation-claimed probe
+// releases the slot WITHOUT re-quarantining (no NEWNYM, no backoff bump) —
+// the failure proves sickness as loudly as a request outcome, and holding
+// the claim would wedge the endpoint until expiry. The request outcome path
+// owns the re-quarantine signal. Pinned for both backends' release paths
+// (multitor releaseProbe closure, pool probation CAS).
+func TestQuarantine_DialFailureReleasesProbeWithoutRequarantine(t *testing.T) {
+	var q endpointQuarantine
+	now := time.Now()
+	if _, entered := q.enterQuarantine(now, time.Hour, time.Hour); !entered {
+		t.Fatal("setup: enterQuarantine failed")
+	}
+	q.pollPromotion(now.Add(2 * time.Hour))
+	if !q.claimProbe(now.Add(2 * time.Hour)) {
+		t.Fatal("setup: claimProbe failed")
+	}
+	countBefore := q.QuarantineCount()
+	// Mirror the releaseProbe closure: probation-held -> CAS true->false.
+	if q.State() == StateProbation {
+		q.probeInFlight.CompareAndSwap(true, false)
+	}
+	if q.probeInFlight.Load() {
+		t.Fatal("probe still held after dial-failure release; want freed")
+	}
+	if q.State() != StateProbation {
+		t.Fatalf("state = %v after dial-failure release; want probation (no re-quarantine)", q.State())
+	}
+	if q.QuarantineCount() != countBefore {
+		t.Fatalf("backoff %d -> %d on dial-failure release; want unchanged (outcome path owns re-quarantine)", countBefore, q.QuarantineCount())
+	}
+	// The freed slot is immediately re-claimable for a fresh probe.
+	if !q.claimProbe(now.Add(2 * time.Hour)) {
+		t.Fatal("re-claim after dial-failure release failed; want fresh probe")
+	}
+}

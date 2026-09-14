@@ -159,3 +159,44 @@ func TestRenewProbe_RouterFanout(t *testing.T) {
 		t.Fatal("router fan-out did not renew the held probe")
 	}
 }
+
+// Pool RenewProbe twin of TestRenewProbe_HeartbeatExtendsClaim: unknown IDs
+// and stale gens drop (false); a held probation claim renews (true) and its
+// expiry clears. Pinned because RenewProbe is the only thing standing
+// between a long pool tunnel and mid-stream probe theft.
+func TestPool_RenewProbeGenGate(t *testing.T) {
+	pool := NewCircuitPoolBackend(PoolConfig{
+		TorAddress:   "127.0.0.1:1",
+		CircuitCount: 1,
+	})
+	cfg := DefaultQuarantineConfig()
+	pool.SetQuarantineConfig(cfg)
+	slot := pool.slots[0]
+	now := time.Now()
+	if _, entered := slot.quar.enterQuarantine(now, cfg.Duration, cfg.MaxDuration); !entered {
+		t.Fatal("setup: enterQuarantine failed")
+	}
+	slot.quar.pollPromotion(now.Add(2 * cfg.Duration))
+	if !slot.quar.claimProbe(now.Add(2 * cfg.Duration)) {
+		t.Fatal("setup: claimProbe failed")
+	}
+	gen := pool.poolGen.Load()
+	if pool.RenewProbe(99, gen) {
+		t.Fatal("RenewProbe unknown ID = true; want false")
+	}
+	pool.poolGen.Add(1)
+	if pool.RenewProbe(0, gen) {
+		t.Fatal("RenewProbe stale gen = true; want false (dropped)")
+	}
+	live := pool.poolGen.Load()
+	slot.quar.probeAt.Store(now.Add(-3 * cfg.Duration).UnixNano())
+	if !slot.quar.probeExpired(now, cfg.Duration) {
+		t.Fatal("setup: want expired before renew")
+	}
+	if !pool.RenewProbe(0, live) {
+		t.Fatal("RenewProbe held claim = false; want true")
+	}
+	if slot.quar.probeExpired(time.Now(), cfg.Duration) {
+		t.Fatal("probe still expired after RenewProbe; want budget extended")
+	}
+}

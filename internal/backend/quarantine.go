@@ -249,6 +249,11 @@ func (q *endpointQuarantine) renewProbe(now time.Time) bool {
 // Draining/Closed never serve. NOTE: this is NOT the selection gate —
 // selection must claim via claimProbe (holder-only), because this
 // predicate returns true for every caller while a probe is held.
+//
+// Live callers: pool DialContext's complement fast path uses
+// eligibleNoClaim instead (same verdict minus the Default-config probe
+// budget — multitor's live quarCfg). This stays as the documented,
+// unit-pinned semantic for external/advisory checks.
 func (q *endpointQuarantine) eligibleForSelection(now time.Time) bool {
 	switch q.State() {
 	case StateActive:
