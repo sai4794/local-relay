@@ -37,17 +37,31 @@ type TorInstance struct {
 	// nymClaim is the monotonic id of the cooldown-window claim that stamped
 	// LastRotated (see claimNymWindow): guarded by TorLifecycle.nymMu with
 	// the instance lock held. Only the owning claim may refund the window.
-	nymClaim      int64
-	lastHealed    time.Time
-	inFlight      atomic.Int64
-	circuitGen    atomic.Int64
-	lastServed    atomic.Int64       // UnixNano of last DialContext serve; 0 = never served
-	stats         EndpointStats      // lock-free dial latency/quality scoring (score.go); cold-zero is neutral
-	quar          endpointQuarantine // lock-free quarantine/probation lifecycle (quarantine.go); zero = Active
-	lastExitIP    string             // last observed Tor exit for this instance
-	exitIPChecked time.Time          // when lastExitIP was last refreshed
+	nymClaim   int64
+	lastHealed time.Time
+	inFlight   atomic.Int64
+	circuitGen atomic.Int64
+	lastServed atomic.Int64       // UnixNano of last DialContext serve; 0 = never served
+	stats      EndpointStats      // lock-free dial latency/quality scoring (score.go); cold-zero is neutral
+	quar       endpointQuarantine // lock-free quarantine/probation lifecycle (quarantine.go); zero = Active
+	// liveCached is the cached liveness verdict (1 = alive, 0 = dead) with
+	// liveAt as its UnixNano timestamp. IsReadyLive reads the cache on the
+	// dial hot path (atomics only, no syscalls); RefreshLiveness runs the
+	// kill(0)/Wait4 probe and stamps the cache. A dead verdict pins until
+	// the next refresh (fail-closed); an alive verdict is trusted for
+	// liveTTL. CheckHealth refreshes in the background; dial failures
+	// clear the cache immediately via MarkLivenessDead.
+	liveCached    atomic.Int64
+	liveAt        atomic.Int64
+	lastExitIP    string    // last observed Tor exit for this instance
+	exitIPChecked time.Time // when lastExitIP was last refreshed
 	mu            sync.RWMutex
 }
+
+// liveTTL bounds how long an alive liveness verdict is trusted on the dial
+// path before a fresh probe is required. 5s keeps the dial path
+// syscall-free while reacting to daemon death within one health interval.
+const liveTTL = 5 * time.Second
 
 // GetSocksPort returns the SOCKS port (thread-safe).
 func (i *TorInstance) GetSocksPort() int {
@@ -92,6 +106,86 @@ func (i *TorInstance) IsReady() bool {
 			// Any other Wait4 error leaves the kill(0) verdict intact.
 		} else if pid == proc.Pid {
 			// Child exited (now reaped): zombie means not-ready.
+			return false
+		}
+	}
+	return true
+}
+
+// IsReadyLive is the dial-hot-path readiness check: Ready flag (RLock)
+// plus the cached liveness verdict (atomics only — zero syscalls). A dead
+// verdict pins until refreshed (fail-closed); an alive verdict older than
+// liveTTL triggers a synchronous refresh (one probe, still cheaper than
+// probing every dial). Semantics match IsReady: a dead process reports
+// not-ready; the cache only delays the discovery by up to liveTTL, and
+// dial failures clear it immediately via MarkLivenessDead.
+func (i *TorInstance) IsReadyLive() bool {
+	i.mu.RLock()
+	ready := i.Ready
+	i.mu.RUnlock()
+	if !ready {
+		return false
+	}
+	now := time.Now().UnixNano()
+	cached := i.liveCached.Load()
+	at := i.liveAt.Load()
+	if cached == 1 && now-at < liveTTL.Nanoseconds() {
+		return true
+	}
+	if cached == 0 && at != 0 {
+		return false
+	}
+	return i.RefreshLiveness()
+}
+
+// RefreshLiveness runs the kill(0)/Wait4 liveness probe and stamps the
+// cache. Returns the fresh verdict. Called on cache miss/expiry from the
+// dial path and periodically by CheckHealth in the background.
+func (i *TorInstance) RefreshLiveness() bool {
+	alive := i.probeLiveness()
+	now := time.Now().UnixNano()
+	if alive {
+		i.liveCached.Store(1)
+	} else {
+		i.liveCached.Store(0)
+	}
+	i.liveAt.Store(now)
+	return alive
+}
+
+// MarkLivenessDead clears a stale alive verdict immediately: call after a
+// dial failure so the next dial re-probes instead of trusting the cache
+// for up to liveTTL.
+func (i *TorInstance) MarkLivenessDead() {
+	i.liveCached.Store(0)
+	i.liveAt.Store(time.Now().UnixNano())
+}
+
+// probeLiveness is the IsReady syscall core factored out: Ready flag plus
+// kill(0) plus Wait4(WNOHANG) zombie reap, with the lock held only for the
+// snapshot. See IsReady for the full rationale.
+func (i *TorInstance) probeLiveness() bool {
+	i.mu.RLock()
+	ready := i.Ready
+	var proc *os.Process
+	if i.Cmd != nil {
+		proc = i.Cmd.Process
+	}
+	i.mu.RUnlock()
+	if !ready {
+		return false
+	}
+	if proc != nil && proc.Pid > 0 {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return false
+		}
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(proc.Pid, &ws, syscall.WNOHANG, nil)
+		if err != nil {
+			if err == syscall.ECHILD {
+				return false
+			}
+		} else if pid == proc.Pid {
 			return false
 		}
 	}
@@ -317,6 +411,19 @@ func (i *TorInstance) DialFailures() int64 { return i.stats.Failures() }
 
 // DialLatencyEWMA returns the success-only EWMA dial latency (0 = no samples).
 func (i *TorInstance) DialLatencyEWMA() time.Duration { return i.stats.LatencyEWMA() }
+
+// dialOKKey/dialErrKey are pre-baked metric series keys for the dial path:
+// IncKey skips the per-dial map/escape/sort alloc plus one mutex format
+// round-trip that Inc(name, labels) pays on every dial (2-3x per request).
+// Keys embed the instance ID, so they are built once per instance.
+func (i *TorInstance) dialOKKey() string {
+	return "lano_dial_ok_total{instance=\"" + strconv.Itoa(i.ID) + "\"}"
+}
+
+// dialErrKey is the pre-baked failure counter key (see dialOKKey).
+func (i *TorInstance) dialErrKey() string {
+	return "lano_dial_err_total{instance=\"" + strconv.Itoa(i.ID) + "\"}"
+}
 
 // --- additive quarantine/probation lifecycle (quarantine.go) ---
 
@@ -790,7 +897,9 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 		// liveness check. Re-probe it here — a single miss is transient, but
 		// consecutive not-ready observations re-run kill/spawn so a wedged
 		// daemon is recycled instead of sitting not-ready forever.
-		if !inst.IsReady() {
+		// RefreshLiveness re-probes AND re-stamps the dial-path cache, so
+		// the background health loop keeps the hot-path verdicts fresh.
+		if !inst.RefreshLiveness() {
 			if tl.isSocksPortReady(inst.GetSocksPort()) {
 				resetNotReady(inst.ID)
 				inst.ResetFailCount()

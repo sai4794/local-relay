@@ -192,9 +192,13 @@ func NewMultiTorBackend(lifecycle *TorLifecycle, timeout time.Duration, logf fun
 func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	start := time.Now()
 	instances := m.lifecycle.GetInstances()
+	// Hot-path readiness uses the cached liveness verdict (atomics, no
+	// syscalls): the full kill(0)/Wait4 probe runs at most once per
+	// instance per liveTTL, plus immediately after any dial failure
+	// (MarkLivenessDead below). CheckHealth refreshes in the background.
 	ready := make([]*TorInstance, 0)
 	for _, inst := range instances {
-		if inst.IsReady() {
+		if inst.IsReadyLive() {
 			ready = append(ready, inst)
 		}
 	}
@@ -234,7 +238,8 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	if err != nil {
 		m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
 		inst.RecordDialOutcome(false, 0, dialScoreAlpha)
-		metrics.Default().Inc("lano_dial_err_total", map[string]string{"instance": strconv.Itoa(inst.ID)})
+		inst.MarkLivenessDead()
+		metrics.Default().IncKey(inst.dialErrKey(), 1)
 		// Try next instance with its isolation user
 		for i := 1; i < len(ready); i++ {
 			nextIdx := (idx + i) % len(ready)
@@ -247,7 +252,8 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 			}
 			m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
 			inst.RecordDialOutcome(false, 0, dialScoreAlpha)
-			metrics.Default().Inc("lano_dial_err_total", map[string]string{"instance": strconv.Itoa(inst.ID)})
+			inst.MarkLivenessDead()
+			metrics.Default().IncKey(inst.dialErrKey(), 1)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("all Tor instances failed: %w", err)
@@ -268,7 +274,7 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	// (filled below) so the outcome sample carries the real sample.
 	// Dial-failure err samples above stay: the outcome path only sees the
 	// winner, so failed attempts would otherwise leave no signal.
-	metrics.Default().Inc("lano_dial_ok_total", map[string]string{"instance": strconv.Itoa(inst.ID)})
+	metrics.Default().IncKey(inst.dialOKKey(), 1)
 
 	// Increment in-flight before wrapping so Close always balances it.
 	inst.IncInFlight()

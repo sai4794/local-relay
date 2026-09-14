@@ -419,7 +419,7 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 		if err != nil {
 			slot.RecordFailure()
 			slot.RecordDialOutcome(false, 0, sp.Alpha)
-			metrics.Default().Inc("relay_pool_slot_dial_err_total", map[string]string{"slot": strconv.Itoa(idx)})
+			metrics.Default().IncKey("relay_pool_slot_dial_err_total{slot=\""+strconv.Itoa(idx)+"\"}", 1)
 			p.logf("[pool] slot %d dial failed: %v", idx, err)
 			continue
 		}
@@ -467,7 +467,7 @@ func sortSlotViews(v []slotView) {
 func (p *CircuitPoolBackend) recordDialSuccess(slot *CircuitSlot, idx int, latency time.Duration) {
 	slot.RecordSuccess()
 	slot.RecordDialOutcome(true, latency, p.scoreParamsLive().Alpha)
-	metrics.Default().Inc("relay_pool_slot_dial_ok_total", map[string]string{"slot": strconv.Itoa(idx)})
+	metrics.Default().IncKey("relay_pool_slot_dial_ok_total{slot=\""+strconv.Itoa(idx)+"\"}", 1)
 	p.resetErrorBackoff()
 	if slot.ShouldRotate(p.maxAge) {
 		slot.SetUnhealthy()
