@@ -245,6 +245,7 @@ func buildBackendStack(ctx context.Context, cfg *config.Config, logger *slog.Log
 				"max_age", cfg.MaxCircuitAgeVal(),
 			)
 		}
+		applyPoolTuningToPool(s.pool, cfg, logger)
 
 	case cfg.IsTor():
 		s.torBackend = backend.NewTorBackend(backend.TorConfig{
@@ -269,25 +270,51 @@ func buildBackendStack(ctx context.Context, cfg *config.Config, logger *slog.Log
 // re-enabling later starts warm. buildRouter, monitorBackends, and the
 // OnRotate→ClearIdleConns wiring are untouched.
 func applyPoolTuning(m *backend.MultiTorBackend, cfg *config.Config, logger *slog.Logger) {
+	applyPoolScoreParams(
+		m.SetScoreParams, m.SetSelection, m.SetQuarantineConfig,
+		cfg, logger, "multi-tor",
+	)
+}
+
+// applyPoolTuningToPool is the circuit-pool twin of applyPoolTuning:
+// identical cfg.Pool conversion, installed on the pool backend. Both
+// topologies honor the same [pool] section; the kill-switch disables
+// steering on both while stats keep recording.
+func applyPoolTuningToPool(p *backend.CircuitPoolBackend, cfg *config.Config, logger *slog.Logger) {
+	applyPoolScoreParams(
+		p.SetScoreParams, p.SetSelection, p.SetQuarantineConfig,
+		cfg, logger, "circuit-pool",
+	)
+}
+
+// applyPoolScoreParams converts cfg.Pool once and installs it through the
+// given setters, so multi-tor and circuit-pool can never drift apart.
+func applyPoolScoreParams(
+	setScore func(backend.ScoreParams),
+	setSelection func(string, int),
+	setQuarantine func(backend.QuarantineConfig),
+	cfg *config.Config, logger *slog.Logger, backendName string,
+) {
 	if !cfg.Pool.Enabled {
-		m.SetScoreParams(backend.ScoreParams{})
-		logger.Info("pool scoring disabled (kill-switch): pure least-inflight selection")
+		setScore(backend.ScoreParams{})
+		logger.Info("pool scoring disabled (kill-switch): pure least-inflight selection", "backend", backendName)
 		return
 	}
-	m.SetScoreParams(backend.ScoreParams{
+	setScore(backend.ScoreParams{
 		Alpha:      cfg.Pool.EWMAAlpha,
 		LatencyRef: time.Duration(cfg.Pool.LatencyRefMs) * time.Millisecond,
 		MinSamples: cfg.Pool.MinSamples,
 		MinQuality: cfg.Pool.MinQuality,
 	})
-	m.SetSelection(cfg.Pool.Selection, cfg.Pool.Po2Samples)
-	m.SetQuarantineConfig(backend.QuarantineConfig{
+	setSelection(cfg.Pool.Selection, cfg.Pool.Po2Samples)
+	setQuarantine(backend.QuarantineConfig{
 		AfterFails:  int64(cfg.Pool.QuarantineAfterFails),
 		Duration:    time.Duration(cfg.Pool.QuarantineSecs) * time.Second,
 		MaxDuration: time.Duration(cfg.Pool.MaxQuarantineSecs) * time.Second,
 		Probes:      int64(cfg.Pool.ProbationProbes),
 	})
 	logger.Info("pool scoring enabled",
+		"backend", backendName,
 		"selection", cfg.Pool.Selection,
 		"ewma_alpha", cfg.Pool.EWMAAlpha,
 		"quarantine_secs", cfg.Pool.QuarantineSecs,

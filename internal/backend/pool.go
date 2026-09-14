@@ -26,7 +26,9 @@ type CircuitSlot struct {
 	lastUsed         time.Time
 	anomalyCount     int64
 	anomalyThreshold int64
-	stats            EndpointStats // lock-free dial latency/quality scoring (score.go); cold-zero is neutral
+	stats            EndpointStats      // lock-free dial latency/quality scoring (score.go); cold-zero is neutral
+	quar             endpointQuarantine // lock-free quarantine/probation lifecycle (quarantine.go); zero = Active
+	inFlight         atomic.Int64       // checked-out conns via this pool; feeds EffectiveLoad
 	mu               sync.RWMutex
 }
 
@@ -58,7 +60,6 @@ type CircuitPoolBackend struct {
 	socksClient       *transport.SOCKS5Client
 	control           *TorControlClient
 	logf              func(format string, args ...interface{})
-	lastSlot          atomic.Int64
 
 	// NEWNYM rate limiting with exponential backoff
 	lastNymTime time.Time
@@ -73,6 +74,17 @@ type CircuitPoolBackend struct {
 
 	// Tor SOCKS5 isolation prefix — each slot gets a unique suffix
 	isolationPrefix string
+
+	// scoreParams + quarCfg + selection tune the pool the same way
+	// applyPoolTuning tunes multitor (SetScoreParams/SetQuarantineConfig/
+	// SetSelection mirrors). Zero values mean defaults; the kill-switch
+	// (pool.enabled:false) passes zero ScoreParams = pure least-inflight
+	// while stats keep recording.
+	scoreParams ScoreParams
+	scored      atomic.Bool
+	quarCfg     QuarantineConfig
+	selection   atomic.Value // string: "weighted" (default) or "po2"
+	po2Samples  atomic.Int64
 
 	// Connection pool for SOCKS5 connection reuse
 	connPool   []*pooledConn
@@ -162,9 +174,112 @@ func NewCircuitPoolBackend(cfg PoolConfig) *CircuitPoolBackend {
 			anomalyThreshold: p.maxAnomaly,
 		}
 	}
-	p.lastSlot.Store(-1)
 
 	return p
+}
+
+// SetScoreParams enables scored selection with the given tuning. The zero
+// ScoreParams value disables steering (pure least-inflight); any non-zero
+// value enables it. Stats record either way. Mirrors MultiTorBackend.
+func (p *CircuitPoolBackend) SetScoreParams(sp ScoreParams) {
+	if sp == (ScoreParams{}) {
+		p.scored.Store(false)
+		return
+	}
+	if sp.Alpha <= 0 || sp.Alpha > 1 {
+		sp.Alpha = DefaultScoreParams().Alpha
+	}
+	if sp.LatencyRef <= 0 {
+		sp.LatencyRef = DefaultScoreParams().LatencyRef
+	}
+	if sp.MinSamples <= 0 {
+		sp.MinSamples = DefaultScoreParams().MinSamples
+	}
+	if sp.MinQuality <= 0 {
+		sp.MinQuality = DefaultScoreParams().MinQuality
+	}
+	p.scoreParams = sp
+	p.scored.Store(true)
+}
+
+// SetQuarantineConfig installs the quarantine/probation tuning. The zero
+// value selects DefaultQuarantineConfig. Mirrors MultiTorBackend.
+func (p *CircuitPoolBackend) SetQuarantineConfig(c QuarantineConfig) {
+	d := DefaultQuarantineConfig()
+	if c.AfterFails <= 0 {
+		c.AfterFails = d.AfterFails
+	}
+	if c.Duration <= 0 {
+		c.Duration = d.Duration
+	}
+	if c.MaxDuration < c.Duration {
+		c.MaxDuration = d.MaxDuration
+		if c.MaxDuration < c.Duration {
+			c.MaxDuration = c.Duration
+		}
+	}
+	if c.Probes <= 0 {
+		c.Probes = d.Probes
+	}
+	p.quarCfg = c
+}
+
+// SetSelection installs the selection algorithm and Po2 sample size.
+// Mirrors MultiTorBackend.SetSelection.
+func (p *CircuitPoolBackend) SetSelection(selection string, po2Samples int) {
+	if selection != "po2" {
+		selection = "weighted"
+	}
+	if po2Samples < 2 || po2Samples > 8 {
+		po2Samples = 2
+	}
+	p.selection.Store(selection)
+	p.po2Samples.Store(int64(po2Samples))
+}
+
+// selectionMode returns the live selection algorithm (default weighted).
+func (p *CircuitPoolBackend) selectionMode() string {
+	if s, ok := p.selection.Load().(string); ok && s == "po2" {
+		return "po2"
+	}
+	return "weighted"
+}
+
+// scoreParamsLive returns the live scoring params (defaults when scoring
+// disabled — stats still record with the default alpha).
+func (p *CircuitPoolBackend) scoreParamsLive() ScoreParams {
+	if !p.scored.Load() {
+		return ScoreParams{MinQuality: DefaultScoreParams().MinQuality, MinSamples: 1 << 60, Alpha: DefaultScoreParams().Alpha, LatencyRef: DefaultScoreParams().LatencyRef}
+	}
+	sp := p.scoreParams
+	if sp.Alpha <= 0 || sp.Alpha > 1 {
+		sp.Alpha = DefaultScoreParams().Alpha
+	}
+	return sp
+}
+
+// quarConfigLive returns the live quarantine tuning (defaults when unset).
+func (p *CircuitPoolBackend) quarConfigLive() QuarantineConfig {
+	c := p.quarCfg
+	if c.AfterFails <= 0 || c.Duration <= 0 || c.MaxDuration <= 0 || c.Probes <= 0 {
+		d := DefaultQuarantineConfig()
+		if c.AfterFails <= 0 {
+			c.AfterFails = d.AfterFails
+		}
+		if c.Duration <= 0 {
+			c.Duration = d.Duration
+		}
+		if c.MaxDuration < c.Duration {
+			c.MaxDuration = d.MaxDuration
+			if c.MaxDuration < c.Duration {
+				c.MaxDuration = c.Duration
+			}
+		}
+		if c.Probes <= 0 {
+			c.Probes = d.Probes
+		}
+	}
+	return c
 }
 
 // DialContext picks the healthiest slot and opens a Tor SOCKS5 connection
@@ -172,6 +287,17 @@ func NewCircuitPoolBackend(cfg PoolConfig) *CircuitPoolBackend {
 // available to eliminate the per-request SOCKS5 handshake overhead.
 // Connections are returned optimistically — dead connections are detected
 // by the caller on first write/read and discarded with a single retry.
+//
+// Selection is scored (mirrors MultiTorBackend.selectInstance): healthy,
+// non-quarantined slots compete by least EffectiveLoad (in-flight +1 over
+// quality, floored at MinQuality), with an all-excluded least-bad fallback
+// (never score-induced fail-closed). The "weighted" mode scans all eligible
+// slots (rotated by the dial counter so cold-equal slots spread instead of
+// pinning slot 0); "po2" samples po2Samples by stride from the shared dial
+// counter. With scoring disabled (pool.enabled:false) quality reads
+// cold-neutral and the ordering reduces to least-inflight round-robin.
+// Quarantined slots are skipped until their hold expires (lazy promotion
+// claims the single probe on selection, like the multitor isExcluded hook).
 func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialStart := time.Now()
 	total := len(p.slots)
@@ -179,19 +305,102 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 		return nil, fmt.Errorf("circuit pool is empty")
 	}
 
-	// Round-robin start with wrap-safe masking: p.current.Add(1) wraps
-	// int64 after 2^63 dials (or via test injection), and a negative
-	// remainder would index p.slots out of range. The bitmask strips the
-	// sign so the sequence stays non-negative across the wrap.
-	start := int((uint64(p.current.Add(1)) & 0x7fffffffffffffff) % uint64(total))
+	sp := p.scoreParamsLive()
+	now := time.Now()
 
-	for i := 0; i < total; i++ {
-		idx := (start + i) % total
-		slot := p.slots[idx]
-
+	// Eligible slots: healthy AND not quarantine-excluded.
+	eligible := make([]slotView, 0, total)
+	var excludedBest *slotView
+	for idx, slot := range p.slots {
 		if !slot.IsHealthy() {
 			continue
 		}
+		switch slot.quar.State() {
+		case StateActive:
+		case StateQuarantined:
+			if now.UnixNano() < slot.quar.quarantinedUntil.Load() {
+				load := slot.inFlight.Load()
+				eff := EffectiveLoad(load, QualityScore(slot.DialSuccesses(), slot.DialFailures(), int64(slot.DialLatencyEWMA()), sp), sp.MinQuality)
+				if excludedBest == nil || eff < excludedBest.eff {
+					cp := slotView{slot: slot, idx: idx, eff: eff, load: load}
+					excludedBest = &cp
+				}
+				continue
+			}
+			slot.quar.pollPromotion(now)
+			if slot.quar.State() != StateProbation || !slot.quar.claimProbe(now) {
+				load := slot.inFlight.Load()
+				eff := EffectiveLoad(load, QualityScore(slot.DialSuccesses(), slot.DialFailures(), int64(slot.DialLatencyEWMA()), sp), sp.MinQuality)
+				if excludedBest == nil || eff < excludedBest.eff {
+					cp := slotView{slot: slot, idx: idx, eff: eff, load: load}
+					excludedBest = &cp
+				}
+				continue
+			}
+		case StateProbation:
+			if slot.quar.releaseStaleProbe(now, p.quarConfigLive().Duration) {
+				if !slot.quar.claimProbe(now) {
+					continue
+				}
+			} else if !slot.quar.claimProbe(now) {
+				continue
+			}
+		default:
+			continue
+		}
+		load := slot.inFlight.Load()
+		eff := EffectiveLoad(load, QualityScore(slot.DialSuccesses(), slot.DialFailures(), int64(slot.DialLatencyEWMA()), sp), sp.MinQuality)
+		eligible = append(eligible, slotView{slot: slot, idx: idx, eff: eff, load: load})
+	}
+	if len(eligible) == 0 {
+		// Every candidate excluded (e.g. all quarantined): serve the
+		// least-bad excluded one rather than failing closed — unless
+		// nothing is even dialable, in which case fall through to the
+		// exhaustion path below.
+		if excludedBest != nil {
+			eligible = append(eligible, *excludedBest)
+		} else {
+			p.logf("[pool] all slots exhausted, dispatching async NEWNYM")
+			p.asyncNEWNYM()
+			return nil, fmt.Errorf("circuit pool exhausted: all slots unhealthy")
+		}
+	}
+
+	// Order eligible by (eff, load, idx) — deterministic. Weighted rotates
+	// the order by the dial counter so cold-equal slots spread instead of
+	// pinning slot 0; po2 strides a sample from the counter and orders it.
+	order := eligible
+	if p.selectionMode() == "po2" {
+		k := int(p.po2Samples.Load())
+		if k < 2 || k > 8 {
+			k = 2
+		}
+		if k > len(eligible) {
+			k = len(eligible)
+		}
+		base := int((uint64(p.current.Add(1)) & 0x7fffffffffffffff) % uint64(len(eligible)))
+		order = make([]slotView, 0, k)
+		step := len(eligible)/k + 1
+		for j := 0; j < k; j++ {
+			order = append(order, eligible[(base+j*step)%len(eligible)])
+		}
+	} else {
+		p.current.Add(1)
+	}
+	sortSlotViews(order)
+	if p.selectionMode() != "po2" && len(order) > 1 {
+		off := int((uint64(p.current.Load()) & 0x7fffffffffffffff) % uint64(len(order)))
+		if off != 0 {
+			rot := make([]slotView, 0, len(order))
+			rot = append(rot, order[off:]...)
+			rot = append(rot, order[:off]...)
+			order = rot
+		}
+	}
+
+	for _, sv := range order {
+		idx := sv.idx
+		slot := sv.slot
 
 		// Try reusing a pooled connection first (optimistic — no alive check).
 		// The entry generation rides out atomically with the conn: a
@@ -199,27 +408,27 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 		// with the new generation (it would re-pool as fresh and defeat
 		// rotation isolation).
 		if conn, entryGen := p.getConn(idx, addr); conn != nil {
-			p.lastSlot.Store(int64(idx))
-			p.recordDialSuccess(slot, idx)
+			p.recordDialSuccess(slot, idx, time.Since(dialStart))
+			slot.inFlight.Add(1)
 			fillClaimSink(ctx, "pool", idx, entryGen, time.Since(dialStart))
-			return &pooledConnWrap{Conn: conn, pool: p, slotIdx: idx, addr: addr, gen: entryGen, endpointID: idx, endpointGen: entryGen, dialLatency: time.Since(dialStart)}, nil
+			return &pooledConnWrap{Conn: conn, pool: p, slot: slot, slotIdx: idx, addr: addr, gen: entryGen, endpointID: idx, endpointGen: entryGen, dialLatency: time.Since(dialStart)}, nil
 		}
 
 		// No pooled connection — create a new one
 		conn, err := p.dialTor(ctx, addr, idx)
 		if err != nil {
 			slot.RecordFailure()
-			slot.RecordDialOutcome(false, 0, DefaultScoreParams().Alpha)
+			slot.RecordDialOutcome(false, 0, sp.Alpha)
 			metrics.Default().Inc("relay_pool_slot_dial_err_total", map[string]string{"slot": strconv.Itoa(idx)})
 			p.logf("[pool] slot %d dial failed: %v", idx, err)
 			continue
 		}
 
-		p.lastSlot.Store(int64(idx))
-		p.recordDialSuccess(slot, idx)
+		p.recordDialSuccess(slot, idx, time.Since(dialStart))
+		slot.inFlight.Add(1)
 		gen := p.poolGen.Load()
 		fillClaimSink(ctx, "pool", idx, gen, time.Since(dialStart))
-		return &pooledConnWrap{Conn: conn, pool: p, slotIdx: idx, addr: addr, gen: gen, endpointID: idx, endpointGen: gen, dialLatency: time.Since(dialStart)}, nil
+		return &pooledConnWrap{Conn: conn, pool: p, slot: slot, slotIdx: idx, addr: addr, gen: gen, endpointID: idx, endpointGen: gen, dialLatency: time.Since(dialStart)}, nil
 	}
 
 	// All healthy slots exhausted — dispatch async NEWNYM (non-blocking).
@@ -229,12 +438,35 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 	return nil, fmt.Errorf("circuit pool exhausted: all slots unhealthy")
 }
 
+// slotView is one slot's hoisted selection inputs for pool DialContext.
+type slotView struct {
+	slot *CircuitSlot
+	idx  int
+	eff  float64
+	load int64
+}
+
+// sortSlotViews orders views by (eff, load, idx) — deterministic.
+func sortSlotViews(v []slotView) {
+	for i := 1; i < len(v); i++ {
+		for j := i; j > 0; j-- {
+			a, b := v[j], v[j-1]
+			if a.eff < b.eff || (a.eff == b.eff && (a.load < b.load || (a.load == b.load && a.idx < b.idx))) {
+				v[j], v[j-1] = v[j-1], v[j]
+			} else {
+				break
+			}
+		}
+	}
+}
+
 // recordDialSuccess records a successful dial for a slot: success counters,
-// error-backoff reset, scoring sample (success-only EWMA + ok counter), and
-// max-age rotation marking.
-func (p *CircuitPoolBackend) recordDialSuccess(slot *CircuitSlot, idx int) {
+// error-backoff reset, scoring sample (success-only EWMA + ok counter with
+// the REAL dial latency — a 0 sample would pin EWMA at 0 and disable the
+// latency factor), and max-age rotation marking.
+func (p *CircuitPoolBackend) recordDialSuccess(slot *CircuitSlot, idx int, latency time.Duration) {
 	slot.RecordSuccess()
-	slot.RecordDialOutcome(true, 0, DefaultScoreParams().Alpha)
+	slot.RecordDialOutcome(true, latency, p.scoreParamsLive().Alpha)
 	metrics.Default().Inc("relay_pool_slot_dial_ok_total", map[string]string{"slot": strconv.Itoa(idx)})
 	p.resetErrorBackoff()
 	if slot.ShouldRotate(p.maxAge) {
@@ -247,13 +479,10 @@ func (p *CircuitPoolBackend) recordDialSuccess(slot *CircuitSlot, idx int) {
 // Triggers a rate-limited NEWNYM when threshold is exceeded.
 // A slotIdx of -1 (or out of range) means "unknown slot": the signal is
 // unattributed — dispatch the rate-limited NEWNYM WITHOUT marking any slot
-// unhealthy. The old lastSlot-guess fallback is gone: lastSlot is a global
-// last-writer-wins register, and under concurrency it attributes to the
-// most recent dialer instead of the failed request's slot, churning an
-// innocent slot (with maxAnomaly=2, two concurrent failures kill it) while
-// the culprit escapes. Attributed callers must pass the slot index from
-// their EndpointClaim (see ReportOutcome); only truly unclaimed transports
-// use -1. With no serving history (cold backend) behavior is unchanged.
+// unhealthy. (A previous version guessed via a lastSlot register; that was
+// a global last-writer-wins register, and under concurrency it attributed
+// to the most recent dialer instead of the failed request's slot, churning
+// an innocent slot while the culprit escaped. Attributed callers must pass
 func (p *CircuitPoolBackend) ReportAnomaly(slotIdx int) {
 	if slotIdx < 0 || slotIdx >= len(p.slots) {
 		p.anomalyNEWNYM(-1)
@@ -266,6 +495,91 @@ func (p *CircuitPoolBackend) ReportAnomaly(slotIdx int) {
 		p.logf("[pool] slot %d unhealthy after %d anomalies", slotIdx, slot.AnomalyCount())
 		p.anomalyNEWNYM(slotIdx)
 	}
+}
+
+// ReportOutcome records one attributed request outcome for a pool slot:
+// success/failure samples feed the scoring stats (failures skip EWMA),
+// and failures drive the quarantine state machine (consec-fails gate OR
+// success-rate gate, single attributed NEWNYM per entry, suppression
+// while held, single-probe probation with backoff) — mirroring
+// MultiTorBackend.ReportOutcome/onEndpointFailure. Outcome.ID is the slot
+// index; Outcome.Gen must match the live poolGen (stale = the slot
+// rotated since the dial, sample belongs to a dead circuit). Unknown IDs
+// and stale gens drop silently, never panic. Success clears consec fails
+// AND backoff via recordSuccess (keeps EWMA to decay).
+func (p *CircuitPoolBackend) ReportOutcome(o Outcome) {
+	if o.ID < 0 || o.ID >= len(p.slots) {
+		return
+	}
+	if o.Gen != 0 && o.Gen != p.poolGen.Load() {
+		return
+	}
+	slot := p.slots[o.ID]
+	sp := p.scoreParamsLive()
+	slot.RecordDialOutcome(o.Success, o.Latency, sp.Alpha)
+	if o.Success {
+		slot.quar.recordSuccess()
+		return
+	}
+	cfg := p.quarConfigLive()
+	now := time.Now()
+	if slot.quar.State() == StateProbation {
+		p.requarantineSlot(slot, o.ID, cfg, now)
+		return
+	}
+	enter := slot.quar.recordFailure(cfg.AfterFails)
+	if !enter {
+		ok := slot.DialSuccesses()
+		fail := slot.DialFailures()
+		if total := ok + fail; total >= sp.MinSamples && total > 0 &&
+			float64(ok)/float64(total) < 0.3 {
+			enter = slot.quar.State() == StateActive
+		}
+	}
+	if !enter {
+		return
+	}
+	p.enterSlotQuarantine(slot, o.ID, cfg, now)
+}
+
+// enterSlotQuarantine moves Active->Quarantined (winner-only), fires the
+// entry metric + ONE attributed NEWNYM (coalesced via anomalyNEWNYM, which
+// shares the nymInflight gate so entry storms collapse).
+func (p *CircuitPoolBackend) enterSlotQuarantine(slot *CircuitSlot, idx int, cfg QuarantineConfig, now time.Time) {
+	if _, entered := slot.quar.enterQuarantine(now, cfg.Duration, cfg.MaxDuration); !entered {
+		return
+	}
+	p.logf("[pool] slot %d quarantined, holding %v", idx, cfg.Duration)
+	metrics.Default().Inc("lano_quarantine_total", map[string]string{
+		"instance": "pool-slot-" + strconv.Itoa(idx),
+		"reason":   "consec-fails",
+	})
+	p.anomalyNEWNYM(idx)
+}
+
+// requarantineSlot moves Probation->Quarantined with doubled backoff after
+// a failed probe. Mirrors MultiTorBackend.requarantine.
+func (p *CircuitPoolBackend) requarantineSlot(slot *CircuitSlot, idx int, cfg QuarantineConfig, now time.Time) {
+	if !slot.quar.state.CompareAndSwap(int32(StateProbation), int32(StateQuarantined)) {
+		return
+	}
+	slot.quar.probeInFlight.Store(false)
+	n := slot.quar.quarantineCount.Add(1)
+	d := cfg.Duration
+	for i := int64(1); i < n && d < cfg.MaxDuration; i++ {
+		d *= 2
+		if d > cfg.MaxDuration || d <= 0 {
+			d = cfg.MaxDuration
+			break
+		}
+	}
+	slot.quar.quarantinedUntil.Store(now.Add(d).UnixNano())
+	p.logf("[pool] slot %d re-quarantined (probation-probe-failure), holding %v", idx, d)
+	metrics.Default().Inc("lano_quarantine_total", map[string]string{
+		"instance": "pool-slot-" + strconv.Itoa(idx),
+		"reason":   "probation-probe-failure",
+	})
+	p.anomalyNEWNYM(idx)
 }
 
 func (p *CircuitPoolBackend) dialTor(ctx context.Context, addr string, slotIdx int) (net.Conn, error) {
@@ -463,7 +777,7 @@ func (p *CircuitPoolBackend) Status() map[string]interface{} {
 		ConsecFails  int64   `json:"consec_fails"`
 	}
 
-	sp := DefaultScoreParams()
+	sp := p.scoreParamsLive()
 	slots := make([]slotInfo, len(p.slots))
 	healthyCount := 0
 	totalReqs := int64(0)
@@ -472,6 +786,8 @@ func (p *CircuitPoolBackend) Status() map[string]interface{} {
 		ewma := slot.DialLatencyEWMA()
 		ok := slot.DialSuccesses()
 		fail := slot.DialFailures()
+		state := slot.quar.State().String()
+		consec := slot.quar.ConsecFails()
 		slot.mu.RLock()
 		slots[i] = slotInfo{
 			Healthy:      slot.healthy,
@@ -483,8 +799,8 @@ func (p *CircuitPoolBackend) Status() map[string]interface{} {
 			DialOK:       ok,
 			DialErr:      fail,
 			Quality:      QualityScore(ok, fail, int64(ewma), sp),
-			State:        "active",
-			ConsecFails:  0,
+			State:        state,
+			ConsecFails:  consec,
 		}
 		if slot.healthy {
 			healthyCount++
@@ -600,6 +916,7 @@ func poolKey(slotIdx int, addr string) string {
 type pooledConnWrap struct {
 	net.Conn
 	pool     *CircuitPoolBackend
+	slot     *CircuitSlot
 	slotIdx  int
 	addr     string
 	gen      int64
@@ -626,6 +943,12 @@ func (w *pooledConnWrap) DialLatency() time.Duration { return w.dialLatency }
 func (w *pooledConnWrap) Close() error {
 	if w.returned.Swap(true) {
 		return nil // already returned
+	}
+	// Balance the slot.inFlight Add(1) taken at checkout in DialContext.
+	// Exactly-once: returned CAS above guarantees one decrement even
+	// across Close/Discard double-calls (mirrors inFlightConn).
+	if w.slot != nil {
+		w.slot.inFlight.Add(-1)
 	}
 	if w.errored.Load() || w.gen != w.pool.poolGen.Load() {
 		return w.Conn.Close()

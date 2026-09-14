@@ -19,10 +19,7 @@ func TestRegression_PoolColdAnomalyNoPhantomRotation(t *testing.T) {
 		ControlAddr:  "127.0.0.1:1", // unreachable: NEWNYM fails fast, no reset
 		CircuitCount: 3,
 	})
-	// Cold: lastSlot==-1, no dials served.
-	if got := pool.lastSlot.Load(); got != -1 {
-		t.Fatalf("lastSlot = %d; want -1 (cold backend)", got)
-	}
+	// Cold: no dials served.
 	pool.ReportAnomaly(-1)
 	// Give the async NEWNYM goroutine (if any) a chance to run; it must fail
 	// on the unreachable control port, so no reset can occur either way.

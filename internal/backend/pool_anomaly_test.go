@@ -13,8 +13,6 @@ func TestPool_UnknownSlotAnomalyMarksNothing(t *testing.T) {
 		TorAddress:   "127.0.0.1:1",
 		CircuitCount: 3,
 	})
-	// Fake serving history on slot 0 (would have been the guess victim).
-	pool.lastSlot.Store(0)
 	for i := 0; i < 10; i++ {
 		pool.ReportAnomaly(-1)
 	}
