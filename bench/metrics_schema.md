@@ -16,7 +16,13 @@ listener on `metrics.address` + `metrics.path`, default `/metrics`).
 | Series | Labels | Written at |
 |---|---|---|
 | `lano_requests_total` | `instance` | `internal/backend/multitor.go` (`IncKey`, per dial) |
+| `lano_dial_ok_total` | `instance` | `internal/backend/multitor.go` (`IncKey` pre-baked, per successful dial) |
+| `lano_dial_err_total` | `instance` | `internal/backend/multitor.go` (`IncKey` pre-baked, per failed dial attempt) |
 | `lano_rotations_total` | `instance`, `trigger` (`anomaly`, `health`) | `internal/backend/torlifecycle.go` (after NEWNYM) |
+| `lano_quarantine_total` | `instance`, `reason` (`consec-fails`, `probation-probe-failure`) | `internal/backend/multitor.go` + `pool.go` (quarantine entry; pool instance label is `pool-slot-N`) |
+| `relay_pool_slot_dial_ok_total` | `slot` | `internal/backend/pool.go` (`IncKey` pre-baked, per successful slot dial) |
+| `relay_pool_slot_dial_err_total` | `slot` | `internal/backend/pool.go` (`IncKey` pre-baked, per failed slot dial) |
+| `relay_pool_requests_total` | none | circuit-pool `Status().total_requests` (**counter** semantics — use `rate()`/`increase()`; exposition TYPE is `counter`) |
 
 ### Gauges (`internal/health.handleMetrics` + registry `Set`)
 
@@ -24,10 +30,12 @@ listener on `metrics.address` + `metrics.path`, default `/metrics`).
 |---|---|---|
 | `relay_healthy` | none | `handleMetrics`: 1 = healthy, 0 = degraded |
 | `lano_in_flight` | `instance` | per-instance in-flight count from multi-tor `Status()` |
-| `lano_exit_ip` | `instance`, `ip` | info-style gauge (`1`), observed exit IP per instance |
+| `lano_dial_latency_ewma_ms` | `instance` | success-only EWMA dial latency (ms) from `Status().dial_ewma_ms` |
+| `lano_endpoint_quality` | `instance` | quality permille (0-1000) from `Status().quality` |
+| `lano_endpoint_state` | `instance`, `state` | quarantine state code (0=active 1=quarantined 2=probation 3=draining 4=closed) |
+| `lano_exit_ip` | `instance`, `ip` | info-style gauge (`1`), observed exit IP per instance (label churns per rotation — bound Prometheus retention/drops accordingly) |
 | `relay_pool_slots_total` | none | circuit-pool `Status().total_slots` |
 | `relay_pool_slots_healthy` | none | circuit-pool `Status().healthy_slots` |
-| `relay_pool_requests_total` | none | circuit-pool `Status().total_requests` |
 | `relay_pool_nym_backoff` | none | circuit-pool `Status().nym_backoff` |
 | `relay_rotation_requests` | none | rotation request count (counter semantics) |
 

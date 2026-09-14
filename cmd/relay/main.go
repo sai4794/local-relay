@@ -812,9 +812,12 @@ func startMetricsServer(ctx context.Context, cfg *config.Config, torLifecycle *b
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "# LANO local-relay metrics\n")
+		fmt.Fprintf(w, "# HELP lano_up Whether the relay process is up (1=up)\n")
+		fmt.Fprintf(w, "# TYPE lano_up gauge\n")
 		fmt.Fprintf(w, "lano_up 1\n")
 		if torLifecycle != nil {
+			fmt.Fprintf(w, "# HELP lano_tor_instances Ready Tor instances\n")
+			fmt.Fprintf(w, "# TYPE lano_tor_instances gauge\n")
 			fmt.Fprintf(w, "lano_tor_instances %d\n", torLifecycle.GetReadyCount())
 		}
 		// Both ports agree: the standalone port renders the same shared

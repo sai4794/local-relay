@@ -100,8 +100,15 @@ func TestPool_EnvOverrides(t *testing.T) {
 	path := writePoolConfig(t, "server:\n  http: \"127.0.0.1:18081\"\n")
 	t.Setenv("POOL_ENABLED", "false")
 	t.Setenv("POOL_EWMA_ALPHA", "0.5")
+	t.Setenv("POOL_LATENCY_REF_MS", "1500")
+	t.Setenv("POOL_MIN_SAMPLES", "8")
+	t.Setenv("POOL_MIN_QUALITY", "0.2")
 	t.Setenv("POOL_SELECTION", "po2")
+	t.Setenv("POOL_PO2_SAMPLES", "4")
+	t.Setenv("POOL_QUARANTINE_AFTER_FAILS", "5")
 	t.Setenv("POOL_QUARANTINE_SECS", "120")
+	t.Setenv("POOL_MAX_QUARANTINE_SECS", "600")
+	t.Setenv("POOL_PROBATION_PROBES", "2")
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -112,11 +119,32 @@ func TestPool_EnvOverrides(t *testing.T) {
 	if cfg.Pool.EWMAAlpha != 0.5 {
 		t.Errorf("POOL_EWMA_ALPHA not applied, got %v", cfg.Pool.EWMAAlpha)
 	}
+	if cfg.Pool.LatencyRefMs != 1500 {
+		t.Errorf("POOL_LATENCY_REF_MS not applied, got %d", cfg.Pool.LatencyRefMs)
+	}
+	if cfg.Pool.MinSamples != 8 {
+		t.Errorf("POOL_MIN_SAMPLES not applied, got %d", cfg.Pool.MinSamples)
+	}
+	if cfg.Pool.MinQuality != 0.2 {
+		t.Errorf("POOL_MIN_QUALITY not applied, got %v", cfg.Pool.MinQuality)
+	}
 	if cfg.Pool.Selection != "po2" {
 		t.Errorf("POOL_SELECTION not applied, got %q", cfg.Pool.Selection)
 	}
+	if cfg.Pool.Po2Samples != 4 {
+		t.Errorf("POOL_PO2_SAMPLES not applied, got %d", cfg.Pool.Po2Samples)
+	}
+	if cfg.Pool.QuarantineAfterFails != 5 {
+		t.Errorf("POOL_QUARANTINE_AFTER_FAILS not applied, got %d", cfg.Pool.QuarantineAfterFails)
+	}
 	if cfg.Pool.QuarantineSecs != 120 {
 		t.Errorf("POOL_QUARANTINE_SECS not applied, got %d", cfg.Pool.QuarantineSecs)
+	}
+	if cfg.Pool.MaxQuarantineSecs != 600 {
+		t.Errorf("POOL_MAX_QUARANTINE_SECS not applied, got %d", cfg.Pool.MaxQuarantineSecs)
+	}
+	if cfg.Pool.ProbationProbes != 2 {
+		t.Errorf("POOL_PROBATION_PROBES not applied, got %d", cfg.Pool.ProbationProbes)
 	}
 
 	t.Setenv("POOL_EWMA_ALPHA", "garbage")

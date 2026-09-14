@@ -354,9 +354,13 @@ func (hs *HealthServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// Pool stats are nested: snapshot["backend"]["backend"] = pool.Status()
 	if b, ok := snapshot["backend"]; ok {
 		if bm, ok := b.(map[string]interface{}); ok {
-			// Try direct fields first, then nested pool stats
+			// Try direct fields first, then nested pool stats.
+			// relay_pool_requests_total is a cumulative counter (TYPE
+			// counter, for rate()/increase()); the slot/cartinality
+			// snapshots stay gauges.
 			poolFields := []string{"total_slots", "healthy_slots", "total_requests", "nym_backoff"}
 			poolLabels := []string{"relay_pool_slots_total", "relay_pool_slots_healthy", "relay_pool_requests_total", "relay_pool_nym_backoff"}
+			poolTypes := []string{"gauge", "gauge", "counter", "gauge"}
 			poolHelp := []string{
 				"Total circuit pool slots",
 				"Healthy circuit pool slots",
@@ -365,7 +369,7 @@ func (hs *HealthServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			}
 			for i, field := range poolFields {
 				if val, ok := bm[field]; ok {
-					fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %v\n", poolLabels[i], poolHelp[i], poolLabels[i], poolLabels[i], val)
+					fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %v\n", poolLabels[i], poolHelp[i], poolLabels[i], poolTypes[i], poolLabels[i], val)
 				}
 			}
 			// Check nested pool status
@@ -373,7 +377,7 @@ func (hs *HealthServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 				if psm, ok := ps.(map[string]interface{}); ok {
 					for i, field := range poolFields {
 						if val, ok := psm[field]; ok {
-							fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %v\n", poolLabels[i], poolHelp[i], poolLabels[i], poolLabels[i], val)
+							fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %v\n", poolLabels[i], poolHelp[i], poolLabels[i], poolTypes[i], poolLabels[i], val)
 						}
 					}
 				}
