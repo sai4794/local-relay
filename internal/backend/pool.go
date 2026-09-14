@@ -419,6 +419,13 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 		if err != nil {
 			slot.RecordFailure()
 			slot.RecordDialOutcome(false, 0, sp.Alpha)
+			// A dial failure on a probation-claimed probe releases the
+			// slot (mirrors the multitor releaseProbe path): the failure
+			// proves sickness, and holding the claim would wedge the
+			// endpoint until expiry.
+			if slot.quar.State() == StateProbation {
+				slot.quar.probeInFlight.CompareAndSwap(true, false)
+			}
 			metrics.Default().IncKey("relay_pool_slot_dial_err_total{slot=\""+strconv.Itoa(idx)+"\"}", 1)
 			p.logf("[pool] slot %d dial failed: %v", idx, err)
 			continue

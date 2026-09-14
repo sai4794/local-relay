@@ -438,3 +438,38 @@ func TestQuarantine_CheckHealthDefersToQuarantineHold(t *testing.T) {
 		t.Fatalf("legacy FailCount after release = %d; want 1 (path resumed)", got)
 	}
 }
+
+// All-probation-claimed selection must NOT serve a second concurrent probe
+// through the least-bad fallback: with every candidate probation-claimed
+// (probe held elsewhere), selection returns nil (fail-closed) instead of
+// handing the sick endpoint a probe herd. Pre-fix pickBest tracked
+// probation-claimed as fallback fuel and served it.
+func TestQuarantine_AllProbationClaimedFailsClosed(t *testing.T) {
+	var nym int64Chan
+	stop := make(chan struct{})
+	addr := serveQuarantineControl(t, &nym, stop)
+	_, m := quarantineLifecycle(t, addr)
+	m.SetQuarantineConfig(QuarantineConfig{AfterFails: 3, Duration: time.Hour, MaxDuration: time.Hour, Probes: 1})
+
+	// Quarantine both, force-expiry, promote both to probation, claim both.
+	now := time.Now()
+	for _, id := range []int{1, 2} {
+		inst := m.getInstanceByID(id)
+		gen := inst.CircuitGen()
+		for i := 0; i < 3; i++ {
+			m.ReportOutcome(Outcome{ID: id, Gen: gen, Success: false, Status: 503})
+		}
+		inst.quar.quarantinedUntil.Store(now.Add(-time.Second).UnixNano())
+	}
+	ready := []*TorInstance{m.getInstanceByID(1), m.getInstanceByID(2)}
+	// First selection claims probe on the winner...
+	first, _ := m.selectInstance(ready)
+	if first == nil {
+		t.Fatal("first selection = nil; want one probe claim")
+	}
+	// ...second selection must fail closed, not serve the other claimed probe.
+	// Drive the raw pickBest path: both probation-claimed now.
+	if got, _ := m.selectInstance(ready); got != nil {
+		t.Fatalf("all-probation-claimed selection = %d; want nil (fail-closed, no herd)", got.ID)
+	}
+}

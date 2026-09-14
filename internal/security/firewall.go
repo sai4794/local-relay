@@ -66,6 +66,7 @@ func getDefaultBlockedRanges() []*net.IPNet {
 		"100.64.0.0/10",
 		"198.18.0.0/15",
 		"::1/128",
+		"::/128", // unspecified: dials the local stack, never a remote Tor target
 		"fc00::/7",
 		"fe80::/10",
 		// IPv6 transition / special-use and multicast ranges, mirroring the

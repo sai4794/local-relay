@@ -192,8 +192,14 @@ func (q *endpointQuarantine) claimProbe(now time.Time) bool {
 
 // probeExpired reports whether the claimed probe slot outlived its budget
 // without an outcome (holder died mid-dial). The budget is deliberately
-// generous (2x the quarantine base, min 60s): probes normally resolve in
-// seconds, so expiry only fires for wedged holders.
+// generous (2x the quarantine base, min 60s): dial-phase probes normally
+// resolve in seconds, so expiry only fires for wedged holders. NOTE: the
+// budget covers the DIAL + first-outcome window, not a full tunnel
+// lifetime — established CONNECT/SOCKS tunnels hold their claim until
+// their terminal outcome (relay close), and a second dialer must not
+// steal the probe mid-tunnel. Long tunnels therefore extend the claim via
+// renewProbe (heartbeat); expiry only fires when neither outcome nor
+// heartbeat arrived within budget.
 func (q *endpointQuarantine) probeExpired(now time.Time, base time.Duration) bool {
 	if !q.probeInFlight.Load() {
 		return false
@@ -222,16 +228,33 @@ func (q *endpointQuarantine) releaseStaleProbe(now time.Time, base time.Duration
 	return q.probeInFlight.CompareAndSwap(true, false)
 }
 
-// eligibleForSelection reports whether the endpoint may serve traffic now:
-// Active always; Probation only for the single probe holder (callers claim
-// via claimProbe); Quarantined only after expiry (promote first via
-// pollPromotion). Draining/Closed never serve.
+// renewProbe heartbeats a live probe claim (long tunnel still getting
+// outcomes/bytes): extends the expiry budget so a legitimate slow probe
+// is never mistaken for a wedged holder. Only the holder's path calls it;
+// a non-holder's renew is a no-op returning false.
+func (q *endpointQuarantine) renewProbe(now time.Time) bool {
+	if q.State() != StateProbation || !q.probeInFlight.Load() {
+		return false
+	}
+	q.probeAt.Store(now.UnixNano())
+	return true
+}
+
+// eligibleForSelection is a conservative point-in-time predicate for
+// non-selection callers (e.g. health summaries deciding whether an
+// endpoint could serve right now). Active always; Probation only while a
+// probe is actually held (claimed AND unexpired — an expired-but-unclaimed
+// slot still needs releaseStaleProbe + claimProbe before serving);
+// Quarantined only after expiry (promote first via pollPromotion).
+// Draining/Closed never serve. NOTE: this is NOT the selection gate —
+// selection must claim via claimProbe (holder-only), because this
+// predicate returns true for every caller while a probe is held.
 func (q *endpointQuarantine) eligibleForSelection(now time.Time) bool {
 	switch q.State() {
 	case StateActive:
 		return true
 	case StateProbation:
-		return q.probeInFlight.Load()
+		return q.probeInFlight.Load() && !q.probeExpired(now, DefaultQuarantineConfig().Duration)
 	case StateQuarantined:
 		return now.UnixNano() >= q.quarantinedUntil.Load()
 	default:

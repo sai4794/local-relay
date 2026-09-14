@@ -58,6 +58,7 @@ var defaultConfig = &Config{
 			"100.64.0.0/10",
 			"198.18.0.0/15",
 			"::1/128",
+			"::/128",
 			"fc00::/7",
 			"fe80::/10",
 			// IPv6 transition / special-use and multicast, mirroring the

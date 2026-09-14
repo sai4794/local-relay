@@ -221,18 +221,39 @@ func TestRegression_SelfDialUnspecifiedBind(t *testing.T) {
 	for _, listen := range []string{
 		net.JoinHostPort("0.0.0.0", port),
 		net.JoinHostPort("::", port),
+		net.JoinHostPort("127.0.0.1", port),
 	} {
 		p.listenAddr.Store(listen)
 		for _, target := range []string{
 			net.JoinHostPort("127.0.0.1", port),
 			net.JoinHostPort("localhost", port),
+			net.JoinHostPort("0.0.0.0", port),
+			"0177.0.0.1:" + port, // octal loopback
+			"2130706433:" + port, // integer loopback
+			"127.1:" + port,      // short-form loopback
+			"0x7f.0.0.1:" + port, // hex loopback
+			"127.0.0.1.:" + port, // trailing-dot loopback
+			"[::]:" + port,       // unspecified target dials local stack
 		} {
 			if !p.isSelfDial(target) {
-				t.Errorf("isSelfDial(%q) with listen %q = false; want true (unspecified bind accepts loopback)", target, listen)
+				t.Errorf("isSelfDial(%q) with listen %q = false; want true", target, listen)
 			}
 		}
 		if other := net.JoinHostPort("127.0.0.1", "1"); p.isSelfDial(other) {
 			t.Errorf("isSelfDial(%q) with listen %q = true; want false (different port)", other, listen)
+		}
+		if external := net.JoinHostPort("93.184.216.34", port); p.isSelfDial(external) {
+			t.Errorf("isSelfDial(%q) with listen %q = true; want false (public IP never self)", external, listen)
+		}
+	}
+	// Reverse direction: loopback listener + unspecified target is also self.
+	p.listenAddr.Store(net.JoinHostPort("127.0.0.1", port))
+	for _, target := range []string{
+		net.JoinHostPort("0.0.0.0", port),
+		"[::]:" + port,
+	} {
+		if !p.isSelfDial(target) {
+			t.Errorf("isSelfDial(%q) with loopback listen = false; want true (unspecified target dials local)", target)
 		}
 	}
 }

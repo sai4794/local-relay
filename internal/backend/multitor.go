@@ -221,6 +221,13 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	// success/failure samples per attempt. Scores never fail a dial closed:
 	// with no fresh candidate the least-bad ready instance still serves.
 	inst, idx := m.selectInstance(ready)
+	if inst == nil {
+		// All candidates probation-claimed (every probe held by another
+		// in-flight dial): fail closed rather than herding a second
+		// probe onto a sick endpoint. The held probes resolve shortly
+		// (success/failure outcomes), freeing the next dial.
+		return nil, fmt.Errorf("all Tor instances busy probing — retry shortly")
+	}
 
 	// IsolateSOCKSAuth: isolation user groups streams to this instance and circuit generation,
 	// allowing Tor to reuse warm 3-hop circuits while maintaining instance isolation and
@@ -231,14 +238,25 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 	// Per-attempt dial failures score err samples on the attempted instance
 	// (the outcome path only sees the winner). EWMA untouched — failure
 	// latency mixes fast-refused with slow-timeout and would pollute it.
+	// A dial failure on a probation-claimed probe releases the slot: the
+	// failure proves sickness as loudly as a request outcome, and holding
+	// the claim would wedge the endpoint until expiry. Release (not
+	// re-quarantine with NEWNYM): the request outcome path owns the
+	// re-quarantine signal and the claim sink may still report.
 	dialScoreAlpha := m.scoreParams.Alpha
 	if !m.scored.Load() {
 		dialScoreAlpha = DefaultScoreParams().Alpha
+	}
+	releaseProbe := func(t *TorInstance) {
+		if t.quar.State() == StateProbation {
+			t.quar.probeInFlight.CompareAndSwap(true, false)
+		}
 	}
 	if err != nil {
 		m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
 		inst.RecordDialOutcome(false, 0, dialScoreAlpha)
 		inst.MarkLivenessDead()
+		releaseProbe(inst)
 		metrics.Default().IncKey(inst.dialErrKey(), 1)
 		// Try next instance with its isolation user
 		for i := 1; i < len(ready); i++ {
@@ -253,6 +271,7 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 			m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
 			inst.RecordDialOutcome(false, 0, dialScoreAlpha)
 			inst.MarkLivenessDead()
+			releaseProbe(inst)
 			metrics.Default().IncKey(inst.dialErrKey(), 1)
 		}
 		if err != nil {
@@ -458,6 +477,14 @@ func (m *MultiTorBackend) pickBest(views []candidateView) (*TorInstance, int) {
 		if m.isExcluded(v.cand) {
 			// Track the least-bad excluded candidate per freshness class
 			// so an all-quarantined pool still serves instead of failing.
+			// Probation-claimed (probe already held by another dialer) is
+			// NOT least-bad fallback fuel: serving through the fallback
+			// would hand a second concurrent probe to the sick endpoint
+			// (probe herd). Only Quarantined (hold active or promotion
+			// lost the race) qualifies for fallback.
+			if v.cand.quar.State() == StateProbation {
+				continue
+			}
 			if fresh && (!anyExcludedFresh || better(*v, *excludedFresh)) {
 				cp := *v
 				excludedFresh = &cp
@@ -484,13 +511,20 @@ func (m *MultiTorBackend) pickBest(views []candidateView) (*TorInstance, int) {
 	if bestAny != nil {
 		return bestAny.cand, bestAny.idx
 	}
-	// Every candidate excluded (e.g. all quarantined): serve the least-bad
-	// excluded one rather than failing closed. Fresh-excluded wins when it
-	// exists to preserve the freshness preference.
+	// Every candidate excluded: serve the least-bad quarantined one
+	// rather than failing closed — but NEVER a probation-claimed probe
+	// (that would hand a second concurrent probe to the sick endpoint).
+	// When every candidate is probation-claimed (all probes held
+	// elsewhere), return nil: the caller fails closed and the held probes
+	// resolve the endpoints. Fresh-excluded wins when it exists to
+	// preserve the freshness preference.
 	if anyExcludedFresh {
 		return excludedFresh.cand, excludedFresh.idx
 	}
-	return excludedAny.cand, excludedAny.idx
+	if excludedAny != nil {
+		return excludedAny.cand, excludedAny.idx
+	}
+	return nil, -1
 }
 
 // selectInstanceWeighted is the full-scan least-effective-load selection.

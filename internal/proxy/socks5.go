@@ -440,12 +440,15 @@ func (p *SOCKS5Proxy) singleLookupVerdict(host string) ([]net.IP, bool) {
 // isSelfDial reports whether target (host:port) addresses this proxy's own
 // listen socket. Same semantics as HTTPProxy.isSelfDial: exact
 // configured-address match (covers hostnames like "localhost") plus a
-// both-sides-loopback match for IP spellings, so a non-loopback hostname
-// bound by config can never collide with a loopback target on the same port
-// number. "localhost" normalizes to loopback: it has no ParseIP form, so it
-// is treated as loopback explicitly on both sides. Unknown listen address
-// (never started, e.g. unit-constructed proxies) returns false. Fail-closed:
-// a match means handleConnect replies 0x01 and returns without tunneling.
+// both-sides-loopback match over canonical IPs (shared numeric parser, so
+// octal/hex/integer/short/trailing-dot spellings match), so a non-loopback
+// hostname bound by config can never collide with a loopback target on the
+// same port number. Unspecified counts on BOTH sides (a 0.0.0.0/:: target
+// dials the local stack). "localhost" normalizes to loopback: it has no
+// ParseIP form, so it is treated as loopback explicitly on both sides.
+// Unknown listen address (never started, e.g. unit-constructed proxies)
+// returns false. Fail-closed: a match means handleConnect replies 0x01 and
+// returns without tunneling.
 func (p *SOCKS5Proxy) isSelfDial(target string) bool {
 	addr, _ := p.listenAddr.Load().(string)
 	if addr == "" {
@@ -466,16 +469,8 @@ func (p *SOCKS5Proxy) isSelfDial(target string) bool {
 	if strings.EqualFold(tHost, lHost) {
 		return true
 	}
-	// Resolved-loopback match for IP spellings: only block when BOTH sides
-	// resolve to loopback. "localhost" has no ParseIP form, so normalize it
-	// to loopback explicitly on each side. An unspecified listen host
-	// (0.0.0.0 or ::) accepts loopback traffic on that port, so it counts
-	// as loopback-equivalent on the listen side (mirrors HTTPProxy).
-	tLoop := strings.EqualFold(strings.TrimSuffix(tHost, "."), "localhost") ||
-		net.ParseIP(strings.Trim(tHost, "[]")).IsLoopback()
-	lLoop := strings.EqualFold(strings.TrimSuffix(lHost, "."), "localhost") ||
-		net.ParseIP(strings.Trim(lHost, "[]")).IsLoopback() ||
-		isUnspecifiedHost(lHost)
+	tLoop := isLoopbackHost(tHost) || isUnspecifiedHost(tHost)
+	lLoop := isLoopbackHost(lHost) || isUnspecifiedHost(lHost)
 	return tLoop && lLoop
 }
 

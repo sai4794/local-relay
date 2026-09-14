@@ -491,9 +491,12 @@ type TorLifecycle struct {
 	// (keyed by instance ID, guarded by authFailMu). A stale or rotated
 	// control cookie makes every NEWNYM fail auth until the cache is
 	// evicted; after authFailThreshold consecutive rejections the instance
-	// is marked not-ready so CheckHealth recycles it instead of failing
-	// rotations forever. Success (any non-auth-rejected SIGNAL result,
-	// including cooldown skip) resets the count.
+	// is marked not-ready, and CheckHealth re-verifies control auth for
+	// not-ready-but-SOCKS-alive instances (re-ready on recovery, recycle
+	// only if the daemon itself is down). Success (any non-auth-rejected
+	// SIGNAL result) resets the count. Note: the NEWNYM cooldown-skip path
+	// (claim==0) returns before noteAuthResult, so skips neither reset nor
+	// increment — "consecutive" means consecutive attempted signals.
 	authFailObs map[int]int
 	authFailMu  sync.Mutex
 }
@@ -892,17 +895,30 @@ func (tl *TorLifecycle) CheckHealth(ctx context.Context) int {
 
 	var unhealthy []*TorInstance
 	for _, inst := range instances {
-		// Heal not-ready instances: a ready instance that stops answering
-		// (killed process, wedged daemon) flips IsReady() false via the
-		// liveness check. Re-probe it here — a single miss is transient, but
-		// consecutive not-ready observations re-run kill/spawn so a wedged
-		// daemon is recycled instead of sitting not-ready forever.
+		// Heal not-ready instances: a not-ready instance whose SOCKS port
+		// still answers is a control-plane casualty (e.g. repeated
+		// control-auth rejection marked it not-ready), NOT a dead daemon:
+		// re-verify control auth — a pass re-readies it immediately, a
+		// transport failure leaves it parked, and a definitive rejection
+		// re-arms the eviction/retry cycle instead of wedging forever.
 		// RefreshLiveness re-probes AND re-stamps the dial-path cache, so
 		// the background health loop keeps the hot-path verdicts fresh.
 		if !inst.RefreshLiveness() {
 			if tl.isSocksPortReady(inst.GetSocksPort()) {
-				resetNotReady(inst.ID)
-				inst.ResetFailCount()
+				// SOCKS alive but liveness dead (or Ready flag cleared):
+				// the daemon runs, so this is a control-plane casualty —
+				// re-verify control auth. A pass means the cookie healed
+				// (rotated on disk, cache evicted): re-ready at once and
+				// clear the auth strikes. A transport failure leaves it
+				// parked for the next pass. A definitive rejection
+				// re-arms eviction via noteAuthResult (VerifyAuth path
+				// below records it).
+				if tl.reverifyControlAuth(inst) {
+					resetNotReady(inst.ID)
+					inst.ResetFailCount()
+					inst.SetReady(true)
+					tl.logf("Tor instance %d control auth recovered, re-readied", inst.ID)
+				}
 				continue
 			}
 			obs := bumpNotReady(inst.ID)
@@ -1130,6 +1146,13 @@ func (tl *TorLifecycle) killInstance(inst *TorInstance) {
 			tl.cookieMu.Lock()
 			delete(tl.cookieCache, inst.ID)
 			tl.cookieMu.Unlock()
+			// Clear auth-failure strikes too: the replacement daemon is
+			// a fresh process with a fresh cookie — inheriting the dead
+			// instance's count would re-mark it not-ready on a single
+			// subsequent rejection.
+			tl.authFailMu.Lock()
+			delete(tl.authFailObs, inst.ID)
+			tl.authFailMu.Unlock()
 			return
 		}
 	}
@@ -1151,6 +1174,9 @@ func (tl *TorLifecycle) ShutdownAll() {
 	tl.notReadyMu.Lock()
 	tl.notReadyObs = make(map[int]int)
 	tl.notReadyMu.Unlock()
+	tl.authFailMu.Lock()
+	tl.authFailObs = make(map[int]int)
+	tl.authFailMu.Unlock()
 }
 
 // shutdownAllLocked stops all Tor instances. Callers must hold healthMu.
@@ -1169,6 +1195,9 @@ func (tl *TorLifecycle) shutdownAllLocked() {
 	tl.notReadyMu.Lock()
 	tl.notReadyObs = make(map[int]int)
 	tl.notReadyMu.Unlock()
+	tl.authFailMu.Lock()
+	tl.authFailObs = make(map[int]int)
+	tl.authFailMu.Unlock()
 }
 
 // RequestNewCircuit rotates the instance's circuits: SIGNAL NEWNYM builds
@@ -1250,6 +1279,23 @@ func (tl *TorLifecycle) requestNewCircuitResultWithDropGuards(inst *TorInstance,
 // instance's cached cookie provider, and closes. No SIGNAL is issued.
 // It returns the first failure; callers run it at startup to fail fast on
 // bad/stale control cookies instead of discovering them lazily on NEWNYM.
+// reverifyControlAuth probes one instance's control port without changing
+// state (no SIGNAL). True = auth passes now (cookie healed on disk).
+// Transport failures return false and leave the cache alone; definitive
+// rejections evict via noteAuthResult and return false. Never blocks
+// beyond the control deadline; safe from the health loop.
+func (tl *TorLifecycle) reverifyControlAuth(inst *TorInstance) bool {
+	controlAddr := fmt.Sprintf("127.0.0.1:%d", inst.ControlPort)
+	client := NewTorControlClient(controlAddr, "", tl.cachedCookie(inst))
+	client.Logf = tl.logf
+	if err := client.VerifyAuth(); err != nil {
+		tl.noteAuthResult(inst, err)
+		return false
+	}
+	tl.noteAuthResult(inst, nil)
+	return true
+}
+
 func (tl *TorLifecycle) VerifyControls() error {
 	instances := tl.GetInstances()
 	if len(instances) == 0 {

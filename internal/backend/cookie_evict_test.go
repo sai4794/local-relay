@@ -1,8 +1,12 @@
 package backend
 
 import (
+	"bufio"
+	"context"
 	"fmt"
+	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -96,5 +100,94 @@ func TestCookieEvict_TransportFailureKeepsCache(t *testing.T) {
 	}
 	if !inst.IsReady() {
 		t.Fatal("transport failure marked not-ready; only repeated auth rejections may do that")
+	}
+}
+
+// A not-ready instance whose SOCKS answers but whose control auth was
+// rejected must recover via CheckHealth re-verification once the cookie
+// heals on disk — not wedge out of selection forever. Pre-fix the not-ready
+// branch only recycled SOCKS-dead daemons, so a healthy-daemon/wrong-cookie
+// instance stayed not-ready permanently (total outage at MaxInstances=1).
+func TestCookieEvict_CheckHealthReverifiesAndReReadies(t *testing.T) {
+	lc := NewTorLifecycle(TorLifecycleConfig{
+		Binary: "true", DataDir: t.TempDir(),
+		BasePort: 0, ControlBase: 0, MaxInstances: 1, Logf: func(string, ...interface{}) {},
+	})
+	dir := t.TempDir()
+	// Fake SOCKS greeting server (healthy daemon surface).
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socksLn.Close()
+	go func() {
+		for {
+			c, err := socksLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(cc net.Conn) {
+				defer cc.Close()
+				_ = cc.SetDeadline(time.Now().Add(5 * time.Second))
+				buf := make([]byte, 3)
+				if _, err := io.ReadFull(cc, buf); err != nil {
+					return
+				}
+				_, _ = cc.Write([]byte{0x05, 0x00})
+			}(c)
+		}
+	}()
+	_, socksPortStr, _ := net.SplitHostPort(socksLn.Addr().String())
+	var socksPort int
+	fmt.Sscan(socksPortStr, &socksPort)
+
+	// Fake control port: reject first (stale cookie), accept after.
+	var reject atomic.Bool
+	reject.Store(true)
+	ctrlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlLn.Close()
+	go func() {
+		for {
+			c, err := ctrlLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(cc net.Conn) {
+				defer cc.Close()
+				_ = cc.SetDeadline(time.Now().Add(5 * time.Second))
+				r := bufio.NewReader(cc)
+				if _, err := r.ReadString('\n'); err != nil {
+					return
+				}
+				if reject.Load() {
+					_, _ = cc.Write([]byte("515 Authentication failed\r\n"))
+					return
+				}
+				_, _ = cc.Write([]byte("250 OK\r\n"))
+			}(c)
+		}
+	}()
+	_, ctrlPortStr, _ := net.SplitHostPort(ctrlLn.Addr().String())
+	var ctrlPort int
+	fmt.Sscan(ctrlPortStr, &ctrlPort)
+
+	inst := &TorInstance{ID: 1, SocksPort: socksPort, ControlPort: ctrlPort, Cmd: nil, DataDir: dir, Ready: true, StartedAt: time.Now().Add(-time.Hour)}
+	lc.instances = append(lc.instances, inst)
+
+	// Drive 3 rejections via VerifyControls (same noteAuthResult path as NEWNYM).
+	for i := 0; i < 3; i++ {
+		_ = lc.VerifyControls()
+	}
+	if inst.IsReady() {
+		t.Fatal("instance still ready after 3 auth rejections; want not-ready")
+	}
+	// Cookie heals: control now accepts. Next CheckHealth must re-ready.
+	reject.Store(false)
+	lc.CheckHealth(context.Background())
+	if !inst.IsReady() {
+		t.Fatal("instance not re-readied after cookie healed; CheckHealth must recover control-plane casualties")
 	}
 }

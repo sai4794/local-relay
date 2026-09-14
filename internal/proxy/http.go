@@ -1035,6 +1035,14 @@ func (p *HTTPProxy) isWaiverHost(host string) bool {
 // sockets for the listen port covers "localhost", "127.0.0.1", and "[::1]"
 // spellings without depending on resolver aliases. Unknown listen address
 // (never started, e.g. unit-constructed proxies) returns false.
+//
+// Loopback comparison is canonical, not spelling-based: both sides go
+// through security.CanonicalizeIP (same parser the SSRF layer blocks with),
+// so octal/hex/integer/short/trailing-dot spellings (0177.0.0.1,
+// 2130706433, 127.1, 0x7f.0.0.1, 127.0.0.1.) match their canonical form.
+// An unspecified target (0.0.0.0 or ::) dials this host's own stack, so it
+// counts as loopback on the target side too; portless targets still return
+// false (no port, no socket identity to compare).
 func (p *HTTPProxy) isSelfDial(target string) bool {
 	addr, _ := p.listenAddr.Load().(string)
 	if addr == "" {
@@ -1055,15 +1063,14 @@ func (p *HTTPProxy) isSelfDial(target string) bool {
 	if strings.EqualFold(tHost, lHost) {
 		return true
 	}
-	// Resolved-loopback match: "localhost" is normalized to loopback before
-	// comparing, so a listener on 127.0.0.1 and a target of localhost (same
-	// port) are detected as the same socket. An unspecified listen host
-	// (0.0.0.0 or ::, common in containers) accepts loopback traffic on
-	// that port, so it counts as loopback-equivalent on the listen side.
-	// Only block when BOTH sides resolve to loopback, so a non-loopback
-	// hostname bound by config can never collide with a loopback target on
-	// the same port number.
-	tLoop := isLoopbackHost(tHost)
+	// Canonical-loopback match: normalize both sides through the shared
+	// numeric parser. An unspecified listen host (0.0.0.0 or ::, common in
+	// containers) accepts loopback traffic on that port, so it counts as
+	// loopback-equivalent on the listen side; an unspecified TARGET dials
+	// the local stack, so it counts on the target side as well. Only block
+	// when BOTH sides resolve to loopback, so a non-loopback hostname bound
+	// by config can never collide with a loopback target on the same port.
+	tLoop := isLoopbackHost(tHost) || isUnspecifiedHost(tHost)
 	lLoop := isLoopbackHost(lHost) || isUnspecifiedHost(lHost)
 	return tLoop && lLoop
 }
@@ -1077,13 +1084,20 @@ func isUnspecifiedHost(h string) bool {
 }
 
 // isLoopbackHost reports whether h is a loopback address in any accepted
-// spelling: 127.0.0.0/8, ::1 (bracketed or bare), or "localhost"
-// (case-insensitive) treated as its conventional loopback alias.
+// spelling: 127.0.0.0/8, ::1 (bracketed or bare), "localhost"
+// (case-insensitive) treated as its conventional loopback alias, plus the
+// non-canonical numeric forms dialers interpret (octal/hex/integer/short/
+// trailing-dot) via the shared security.CanonicalizeIP parser — the same
+// parser the SSRF layer blocks with, so the guard cannot be spelling-split
+// from the firewall.
 func isLoopbackHost(h string) bool {
 	if strings.EqualFold(strings.TrimSuffix(h, "."), "localhost") {
 		return true
 	}
 	if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil {
+		return ip.IsLoopback()
+	}
+	if ip := security.CanonicalizeIP(h); ip != nil {
 		return ip.IsLoopback()
 	}
 	return false
