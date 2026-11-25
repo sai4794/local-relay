@@ -35,6 +35,20 @@ func NewRouter(direct Backend, backends ...Backend) *Router {
 	}
 }
 
+// normalizeBypassHost is the single canonicalizer for both config entries
+// and lookup/dial hosts: lowercase, one trailing dot and IPv6 brackets
+// removed. Keeping one function prevents the config and lookup paths from
+// disagreeing about "[::1]" (issue L-01).
+func normalizeBypassHost(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(host)
+	host = strings.TrimSuffix(host, ".")
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	return strings.TrimSuffix(host, ".")
+}
+
 func (r *Router) SetBypassHosts(hosts []string) {
 	r.bypassMu.Lock()
 	// Canonicalize entries the same way every lookup normalizes (lowercase,
@@ -44,7 +58,7 @@ func (r *Router) SetBypassHosts(hosts []string) {
 	r.bypassHosts = make([]string, len(hosts))
 	r.bypassHostMap = make(map[string]bool, len(hosts)*2)
 	for i, h := range hosts {
-		h = strings.ToLower(strings.TrimSuffix(h, "."))
+		h = normalizeBypassHost(h)
 		r.bypassHosts[i] = h
 		r.bypassHostMap[h] = true
 		r.bypassHostMap["."+h] = true
@@ -61,9 +75,7 @@ func (r *Router) isBypassHost(host string) bool {
 	// (lowercase, IPv6 brackets stripped, one trailing dot stripped): without
 	// this, an FQDN "example.com." matches at dial time but misses here, so
 	// the proxy's bypass verdict and the router's would diverge.
-	host = strings.ToLower(host)
-	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
-	host = strings.TrimSuffix(host, ".")
+	host = normalizeBypassHost(host)
 	r.bypassMu.RLock()
 	defer r.bypassMu.RUnlock()
 	if r.bypassHostMap[host] {
@@ -105,7 +117,7 @@ func (r *Router) DialContext(ctx context.Context, network, addr string) (net.Con
 	if err != nil {
 		host = addr
 	}
-	host = strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(host, "]"), "["), "."))
+	host = normalizeBypassHost(host)
 
 	// Bypass hosts MUST go through direct backend — no fallback to Tor.
 	// The proxy layer attaches its verified single-Lookup resolution to ctx

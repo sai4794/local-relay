@@ -90,10 +90,28 @@ func getDefaultBlockedRanges() []*net.IPNet {
 	return ranges
 }
 
+// rateLimitKey canonicalizes a destination for the per-host token bucket.
+// Numeric IP spellings (decimal, hex, octal, short form) that denote the same
+// address must share one bucket; otherwise each spelling gets a fresh quota
+// and the per-host limit is trivially bypassed (issue M-08).
+func rateLimitKey(host string) string {
+	key := normalizeHostKey(host)
+	if looksNumericHost(key) {
+		if ip := parseNumericIP(key); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				ip = ip4
+			}
+			return ip.String()
+		}
+	}
+	return key
+}
+
 func (fw *Firewall) allowRateLimit(host string) bool {
 	if fw.rateLimit <= 0 {
 		return true
 	}
+	host = rateLimitKey(host)
 	fw.limiterMu.Lock()
 	defer fw.limiterMu.Unlock()
 
@@ -144,7 +162,7 @@ func (fw *Firewall) RateLimitExceeded(host string) bool {
 	}
 	fw.limiterMu.Lock()
 	defer fw.limiterMu.Unlock()
-	tb, exists := fw.limiters[normalizeHostKey(host)]
+	tb, exists := fw.limiters[rateLimitKey(host)]
 	if !exists {
 		return false
 	}

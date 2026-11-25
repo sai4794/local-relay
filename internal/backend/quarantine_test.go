@@ -439,11 +439,9 @@ func TestQuarantine_CheckHealthDefersToQuarantineHold(t *testing.T) {
 	}
 }
 
-// All-probation-claimed selection must NOT serve a second concurrent probe
-// through the least-bad fallback: with every candidate probation-claimed
-// (probe held elsewhere), selection returns nil (fail-closed) instead of
-// handing the sick endpoint a probe herd. Pre-fix pickBest tracked
-// probation-claimed as fallback fuel and served it.
+// Probation probes must be claimed one per served dial, and selection must
+// fail closed only when EVERY candidate's probe is genuinely held. Pre-fix
+// pickBest claimed probes on losing candidates, wedging them until expiry.
 func TestQuarantine_AllProbationClaimedFailsClosed(t *testing.T) {
 	var nym int64Chan
 	stop := make(chan struct{})
@@ -462,15 +460,38 @@ func TestQuarantine_AllProbationClaimedFailsClosed(t *testing.T) {
 		inst.quar.quarantinedUntil.Store(now.Add(-time.Second).UnixNano())
 	}
 	ready := []*TorInstance{m.getInstanceByID(1), m.getInstanceByID(2)}
-	// First selection claims probe on the winner...
+	// Selection claims the probe on the winner only. The loser must stay
+	// unclaimed: pinning both as "in flight" after ONE selection was the
+	// leak that suppressed the loser's only probe (issue H-02).
 	first, _ := m.selectInstance(ready)
 	if first == nil {
 		t.Fatal("first selection = nil; want one probe claim")
 	}
-	// ...second selection must fail closed, not serve the other claimed probe.
-	// Drive the raw pickBest path: both probation-claimed now.
+	claims := func() int {
+		n := 0
+		for _, inst := range ready {
+			if inst.quar.probeInFlight.Load() {
+				n++
+			}
+		}
+		return n
+	}
+	if n := claims(); n != 1 {
+		t.Fatalf("claims after first selection = %d, want 1 (winner only)", n)
+	}
+	// The other endpoint can be probed by the NEXT dial — sequentially, not
+	// as a second concurrent probe of the same sick endpoint.
+	second, _ := m.selectInstance(ready)
+	if second == nil || second.ID == first.ID {
+		t.Fatalf("second selection = %v; want the other instance", second)
+	}
+	if n := claims(); n != 2 {
+		t.Fatalf("claims after second selection = %d, want 2 (one per served probe)", n)
+	}
+	// With both probes genuinely held, a third dial fails closed rather
+	// than starting a probe herd.
 	if got, _ := m.selectInstance(ready); got != nil {
-		t.Fatalf("all-probation-claimed selection = %d; want nil (fail-closed, no herd)", got.ID)
+		t.Fatalf("third selection = %d; want nil (all probes held)", got.ID)
 	}
 }
 

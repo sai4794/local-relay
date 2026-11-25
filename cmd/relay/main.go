@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -44,6 +45,7 @@ func main() {
 	httpAddr := flag.String("http", "", "Override HTTP proxy address")
 	socks5Addr := flag.String("socks5", "", "Override SOCKS5 proxy address")
 	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error")
+	authOverride := flag.String("auth", "", "Override auth enabled (true|false); takes precedence over config and PROXY_AUTH_ENABLED")
 	flag.Parse()
 
 	if *showVersion {
@@ -52,12 +54,23 @@ func main() {
 		os.Exit(0)
 	}
 
-	cfg, err := config.Load(*configPath)
+	// Parse and apply env/file config without validating, apply the
+	// higher-precedence CLI overrides, then validate exactly once so a flag
+	// can repair an invalid lower-precedence value (issue M-01).
+	cfg, err := config.LoadUnvalidated(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 	applyFlagOverrides(cfg, httpAddr, socks5Addr, logLevel, verbose)
+	if *authOverride != "" {
+		enabled, err := strconv.ParseBool(*authOverride)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid -auth value %q: %v\n", *authOverride, err)
+			os.Exit(1)
+		}
+		cfg.Auth.Enabled = enabled
+	}
 	if err := config.Validate(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid config after CLI overrides: %v\n", err)
 		os.Exit(1)
@@ -86,8 +99,11 @@ func main() {
 		failExit(stack, 1)
 	}
 
+	// One auth instance is shared by the proxies, admin health and metrics
+	// ports so any future stateful auth cannot diverge (L-11).
+	authMw := authMiddlewareOrNil(cfg)
 	httpProxy, socks5Proxy := buildProxies(router, stack.usePool, cfg, logger,
-		authMiddlewareOrNil(cfg), firewall, rotator, ssrfBlocker)
+		authMw, firewall, rotator, ssrfBlocker)
 
 	if stack.multiTor != nil {
 		stack.multiTor.OnRotate = func() {
@@ -100,7 +116,6 @@ func main() {
 	// Bind/StartListener split, with SetVersion/SetAuth/SetMetricsEnabled
 	// wiring) plus probe-binds for HTTP/SOCKS5/metrics. Every failure path
 	// failExits (ShutdownAll Tor daemons, then os.Exit).
-	authMw := authMiddlewareOrNil(cfg)
 	healthSrv, healthLn, herr := bindHealthServer(cfg, stack, rotator, logger, authMw)
 	if herr != nil {
 		logger.Error("Health server bind failed", "addr", cfg.Health.Address, "error", herr)
@@ -140,8 +155,8 @@ func main() {
 
 	// Binds already succeeded so no fail-fast path remains past this point.
 	startServers(ctx, stop, cfg, logger, stack, httpProxy, socks5Proxy)
-	startHealthListener(healthSrv, healthLn, logger)
-	startMetricsServer(ctx, cfg, stack.torLifecycle, authMw, logger)
+	startHealthListener(healthSrv, healthLn, stop, logger)
+	startMetricsServer(ctx, stop, cfg, stack.torLifecycle, authMw, logger)
 
 	logger.Info("Local relay is ready")
 	if !router.IsHealthy() {
@@ -363,14 +378,13 @@ func setupSecurity(ctx context.Context, cfg *config.Config, logger *slog.Logger)
 	sharedResolver := security.NewResolver()
 	sharedResolver.StartCleanup(ctx, cleanupInterval)
 
-	var blocker *security.SSRFBlocker
-	if len(cfg.Security.BlockedNetworks) > 0 {
-		blocker = security.NewSSRFBlockerWithResolver(cfg.Security.BlockedNetworks, sharedResolver)
-		logger.Info("SSRF protection enabled", "blocked_networks", len(cfg.Security.BlockedNetworks))
-	}
-	if blocker != nil {
-		blocker.FailClosedDNS = cfg.Security.FailClosedDNS
-	}
+	// Always construct the blocker, even with an empty blocked_networks
+	// list: scheme gating and defense-in-depth must not disappear just
+	// because the operator supplied no CIDRs (issue M-03). The firewall
+	// independently keeps its own default blocked ranges.
+	blocker := security.NewSSRFBlockerWithResolver(cfg.Security.BlockedNetworks, sharedResolver)
+	blocker.FailClosedDNS = cfg.Security.FailClosedDNS
+	logger.Info("SSRF protection enabled", "blocked_networks", len(cfg.Security.BlockedNetworks))
 
 	fw := security.NewFirewallWithResolver(security.FirewallConfig{
 		RateLimit:     cfg.Security.RateLimit,
@@ -400,16 +414,46 @@ func failExit(stack *backendStack, code int) {
 	os.Exit(code)
 }
 
+// controlClass is the startup action for a control-port verification error.
+type controlClass int
+
+const (
+	controlFail    controlClass = iota // definitive bad credentials: fail fast
+	controlSkip                        // no control endpoint configured: skip
+	controlDegrade                     // Tor down/wedged: serve fail-closed
+)
+
+// classifyControlError uses typed sentinels from the backend package first;
+// message matching stays only as a fallback for third-party/older errors.
+func classifyControlError(err error) controlClass {
+	if err == nil {
+		return controlFail
+	}
+	msg := err.Error()
+	switch {
+	case errors.Is(err, backend.ErrControlNotConfigured) || strings.Contains(msg, "not configured"):
+		return controlSkip
+	case errors.Is(err, backend.ErrControlAuthRejected) || strings.Contains(msg, "auth rejected"):
+		return controlFail
+	case errors.Is(err, backend.ErrControlUnreachable),
+		errors.Is(err, backend.ErrControlAuthFailed),
+		isTimeoutErr(err),
+		strings.Contains(msg, "failed to connect"),
+		strings.Contains(msg, "auth failed"):
+		return controlDegrade
+	default:
+		return controlFail
+	}
+}
+
 // verifyControlAuthAtStartup fails fast when a configured control port rejects
 // our credentials: without working control auth every later NEWNYM silently
 // fails, so surfacing it before serving beats discovering it on first rotation.
 // It authenticates only (no SIGNAL, no state change) via the existing
-// VerifyControl/VerifyControls exported APIs. Fail-fast is reserved for a
-// definitive "auth rejected" reply; "not configured" (no control endpoint),
-// "failed to connect" (Tor down at startup), timeouts, and transport-level
-// "auth failed" (read errors under a wedged daemon) degrade fail-closed with
-// a warning — matching the existing buildBackendStack behavior — and the 30s
-// monitor recovers them.
+// VerifyControl/VerifyControls exported APIs. Classification uses typed
+// backend errors (see classifyControlError); only a definitive "auth rejected"
+// fails fast, while "not configured", "failed to connect", timeouts and
+// transport-level auth failures degrade fail-closed with a warning.
 // Direct-only stacks verify nothing.
 func verifyControlAuthAtStartup(stack *backendStack, logger *slog.Logger) error {
 	if stack == nil {
@@ -417,28 +461,23 @@ func verifyControlAuthAtStartup(stack *backendStack, logger *slog.Logger) error 
 	}
 	verify := func(name string, fn func() error) error {
 		if err := fn(); err != nil {
-			msg := err.Error()
-			switch {
-			case strings.Contains(msg, "not configured"):
+			switch classifyControlError(err) {
+			case controlSkip:
 				// No control endpoint (unconfigured backend or zero
 				// instances): a bootstrap outcome, not an auth failure —
 				// startup already logged it and degrades.
 				logger.Warn("Skipping control-auth verification: no control endpoint", "backend", name, "error", err)
 				return nil
-			case strings.Contains(msg, "auth rejected"):
+			case controlFail:
 				// Definitive bad credentials — the only fail-fast case.
 				return err
-			case strings.Contains(msg, "failed to connect"),
-				strings.Contains(msg, "auth failed"),
-				isTimeoutErr(err):
+			case controlDegrade:
 				// Tor down or wedged at startup: keep serving degraded
 				// (fail-closed) and let the 30s monitor recover it
 				// without a restart.
 				logger.Warn("Control port unreachable at startup — serving degraded until Tor recovers (fail-closed)",
 					"backend", name, "error", err)
 				return nil
-			default:
-				return err
 			}
 		}
 		logger.Info("Control-port auth verified", "backend", name)
@@ -621,6 +660,10 @@ func startServerGoroutine(name string, logger *slog.Logger, stop context.CancelF
 		defer func() {
 			if r := recover(); r != nil {
 				logger.Error("Panic in "+name, "error", r)
+				// A recovered panic leaves the listener dead while the PID
+				// and the "ready" log survive, so systemd's Restart=always
+				// never fires. Cancel the process context (issue H-01).
+				stop()
 			}
 		}()
 		if err := serve(); err != nil {
@@ -787,11 +830,11 @@ func bindHealthServer(
 
 // startHealthListener serves a pre-bound admin listener in the background with
 // panic containment. Nil-safe: disabled health leaves nil server/listener.
-func startHealthListener(healthSrv *health.HealthServer, healthLn net.Listener, logger *slog.Logger) {
+func startHealthListener(healthSrv *health.HealthServer, healthLn net.Listener, stop context.CancelFunc, logger *slog.Logger) {
 	if healthSrv == nil || healthLn == nil {
 		return
 	}
-	go runComponent("health server", logger, func() error { return healthSrv.StartListener(healthLn) })
+	go runComponent("health server", logger, stop, func() error { return healthSrv.StartListener(healthLn) })
 }
 
 // metricsServer owns the standalone Prometheus listener so shutdown can
@@ -803,7 +846,7 @@ var metricsSrv *http.Server
 // ready log; here a late bind race only logs (metrics must never take down
 // serving traffic). Timeouts mirror the admin health server (5s read/write,
 // 60s idle); shutdown is graceful via Stop with the same 5s budget.
-func startMetricsServer(ctx context.Context, cfg *config.Config, torLifecycle *backend.TorLifecycle, authMw *auth.APIKeyAuth, logger *slog.Logger) {
+func startMetricsServer(ctx context.Context, stop context.CancelFunc, cfg *config.Config, torLifecycle *backend.TorLifecycle, authMw *auth.APIKeyAuth, logger *slog.Logger) {
 	if !cfg.Metrics.Enabled {
 		return
 	}
@@ -844,6 +887,7 @@ func startMetricsServer(ctx context.Context, cfg *config.Config, torLifecycle *b
 		defer func() {
 			if r := recover(); r != nil {
 				logger.Error("Panic in metrics server", "error", r)
+				stop()
 			}
 		}()
 
@@ -874,23 +918,45 @@ func stopMetricsServer() {
 }
 
 // runComponent runs a blocking component, containing panics so one bad
-// handler cannot take down the process.
-func runComponent(name string, logger *slog.Logger, serve func() error) {
+// handler cannot take down the process without the supervisor noticing.
+func runComponent(name string, logger *slog.Logger, stop context.CancelFunc, serve func() error) {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Panic in "+name, "error", r)
+			stop() // issue H-01: a dead component must stop the process
 		}
 	}()
 	if err := serve(); err != nil {
 		logger.Error(name+" failed", "error", err)
+		stop()
+	}
+}
+
+// waitForRotator drains in-flight rotations, but never past timeout: a stuck
+// callback must not block SIGTERM until SIGKILL and skip Tor/proxy cleanup
+// (issue M-13). Reports whether all callbacks finished in time.
+func waitForRotator(rotator *rotate.Rotator, timeout time.Duration) bool {
+	if rotator == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		rotator.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }
 
 // shutdown drains proxies and Tor daemons in dependency order.
 func shutdown(logger *slog.Logger, rotator *rotate.Rotator, socks5Proxy *proxy.SOCKS5Proxy, httpProxy *proxy.HTTPProxy, torLifecycle *backend.TorLifecycle) {
 	logger.Info("Shutting down...")
-	if rotator != nil {
-		rotator.Wait()
+	if !waitForRotator(rotator, 10*time.Second) {
+		logger.Warn("Timed out waiting for in-flight rotation; proceeding with shutdown")
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -52,12 +52,12 @@ func (a *APIKeyAuth) MatchesQueryKey(value string) bool {
 
 // StripProxyQueryKey removes only the query parameter values that carry the
 // proxy's own key (per MatchesProxyKey), preserving non-matching values and
-// all other parameters. q is the parsed query of the request URL about to be
-// forwarded; the caller re-encodes it via q.Encode().
-func (a *APIKeyAuth) StripProxyQueryKey(q url.Values) {
+// all other parameters. It reports whether anything was removed so the
+// caller can avoid re-encoding an otherwise untouched raw query (L-05).
+func (a *APIKeyAuth) StripProxyQueryKey(q url.Values) bool {
 	vals, ok := q[a.queryParam]
 	if !ok {
-		return
+		return false
 	}
 	kept := vals[:0]
 	stripped := false
@@ -69,13 +69,14 @@ func (a *APIKeyAuth) StripProxyQueryKey(q url.Values) {
 		kept = append(kept, v)
 	}
 	if !stripped {
-		return
+		return false
 	}
 	if len(kept) == 0 {
 		q.Del(a.queryParam)
-		return
+		return true
 	}
 	q[a.queryParam] = kept
+	return true
 }
 
 // MatchesAnyProxyKey reports whether any of the given Authorization header

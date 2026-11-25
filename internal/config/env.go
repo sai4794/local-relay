@@ -1,12 +1,31 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 )
 
-func applyEnvOverrides(cfg *Config) {
+// parseEnv applies a parsed environment override. Empty values mean "unset"
+// and leave the file/default value alone. A non-empty but unparseable value
+// is an error: silently keeping a default hid operator typos (issue M-12).
+func parseEnv[T any](name string, parse func(string) (T, error), apply func(T)) error {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+	parsed, err := parse(strings.TrimSpace(v))
+	if err != nil {
+		return fmt.Errorf("invalid %s=%q: %w", name, v, err)
+	}
+	apply(parsed)
+	return nil
+}
+
+// applyEnvOverrides applies all supported environment variables over the
+// file/default config. Unsupported values fail fast with the variable name.
+func applyEnvOverrides(cfg *Config) error {
 	if v := os.Getenv("PROXY_HTTP"); v != "" {
 		cfg.Server.HTTP = v
 	}
@@ -18,7 +37,16 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("PROXY_AUTH_KEY"); v != "" {
 		cfg.Auth.APIKey = v
-		cfg.Auth.Enabled = true
+		// Legacy behavior: supplying a key enables auth unless the
+		// explicit toggle is present (issue M-02).
+		if os.Getenv("PROXY_AUTH_ENABLED") == "" {
+			cfg.Auth.Enabled = true
+		}
+	}
+	if err := parseEnv("PROXY_AUTH_ENABLED", strconv.ParseBool, func(b bool) {
+		cfg.Auth.Enabled = b
+	}); err != nil {
+		return err
 	}
 	if v := os.Getenv("PROXY_LOG_LEVEL"); v != "" {
 		cfg.Logging.Level = v
@@ -32,58 +60,53 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("TOR_LIBRARY_PATH"); v != "" {
 		cfg.MultiTor.LibraryPath = v
 	}
-	// Pool tuning overrides (lenient-parse: unparseable values keep file/defaults).
-	if v := os.Getenv("POOL_ENABLED"); v != "" {
-		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
-			cfg.Pool.Enabled = b
+
+	for _, override := range []func() error{
+		func() error {
+			return parseEnv("POOL_ENABLED", strconv.ParseBool, func(b bool) { cfg.Pool.Enabled = b })
+		},
+		func() error {
+			return parseEnv("POOL_EWMA_ALPHA", func(s string) (float64, error) { return strconv.ParseFloat(s, 64) },
+				func(f float64) { cfg.Pool.EWMAAlpha = f })
+		},
+		func() error {
+			return parseEnv("POOL_LATENCY_REF_MS", func(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) },
+				func(n int64) { cfg.Pool.LatencyRefMs = n })
+		},
+		func() error {
+			return parseEnv("POOL_MIN_SAMPLES", func(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) },
+				func(n int64) { cfg.Pool.MinSamples = n })
+		},
+		func() error {
+			return parseEnv("POOL_MIN_QUALITY", func(s string) (float64, error) { return strconv.ParseFloat(s, 64) },
+				func(f float64) { cfg.Pool.MinQuality = f })
+		},
+		func() error {
+			return parseEnv("POOL_SELECTION", func(s string) (string, error) { return s, nil },
+				func(s string) { cfg.Pool.Selection = s })
+		},
+		func() error {
+			return parseEnv("POOL_PO2_SAMPLES", strconv.Atoi, func(n int) { cfg.Pool.Po2Samples = n })
+		},
+		func() error {
+			return parseEnv("POOL_QUARANTINE_AFTER_FAILS", strconv.Atoi,
+				func(n int) { cfg.Pool.QuarantineAfterFails = n })
+		},
+		func() error {
+			return parseEnv("POOL_QUARANTINE_SECS", func(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) },
+				func(n int64) { cfg.Pool.QuarantineSecs = n })
+		},
+		func() error {
+			return parseEnv("POOL_MAX_QUARANTINE_SECS", func(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) },
+				func(n int64) { cfg.Pool.MaxQuarantineSecs = n })
+		},
+		func() error {
+			return parseEnv("POOL_PROBATION_PROBES", strconv.Atoi, func(n int) { cfg.Pool.ProbationProbes = n })
+		},
+	} {
+		if err := override(); err != nil {
+			return err
 		}
 	}
-	if v := os.Getenv("POOL_EWMA_ALPHA"); v != "" {
-		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
-			cfg.Pool.EWMAAlpha = f
-		}
-	}
-	if v := os.Getenv("POOL_LATENCY_REF_MS"); v != "" {
-		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
-			cfg.Pool.LatencyRefMs = n
-		}
-	}
-	if v := os.Getenv("POOL_MIN_SAMPLES"); v != "" {
-		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
-			cfg.Pool.MinSamples = n
-		}
-	}
-	if v := os.Getenv("POOL_MIN_QUALITY"); v != "" {
-		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
-			cfg.Pool.MinQuality = f
-		}
-	}
-	if v := os.Getenv("POOL_SELECTION"); v != "" {
-		cfg.Pool.Selection = strings.TrimSpace(v)
-	}
-	if v := os.Getenv("POOL_PO2_SAMPLES"); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-			cfg.Pool.Po2Samples = n
-		}
-	}
-	if v := os.Getenv("POOL_QUARANTINE_AFTER_FAILS"); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-			cfg.Pool.QuarantineAfterFails = n
-		}
-	}
-	if v := os.Getenv("POOL_QUARANTINE_SECS"); v != "" {
-		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
-			cfg.Pool.QuarantineSecs = n
-		}
-	}
-	if v := os.Getenv("POOL_MAX_QUARANTINE_SECS"); v != "" {
-		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
-			cfg.Pool.MaxQuarantineSecs = n
-		}
-	}
-	if v := os.Getenv("POOL_PROBATION_PROBES"); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-			cfg.Pool.ProbationProbes = n
-		}
-	}
+	return nil
 }

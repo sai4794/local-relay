@@ -117,7 +117,11 @@ type MetricsConfig struct {
 	Address string `yaml:"address"`
 }
 
-func Load(path string) (*Config, error) {
+// LoadUnvalidated parses defaults, the YAML file and environment overrides
+// without running Validate. Callers that apply higher-precedence overrides
+// (CLI flags) must call Validate once after all overrides are applied; this
+// lets a flag repair an invalid lower-precedence value (issue M-01).
+func LoadUnvalidated(path string) (*Config, error) {
 	cfg := &Config{}
 	if err := loadDefaults(cfg); err != nil {
 		return nil, fmt.Errorf("loading defaults: %w", err)
@@ -155,12 +159,22 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	applyEnvOverrides(cfg)
+	if err := applyEnvOverrides(cfg); err != nil {
+		return nil, fmt.Errorf("environment overrides: %w", err)
+	}
+	return cfg, nil
+}
 
+// Load parses and validates a config. Use LoadUnvalidated when applying
+// higher-precedence overrides (CLI flags) before the single validation pass.
+func Load(path string) (*Config, error) {
+	cfg, err := LoadUnvalidated(path)
+	if err != nil {
+		return nil, err
+	}
 	if err := Validate(cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
-
 	return cfg, nil
 }
 

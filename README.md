@@ -55,9 +55,16 @@ make build          # produces ./relay (the binary systemd runs)
 
 ### Run (production)
 ```bash
-sudo systemctl enable --now local-relay.service   # unit file in repo root
+# Unit files in the repo root are not discovered by systemctl by name.
+sudo install -m 644 local-relay.service /etc/systemd/system/local-relay.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now local-relay.service
 journalctl -u local-relay -f
 ```
+`tor-local.service` is only for an externally managed Tor instance (single-tor
+backend). Do not enable it alongside `multi_tor.enabled: true`: the relay
+already spawns and manages its own Tor daemons in that mode, and the two
+stacks compete for data directories and ports.
 
 ### Run (manual)
 ```bash

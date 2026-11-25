@@ -83,6 +83,8 @@ var (
 	errSocksUnsupportedATYP = errors.New("unsupported address type")
 	errSocksEmptyDomain     = errors.New("empty domain")
 	errSocksZeroPort        = errors.New("zero port")
+	errSocksBadRSV          = errors.New("non-zero RSV")
+	errSocksNoMethods       = errors.New("no acceptable auth methods")
 )
 
 func (p *SOCKS5Proxy) handleConn(conn net.Conn) {
@@ -134,6 +136,13 @@ func (p *SOCKS5Proxy) handshake(conn net.Conn) error {
 	}
 
 	nMethods := int(buf[1])
+	if nMethods == 0 {
+		// RFC1928: no methods offered means no acceptable method (L-04).
+		if _, err := conn.Write([]byte{0x05, 0xFF}); err != nil {
+			return err
+		}
+		return errSocksNoMethods
+	}
 	methods := make([]byte, nMethods)
 	if _, err := io.ReadFull(conn, methods); err != nil {
 		return err
@@ -203,6 +212,11 @@ func (p *SOCKS5Proxy) readRequest(conn net.Conn) (string, byte, error) {
 
 	if header[0] != 0x05 {
 		return "", 0, errSocksBadVersion
+	}
+	if header[2] != 0x00 {
+		// RFC1928 RSV must be 0; accepting garbage makes the request
+		// framing ambiguous (L-04).
+		return "", 0, errSocksBadRSV
 	}
 
 	cmd := header[1]

@@ -190,6 +190,14 @@ func (q *endpointQuarantine) claimProbe(now time.Time) bool {
 	return true
 }
 
+// releaseClaim frees a probe slot this caller holds. Used when candidate
+// evaluation claimed a probation probe but the candidate lost selection:
+// without this, losing candidates keep probeInFlight=true until stale
+// expiry and their only probe is suppressed (issue H-02).
+func (q *endpointQuarantine) releaseClaim() {
+	q.probeInFlight.CompareAndSwap(true, false)
+}
+
 // probeExpired reports whether the claimed probe slot outlived its budget
 // without an outcome (holder died mid-dial). The budget is deliberately
 // generous (2x the quarantine base, min 60s): dial-phase probes normally

@@ -66,7 +66,7 @@ func NewTorBackend(cfg TorConfig) *TorBackend {
 // distinguish "nothing to verify" from "auth OK".
 func (t *TorBackend) VerifyControl() error {
 	if t.control == nil || t.control.Addr == "" {
-		return fmt.Errorf("tor control port not configured")
+		return ErrControlNotConfigured
 	}
 	return t.control.VerifyAuth()
 }

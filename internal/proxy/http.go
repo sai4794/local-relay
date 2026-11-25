@@ -56,7 +56,7 @@ func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *s
 	// across Tor instances. Keep-alives would reuse the same connection,
 	// defeating IP rotation.
 	transport := &http.Transport{
-		DialContext:           router.DialContext,
+		DialContext:           wrapDialWithHopCapture(router.DialContext),
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   0,
 		IdleConnTimeout:       90 * time.Second,
@@ -84,18 +84,25 @@ func NewHTTPProxy(router *backend.Router, authMiddleware *auth.APIKeyAuth, fw *s
 }
 
 func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/health" || r.URL.Path == "/healthz" {
+	if p.auth != nil && !p.auth.Check(w, r) {
+		return
+	}
+
+	// Local health alias for origin-form requests only. Absolute-form
+	// requests (GET http://upstream/healthz) target a real upstream resource
+	// and must be forwarded, not intercepted (issue M-04).
+	if r.URL.Host == "" && r.URL.Scheme == "" && (r.URL.Path == "/health" || r.URL.Path == "/healthz") {
+		status, state := http.StatusOK, "ok"
+		if p.router != nil && !p.router.IsHealthy() {
+			status, state = http.StatusServiceUnavailable, "degraded"
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(status)
 		mode := "multi_tor"
 		if p.usePool {
 			mode = "circuit_pool"
 		}
-		fmt.Fprintf(w, `{"status":"ok","mode":"%s"}`, mode)
-		return
-	}
-
-	if p.auth != nil && !p.auth.Check(w, r) {
+		fmt.Fprintf(w, `{"status":"%s","mode":"%s"}`, state, mode)
 		return
 	}
 
@@ -533,8 +540,13 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// itself is clean.
 	if p.auth != nil {
 		if q := r.URL.Query(); len(q) > 0 {
-			p.auth.StripProxyQueryKey(q)
-			r.URL.RawQuery = q.Encode()
+			// Re-encode only when a matching proxy key was actually removed:
+			// Values.Encode() normalizes raw percent-encoding and parameter
+			// order, which can invalidate signature-over-raw-query upstreams
+			// (issue L-05).
+			if p.auth.StripProxyQueryKey(q) {
+				r.URL.RawQuery = q.Encode()
+			}
 		}
 	}
 	targetURL := r.URL.String()
@@ -596,14 +608,12 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		case r.Body == nil:
 			return nil, nil
 		case bodyOverCap:
-			// Replay buffered prefix, then live-stream the rest. Snapshot the
-			// prefix slice per attempt: the transport may retain the reader
-			// past the attempt boundary.
+			// Replay buffered prefix, then live-stream the rest. The
+			// already-consumed r.Body cannot be rewound, so GetBody must
+			// stay nil: the transport would otherwise replay a truncated
+			// body on a redirect (issue M-05).
 			head := append([]byte(nil), bodyHead...)
-			return io.MultiReader(bytes.NewReader(head), r.Body),
-				func() (io.ReadCloser, error) {
-					return io.NopCloser(io.MultiReader(bytes.NewReader(head), r.Body)), nil
-				}
+			return io.MultiReader(bytes.NewReader(head), r.Body), nil
 		default:
 			// Small bodies: a fresh reader per attempt (a consumed reader
 			// cannot rewind for retries).
@@ -616,6 +626,13 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var resp *http.Response
 	var lastErr error
+	// R-019: net/http erases the upstream Connection header from
+	// Response.Header when it carries "close", taking the token list with
+	// it. Capture the raw response head on the dialed conn so the original
+	// values can be restored before forwarding. One capture per client
+	// request; each attempt's dial installs a fresh head and the last one
+	// is the response the client actually receives.
+	capture := &responseHeadCapture{}
 	// Pin the verified bypass resolution: the transport dials through
 	// router.DialContext with the request context, so attaching the pin here
 	// makes bypass-routed dials use the check-time IPs instead of fresh DNS.
@@ -626,7 +643,7 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// dial fills a fresh claim. Legacy ReportAnomaly rotation below is
 	// unchanged in this slice.
 	var claim backend.EndpointClaim
-	baseCtx := r.Context()
+	baseCtx := context.WithValue(r.Context(), hopCaptureKey{}, capture)
 	if p.router != nil && p.router.IsBypassHost(r.URL.Hostname()) {
 		baseCtx = backend.WithPinnedDial(baseCtx, r.URL.Host, sharedIPs)
 	}
@@ -650,12 +667,10 @@ retryLoop:
 			req.GetBody = getBody
 			req.ContentLength = r.ContentLength
 		} else if bodyOverCap {
-			// Over-cap single-shot streams must never carry a GetBody: a
-			// half-consumed r.Body cannot be rewound, so a redirect or retry
-			// replaying it would corrupt the body. Nil GetBody forces the
-			// transport to follow redirects with the documented
-			// GetBody-missing behavior instead.
+			// Over-cap single-shot streams carry no GetBody and unknown
+			// length; the transport must not claim a replayable length.
 			req.GetBody = nil
+			req.ContentLength = -1
 		}
 
 		resp, lastErr = p.client.Do(req)
@@ -751,6 +766,11 @@ retryLoop:
 	}
 	defer resp.Body.Close()
 
+	// Restore the exact Connection values seen on the wire if net/http
+	// dropped them; forwardResponse's existing token stripper then removes
+	// every header they name, and stripHopByHopHeaders removes Connection.
+	restoreConnectionHeader(resp, capture)
+
 	isSSE := stream.HasSSEContentType(resp.Header)
 
 	// Same probe-steal hazard as relayConn: an SSE token stream can outlive
@@ -779,7 +799,6 @@ retryLoop:
 //     reach the client immediately instead of being buffered by net/http.
 //   - Everything else is copied through with a pooled buffer.
 func (p *HTTPProxy) forwardResponse(w http.ResponseWriter, resp *http.Response, isSSE bool) {
-	stripConnectionTokens(w.Header(), resp.Header)
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -813,6 +832,135 @@ func (p *HTTPProxy) forwardResponse(w http.ResponseWriter, resp *http.Response, 
 		if err != nil {
 			return
 		}
+	}
+}
+
+// --- R-019: raw response-head capture -------------------------------------
+//
+// net/http's shouldClose() (readTransfer -> shouldClose, transfer.go) deletes
+// the Connection response header from Response.Header whenever it carries the
+// "close" token. That erases the token list that RFC 9110 §7.6.1 stripping
+// needs, so a header named by the upstream Connection list would otherwise
+// be forwarded. Capture the first response head as it arrives on the dialed
+// connection and restore only those exact values into resp.Header.
+//
+// Keep-alives are disabled on this transport, so each successful request
+// gets its own connection and one response head. A fresh *rawResponseHead is
+// installed per dial; the last one wins for the response that is forwarded.
+
+type hopCaptureKey struct{}
+
+type responseHeadCapture struct {
+	mu     sync.Mutex
+	latest *rawResponseHead
+}
+
+type rawResponseHead struct {
+	mu     sync.Mutex
+	buf    []byte
+	values []string
+	done   bool
+}
+
+const maxCapturedResponseHead = 64 << 10
+
+// record accumulates until the head terminator is seen, then extracts the
+// Connection values. Plain HTTP heads start with "HTTP/"; TLS ciphertext is
+// rejected so binary bytes can never masquerade as token names.
+func (h *rawResponseHead) record(p []byte) {
+	if h == nil || len(p) == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.done || len(h.buf) >= maxCapturedResponseHead {
+		return
+	}
+	if len(h.buf) == 0 && p[0] != 'H' {
+		// Not plaintext HTTP (e.g. TLS handshake bytes). Nothing to capture.
+		h.done = true
+		return
+	}
+	h.buf = append(h.buf, p...)
+	end := bytes.Index(h.buf, []byte("\r\n\r\n"))
+	if end < 0 {
+		if i := bytes.Index(h.buf, []byte("\n\n")); i >= 0 {
+			end = i
+		}
+	}
+	if end < 0 {
+		return
+	}
+	h.done = true
+	for _, line := range strings.Split(string(h.buf[:end]), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		name, value, ok := strings.Cut(line, ":")
+		if ok && strings.EqualFold(strings.TrimSpace(name), "Connection") {
+			h.values = append(h.values, strings.TrimSpace(value))
+		}
+	}
+	h.buf = nil
+}
+
+func (c *responseHeadCapture) newHead() *rawResponseHead {
+	h := &rawResponseHead{}
+	c.mu.Lock()
+	c.latest = h
+	c.mu.Unlock()
+	return h
+}
+
+func (c *responseHeadCapture) connectionValues() []string {
+	c.mu.Lock()
+	h := c.latest
+	c.mu.Unlock()
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.values...)
+}
+
+// recordingResponseConn tees only server->client reads into the head capture;
+// writes (the outgoing request) are untouched.
+type recordingResponseConn struct {
+	net.Conn
+	head *rawResponseHead
+}
+
+func (c *recordingResponseConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.head.record(p[:n])
+	}
+	return n, err
+}
+
+func wrapDialWithHopCapture(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil || conn == nil {
+			return conn, err
+		}
+		if capture, ok := ctx.Value(hopCaptureKey{}).(*responseHeadCapture); ok {
+			return &recordingResponseConn{Conn: conn, head: capture.newHead()}, nil
+		}
+		return conn, nil
+	}
+}
+
+// restoreConnectionHeader re-inserts the wire-level Connection values only
+// when net/http removed them; already-present values are left alone.
+func restoreConnectionHeader(resp *http.Response, capture *responseHeadCapture) {
+	if resp == nil || resp.Header == nil || capture == nil {
+		return
+	}
+	if len(resp.Header.Values("Connection")) > 0 {
+		return
+	}
+	if values := capture.connectionValues(); len(values) > 0 {
+		resp.Header["Connection"] = values
 	}
 }
 

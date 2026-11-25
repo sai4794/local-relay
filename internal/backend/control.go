@@ -3,11 +3,21 @@ package backend
 import (
 	"bufio"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strings"
 	"time"
+)
+
+// Typed control errors let callers classify failures with errors.Is instead
+// of matching message text, which changes when wording is reworded (M-14).
+var (
+	ErrControlNotConfigured = errors.New("tor control port not configured")
+	ErrControlUnreachable   = errors.New("failed to connect to control port")
+	ErrControlAuthFailed    = errors.New("auth failed")
+	ErrControlAuthRejected  = errors.New("auth rejected")
 )
 
 // controlTimeout bounds every control-port operation (connect, auth,
@@ -46,12 +56,12 @@ func NewTorControlClient(addr, password string, cookie func() ([]byte, bool)) *T
 // No SIGNAL or other command is issued.
 func (c *TorControlClient) VerifyAuth() error {
 	if c.Addr == "" {
-		return fmt.Errorf("tor control port not configured")
+		return ErrControlNotConfigured
 	}
 
 	conn, err := net.DialTimeout("tcp", c.Addr, controlTimeout)
 	if err != nil {
-		return fmt.Errorf("failed to connect to control port: %w", err)
+		return fmt.Errorf("%w: %w", ErrControlUnreachable, err)
 	}
 	defer conn.Close()
 	// Log-only on failure: the deadline is best-effort hardening so a wedged
@@ -72,12 +82,12 @@ func (c *TorControlClient) VerifyAuth() error {
 // failure is tolerated but surfaced to the caller's log via Logf when set.
 func (c *TorControlClient) SignalNEWNYM(dropGuards bool) error {
 	if c.Addr == "" {
-		return fmt.Errorf("tor control port not configured")
+		return ErrControlNotConfigured
 	}
 
 	conn, err := net.DialTimeout("tcp", c.Addr, controlTimeout)
 	if err != nil {
-		return fmt.Errorf("failed to connect to control port: %w", err)
+		return fmt.Errorf("%w: %w", ErrControlUnreachable, err)
 	}
 	defer conn.Close()
 	// Log-only on failure (see VerifyAuth): best-effort hardening, behavior-preserving.
@@ -122,10 +132,10 @@ func (c *TorControlClient) authenticate(conn net.Conn, reader *bufio.Reader) err
 
 	resp, err := reader.ReadString('\n')
 	if err != nil {
-		return fmt.Errorf("auth failed: %w", err)
+		return fmt.Errorf("%w: %w", ErrControlAuthFailed, err)
 	}
 	if !strings.HasPrefix(resp, "250") {
-		return fmt.Errorf("auth rejected: %s", strings.TrimSpace(resp))
+		return fmt.Errorf("%w: %s", ErrControlAuthRejected, strings.TrimSpace(resp))
 	}
 	return nil
 }

@@ -1,7 +1,9 @@
 [Unit]
-Description=Tor anonymity network
+Description=Tor anonymity network (externally managed; do NOT enable alongside multi_tor.enabled=true)
 Documentation=https://www.torproject.org/docs/
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple

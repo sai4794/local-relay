@@ -95,7 +95,7 @@ func TestPool_RejectsUnknownField(t *testing.T) {
 	}
 }
 
-// Env overrides apply leniently: parseable values win, garbage keeps file/defaults.
+// Env overrides apply parseable values; unparseable values are rejected by Load.
 func TestPool_EnvOverrides(t *testing.T) {
 	path := writePoolConfig(t, "server:\n  http: \"127.0.0.1:18081\"\n")
 	t.Setenv("POOL_ENABLED", "false")
@@ -149,14 +149,7 @@ func TestPool_EnvOverrides(t *testing.T) {
 
 	t.Setenv("POOL_EWMA_ALPHA", "garbage")
 	t.Setenv("POOL_QUARANTINE_SECS", "garbage")
-	cfg2, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load with garbage env: %v", err)
-	}
-	if cfg2.Pool.EWMAAlpha != 0.2 {
-		t.Errorf("garbage POOL_EWMA_ALPHA overrode default: %v", cfg2.Pool.EWMAAlpha)
-	}
-	if cfg2.Pool.QuarantineSecs != 60 {
-		t.Errorf("garbage POOL_QUARANTINE_SECS overrode default: %d", cfg2.Pool.QuarantineSecs)
+	if _, err := Load(path); err == nil {
+		t.Fatal("unparseable POOL_* env values were silently accepted")
 	}
 }

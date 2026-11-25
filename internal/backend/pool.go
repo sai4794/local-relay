@@ -321,6 +321,7 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 		if !slot.IsHealthy() {
 			continue
 		}
+		claimed := false
 		switch slot.quar.State() {
 		case StateActive:
 		case StateQuarantined:
@@ -341,7 +342,7 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 			// concurrent probe through the all-excluded fallback (probe
 			// herd) — mirroring multitor pickBest, which skips
 			// StateProbation for fallback. Skip WITHOUT fallback fuel.
-			if slot.quar.State() != StateProbation || !slot.quar.claimProbe(now) {
+			if slot.quar.State() != StateProbation {
 				if slot.quar.State() == StateQuarantined {
 					load := slot.inFlight.Load()
 					eff := EffectiveLoad(load, QualityScore(slot.DialSuccesses(), slot.DialFailures(), int64(slot.DialLatencyEWMA()), sp), sp.MinQuality)
@@ -352,20 +353,22 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 				}
 				continue
 			}
-		case StateProbation:
-			if slot.quar.releaseStaleProbe(now, p.quarConfigLive().Duration) {
-				if !slot.quar.claimProbe(now) {
-					continue
-				}
-			} else if !slot.quar.claimProbe(now) {
+			if !slot.quar.claimProbe(now) {
 				continue
 			}
+			claimed = true
+		case StateProbation:
+			slot.quar.releaseStaleProbe(now, p.quarConfigLive().Duration)
+			if !slot.quar.claimProbe(now) {
+				continue
+			}
+			claimed = true
 		default:
 			continue
 		}
 		load := slot.inFlight.Load()
 		eff := EffectiveLoad(load, QualityScore(slot.DialSuccesses(), slot.DialFailures(), int64(slot.DialLatencyEWMA()), sp), sp.MinQuality)
-		eligible = append(eligible, slotView{slot: slot, idx: idx, eff: eff, load: load})
+		eligible = append(eligible, slotView{slot: slot, idx: idx, eff: eff, load: load, claimed: claimed})
 	}
 	if len(eligible) == 0 {
 		// Every candidate excluded (e.g. all quarantined): serve the
@@ -380,6 +383,19 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 			return nil, fmt.Errorf("circuit pool exhausted: all slots unhealthy")
 		}
 	}
+
+	// Candidates that were evaluated and claimed a probation probe but are
+	// not the one actually served must release their claim immediately;
+	// otherwise a single dial wedges every losing slot's only probe
+	// (issue H-02, pool analogue).
+	servedIdx := -1
+	defer func() {
+		for _, sv := range eligible {
+			if sv.idx != servedIdx && sv.claimed {
+				sv.slot.quar.releaseClaim()
+			}
+		}
+	}()
 
 	// Order eligible by (eff, load, idx) — deterministic. Weighted rotates
 	// the order by the dial counter so cold-equal slots spread instead of
@@ -437,6 +453,7 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 		if conn, entryGen := p.getConn(idx, addr); conn != nil {
 			p.recordDialReuse(slot, idx)
 			slot.inFlight.Add(1)
+			servedIdx = idx
 			fillClaimSink(ctx, "pool", idx, entryGen, time.Since(dialStart))
 			return &pooledConnWrap{Conn: conn, pool: p, slot: slot, slotIdx: idx, addr: addr, gen: entryGen, endpointID: idx, endpointGen: entryGen, dialLatency: time.Since(dialStart)}, nil
 		}
@@ -460,6 +477,7 @@ func (p *CircuitPoolBackend) DialContext(ctx context.Context, network, addr stri
 
 		p.recordDialSuccess(slot, idx, time.Since(dialStart))
 		slot.inFlight.Add(1)
+		servedIdx = idx
 		gen := p.poolGen.Load()
 		fillClaimSink(ctx, "pool", idx, gen, time.Since(dialStart))
 		return &pooledConnWrap{Conn: conn, pool: p, slot: slot, slotIdx: idx, addr: addr, gen: gen, endpointID: idx, endpointGen: gen, dialLatency: time.Since(dialStart)}, nil
@@ -486,10 +504,11 @@ func (s *CircuitSlot) slotDialErrKey() string {
 
 // slotView is one slot's hoisted selection inputs for pool DialContext.
 type slotView struct {
-	slot *CircuitSlot
-	idx  int
-	eff  float64
-	load int64
+	slot    *CircuitSlot
+	idx     int
+	eff     float64
+	load    int64
+	claimed bool // this selection claimed the slot's probation probe
 }
 
 // sortSlotViews orders views by (eff, load, idx) — deterministic.
@@ -692,7 +711,7 @@ func (p *CircuitPoolBackend) dialTor(ctx context.Context, addr string, slotIdx i
 // A signal failure returns (false, err) — slots NOT reset.
 func (p *CircuitPoolBackend) rateLimitedNEWNYM() (rotated bool, err error) {
 	if p.controlAddr == "" {
-		return false, fmt.Errorf("tor control port not configured")
+		return false, ErrControlNotConfigured
 	}
 
 	p.nymMu.Lock()
@@ -796,8 +815,16 @@ func (p *CircuitPoolBackend) resetAll() {
 	for _, slot := range p.slots {
 		slot.Reset()
 	}
-	p.evictConns()
+	// Bump the generation and evict under ONE lock hold: a wrapper that
+	// checked its generation before this point can no longer re-insert a
+	// burned pre-rotation tunnel under the new generation (issue H-03).
+	p.connPoolMu.Lock()
 	p.poolGen.Add(1)
+	stale := p.takeConnsLocked()
+	p.connPoolMu.Unlock()
+	for _, pc := range stale {
+		pc.conn.Close()
+	}
 }
 
 // IsHealthy returns true if at least one slot is healthy.
@@ -816,7 +843,7 @@ func (p *CircuitPoolBackend) IsHealthy() bool {
 // distinguish "nothing to verify" from "auth OK".
 func (p *CircuitPoolBackend) VerifyControl() error {
 	if p.controlAddr == "" {
-		return fmt.Errorf("tor control port not configured")
+		return ErrControlNotConfigured
 	}
 	return p.control.VerifyAuth()
 }
@@ -1056,7 +1083,10 @@ func (w *pooledConnWrap) Close() error {
 	if w.errored.Load() || w.gen != w.pool.poolGen.Load() {
 		return w.Conn.Close()
 	}
-	w.pool.putConn(w.slotIdx, w.addr, w.Conn)
+	// Pass the checkout generation: putConnGen re-checks it under the pool
+	// lock so a resetAll bump between this check and insertion cannot stamp
+	// a burned circuit with the new generation (issue H-03).
+	w.pool.putConnGen(w.slotIdx, w.addr, w.Conn, w.gen)
 	return nil
 }
 
@@ -1142,7 +1172,18 @@ func (p *CircuitPoolBackend) getConn(slotIdx int, addr string) (net.Conn, int64)
 	return nil, 0
 }
 
+// putConn is the test/utility entry point: it stamps the entry with the
+// current generation. Production Close uses putConnGen with its checkout gen.
 func (p *CircuitPoolBackend) putConn(slotIdx int, addr string, conn net.Conn) {
+	p.putConnGen(slotIdx, addr, conn, p.poolGen.Load())
+}
+
+// putConnGen returns a checked-out tunnel to the idle pool only if its
+// checkout generation still matches the live generation under connPoolMu.
+// A resetAll that evicts and bumps concurrently therefore cannot stamp a
+// burned circuit with the fresh generation (issue H-03). All stale sockets
+// are closed after releasing the lock so a wedged peer cannot stall dials.
+func (p *CircuitPoolBackend) putConnGen(slotIdx int, addr string, conn net.Conn, gen int64) {
 	if conn == nil {
 		return
 	}
@@ -1156,35 +1197,36 @@ func (p *CircuitPoolBackend) putConn(slotIdx int, addr string, conn net.Conn) {
 	// pooled conns are detected by the caller on first write/read and are
 	// discarded there (see handleHTTP / handleConnect).
 
-	if len(p.connPool) >= p.maxIdle {
+	mismatch := gen != p.poolGen.Load()
+	var toClose []net.Conn
+	if !mismatch && len(p.connPool) >= p.maxIdle {
 		// Pool full — amortize the stale-connection scan onto the overflow
 		// path instead of paying it on every put. evictStaleLocked compacts
-		// in place WITHOUT releasing the mutex; closes happen AFTER the
+		// in place WITHOUT releasing the mutex; closes happen after the
 		// lock is released so a wedged peer cannot stall dials holding it.
-		stale := p.evictStaleLocked()
-		p.connPoolMu.Unlock()
-		for _, c := range stale {
-			c.Close()
-		}
-		p.connPoolMu.Lock()
+		toClose = append(toClose, p.evictStaleLocked()...)
 	}
-
-	if len(p.connPool) >= p.maxIdle {
+	if !mismatch && len(p.connPool) >= p.maxIdle {
 		old := p.connPool[0]
 		p.connPool[0] = nil
 		p.connPool = p.connPool[1:]
-		p.connPoolMu.Unlock()
-		old.conn.Close()
-		p.connPoolMu.Lock()
+		toClose = append(toClose, old.conn)
 	}
-
+	if mismatch {
+		p.connPoolMu.Unlock()
+		conn.Close()
+		return
+	}
 	p.connPool = append(p.connPool, &pooledConn{
 		conn:      conn,
 		key:       poolKey(slotIdx, addr),
 		createdAt: time.Now(),
-		gen:       p.poolGen.Load(),
+		gen:       gen,
 	})
 	p.connPoolMu.Unlock()
+	for _, stale := range toClose {
+		stale.Close()
+	}
 }
 
 // evictStaleLocked compacts idle-expired connections in place and returns
@@ -1213,6 +1255,15 @@ func (p *CircuitPoolBackend) evictStaleLocked() []net.Conn {
 
 func (p *CircuitPoolBackend) evictConns() {
 	p.connPoolMu.Lock()
+	conns := p.takeConnsLocked()
+	p.connPoolMu.Unlock()
+	p.closePooledConns(conns)
+}
+
+// takeConnsLocked removes every pooled tunnel from the live pool and returns
+// the removed entries. Caller holds connPoolMu; sockets are closed by the
+// caller after unlocking (never while holding the mutex).
+func (p *CircuitPoolBackend) takeConnsLocked() []*pooledConn {
 	// Copy-on-evict: hand the evictor its own slice and reset the live pool
 	// to a FRESH slice (not p.connPool[:0], which aliases the backing array).
 	// The alias let a concurrent putConn append overwrite entries the evictor
@@ -1224,7 +1275,10 @@ func (p *CircuitPoolBackend) evictConns() {
 		p.connPool[i] = nil
 	}
 	p.connPool = make([]*pooledConn, 0, p.maxIdle)
-	p.connPoolMu.Unlock()
+	return conns
+}
+
+func (p *CircuitPoolBackend) closePooledConns(conns []*pooledConn) {
 	for _, pc := range conns {
 		pc.conn.Close()
 	}

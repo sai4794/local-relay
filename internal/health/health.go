@@ -31,9 +31,9 @@ type HealthServer struct {
 	// shape — only the value.
 	version string
 	// auth, when non-nil, gates every admin handler with the proxy API key
-	// (same credential and 407 semantics as the proxy-port auth gate in
-	// HTTPProxy.ServeHTTP, which applies to all non-/health paths including
-	// the proxy-port /healthz alias). Nil means auth disabled: loopback
+	// the same credential and 407 semantics as the proxy-port auth gate in
+	// HTTPProxy.ServeHTTP, which applies to every proxy request including
+	// the origin-form proxy-port /health and /healthz aliases. Nil means auth
 	// scraping works unchanged, and successful-start behavior is identical
 	// (Bind still pre-binds the same address; only per-request auth changes,
 	// and only when the operator enabled auth).

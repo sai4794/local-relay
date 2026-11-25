@@ -93,10 +93,22 @@ func (c *SOCKS5Client) handshake(conn net.Conn, targetAddr, isoUser string) erro
 		return fmt.Errorf("target host %q exceeds maximum SOCKS5 domain length (255)", host)
 	}
 
-	req := make([]byte, 0, 4+1+len(host)+2)
-	req = append(req, 0x05, 0x01, 0x00, 0x03)
-	req = append(req, byte(len(host)))
-	req = append(req, host...)
+	// Encode the target address with its native ATYP. A literal IPv6 target
+	// sent as ATYP 0x03 (domain) is unresolvable by the SOCKS server (L-02).
+	req := make([]byte, 0, 4+net.IPv6len+2)
+	req = append(req, 0x05, 0x01, 0x00)
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			req = append(req, 0x01)
+			req = append(req, ip4...)
+		} else {
+			req = append(req, 0x04)
+			req = append(req, ip.To16()...)
+		}
+	} else {
+		req = append(req, 0x03, byte(len(host)))
+		req = append(req, host...)
+	}
 	req = append(req, byte(port>>8), byte(port&0xff))
 
 	if _, err := conn.Write(req); err != nil {

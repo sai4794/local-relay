@@ -282,10 +282,18 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 		markDead(inst, err)
 		releaseProbe(inst)
 		metrics.Default().IncKey(inst.dialErrKey(), 1)
-		// Try next instance with its isolation user
+		// Retry only candidates that are still eligible. The raw ready
+		// snapshot is filtered by liveness alone; without this gate a retry
+		// could dial a quarantined instance, hijack another dialer's probe,
+		// or credit a success that never passed a probe (issue H-04).
 		for i := 1; i < len(ready); i++ {
 			nextIdx := (idx + i) % len(ready)
-			inst = ready[nextIdx]
+			next := ready[nextIdx]
+			excluded, took := m.evalExcluded(next)
+			if excluded {
+				continue
+			}
+			inst = next
 			socksAddr = "127.0.0.1:" + strconv.Itoa(inst.GetSocksPort())
 			isoUser = "relay:" + strconv.Itoa(inst.ID) + ":" + strconv.FormatInt(inst.CircuitGen(), 10)
 			conn, err = m.socksClient.Connect(ctx, socksAddr, addr, isoUser)
@@ -295,7 +303,9 @@ func (m *MultiTorBackend) DialContext(ctx context.Context, network, addr string)
 			m.logf("multi-tor: dial instance %d failed: %v", inst.ID, err)
 			inst.RecordDialOutcome(false, 0, dialScoreAlpha)
 			markDead(inst, err)
-			releaseProbe(inst)
+			if took {
+				inst.quar.releaseClaim()
+			}
 			metrics.Default().IncKey(inst.dialErrKey(), 1)
 		}
 		if err != nil {
@@ -502,13 +512,26 @@ func (m *MultiTorBackend) pickBest(views []candidateView) (*TorInstance, int) {
 // candidate won. The Po2 path uses it to decide whether a complement scan
 // outside the sample may find a clean winner; nil winners (all probes held)
 // report false.
-func (m *MultiTorBackend) pickBestEx(views []candidateView) (*TorInstance, int, bool) {
+func (m *MultiTorBackend) pickBestEx(views []candidateView) (winner *TorInstance, winnerIdx int, excludedWinner bool) {
+	// Candidate evaluation claims probation probes; a candidate that loses
+	// selection must have its claim released immediately, otherwise the
+	// single probe slot stays wedged until stale expiry (issue H-02).
+	claimed := make([]bool, len(views))
+	defer func() {
+		for i := range claimed {
+			if claimed[i] && i != winnerIdx {
+				views[i].cand.quar.releaseClaim()
+			}
+		}
+	}()
 	var bestFresh, bestAny, excludedFresh, excludedAny *candidateView
 	anyExcludedFresh := false
 	for i := range views {
 		v := &views[i]
 		fresh := time.Since(v.rot) > 5*time.Second
-		if m.isExcluded(v.cand) {
+		excluded, took := m.evalExcluded(v.cand)
+		claimed[i] = took
+		if excluded {
 			// Track the least-bad excluded candidate per freshness class
 			// so an all-quarantined pool still serves instead of failing.
 			// Probation-claimed (probe already held by another dialer) is
@@ -664,7 +687,7 @@ func (m *MultiTorBackend) eligibleNoClaim(cand *TorInstance) bool {
 	}
 }
 
-// isExcluded reports whether quarantine currently excludes cand from
+// evalExcluded reports whether quarantine currently excludes cand from
 // selection. Quarantined endpoints are skipped until their hold expires
 // (lazy promotion to probation happens here, on the selection path);
 // probation admits ONLY the dialer that CAS-claims the single probe slot
@@ -675,29 +698,34 @@ func (m *MultiTorBackend) eligibleNoClaim(cand *TorInstance) bool {
 // Draining/closed never serve. Promotion here only moves
 // Quarantined->Probation; Probation->Active / Probation->Quarantined
 // resolve on the outcome path, where success/failure is known.
-func (m *MultiTorBackend) isExcluded(cand *TorInstance) bool {
+// The claimed return identifies probes THIS call owns so losers can be
+// released by pickBestEx (issue H-02).
+// evalExcluded reports whether quarantine excludes cand from selection and,
+// when it transitioned a probation candidate from unclaimed to claimed by
+// THIS call, returns claimed=true so the caller can either serve the probe
+// or release it if the candidate loses selection. Reporting ownership is
+// what prevents losing candidates from leaking probe claims (issue H-02).
+func (m *MultiTorBackend) evalExcluded(cand *TorInstance) (excluded, claimed bool) {
 	now := time.Now()
 	switch cand.quar.State() {
 	case StateActive:
-		return false
+		return false, false
 	case StateQuarantined:
 		if now.UnixNano() < cand.quar.quarantinedUntil.Load() {
-			return true
+			return true, false
 		}
 		cand.quar.pollPromotion(now)
-		// Fall through: freshly promoted to Probation — claim below.
 		if cand.quar.State() != StateProbation {
-			return true
+			return true, false
 		}
-		return !cand.quar.claimProbe(now)
+		claimed = cand.quar.claimProbe(now)
+		return !claimed, claimed
 	case StateProbation:
-		cfg := m.quarConfig()
-		if cand.quar.releaseStaleProbe(now, cfg.Duration) {
-			return !cand.quar.claimProbe(now)
-		}
-		return !cand.quar.claimProbe(now)
+		cand.quar.releaseStaleProbe(now, m.quarConfig().Duration)
+		claimed = cand.quar.claimProbe(now)
+		return !claimed, claimed
 	default:
-		return true
+		return true, false
 	}
 }
 

@@ -91,23 +91,8 @@ func (i *TorInstance) IsReady() bool {
 	if !ready {
 		return false
 	}
-	if proc != nil && proc.Pid > 0 {
-		if err := proc.Signal(syscall.Signal(0)); err != nil {
-			return false
-		}
-		var ws syscall.WaitStatus
-		pid, err := syscall.Wait4(proc.Pid, &ws, syscall.WNOHANG, nil)
-		if err != nil {
-			if err == syscall.ECHILD {
-				// Already reaped (e.g. a prior IsReady reaped it, or
-				// killInstance waited): no live process backs this instance.
-				return false
-			}
-			// Any other Wait4 error leaves the kill(0) verdict intact.
-		} else if pid == proc.Pid {
-			// Child exited (now reaped): zombie means not-ready.
-			return false
-		}
+	if !processStillAlive(proc, i.Cmd) {
+		return false
 	}
 	return true
 }
@@ -175,19 +160,8 @@ func (i *TorInstance) probeLiveness() bool {
 	if !ready {
 		return false
 	}
-	if proc != nil && proc.Pid > 0 {
-		if err := proc.Signal(syscall.Signal(0)); err != nil {
-			return false
-		}
-		var ws syscall.WaitStatus
-		pid, err := syscall.Wait4(proc.Pid, &ws, syscall.WNOHANG, nil)
-		if err != nil {
-			if err == syscall.ECHILD {
-				return false
-			}
-		} else if pid == proc.Pid {
-			return false
-		}
+	if !processStillAlive(proc, i.Cmd) {
+		return false
 	}
 	return true
 }
@@ -634,6 +608,13 @@ func (tl *TorLifecycle) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// We still own the daemons spawned in this cycle: leaving them
+			// alive orphans children and can collide with a later Start's
+			// ports (issue M-07). A superseded generation is already owned
+			// by the newer cycle, so never kill its instances here.
+			if tl.generation.Load() == bootstrapGen {
+				tl.ShutdownAll()
+			}
 			return ctx.Err()
 		case <-deadline:
 			tl.mu.RLock()
@@ -642,6 +623,9 @@ func (tl *TorLifecycle) Start(ctx context.Context) error {
 			tl.mu.RUnlock()
 			if ready == 0 {
 				tl.logf("Tor bootstrap timeout with zero ready instances — failing startup")
+				if tl.generation.Load() == bootstrapGen {
+					tl.ShutdownAll()
+				}
 				return fmt.Errorf("tor bootstrap timeout: zero of %d instances ready after 60s", total)
 			}
 			tl.logf("Tor bootstrap timeout reached — proceeding with currently ready instances")
@@ -770,19 +754,27 @@ func (tl *TorLifecycle) evictCookie(instID int) {
 // cooldown skip. Only auth-rejected warrants cookie eviction: anything else
 // says nothing about the cached cookie's validity.
 func isAuthRejected(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "auth rejected")
+	return err != nil && (errors.Is(err, ErrControlAuthRejected) || strings.Contains(err.Error(), "auth rejected"))
 }
 
 // noteAuthResult tracks consecutive control-auth rejections per instance.
 // On auth-rejected it evicts the cookie and bumps the counter; at threshold
 // it marks the instance not-ready so CheckHealth recycles it instead of
-// failing rotations forever. Any non-rejected result resets the counter.
+// failing rotations forever. A successful result resets the counter;
+// transient errors leave it untouched (issue M-06).
 // Safe for concurrent use; never blocks on I/O.
 func (tl *TorLifecycle) noteAuthResult(inst *TorInstance, err error) {
-	if !isAuthRejected(err) {
+	// Only a definitive rejection advances the streak. A successful auth
+	// clears it; a timeout/refusal/cooldown skip leaves it untouched —
+	// resetting on a transient error defeated the 3-consecutive-reject
+	// recycle rule (issue M-06).
+	if err == nil {
 		tl.authFailMu.Lock()
 		delete(tl.authFailObs, inst.ID)
 		tl.authFailMu.Unlock()
+		return
+	}
+	if !isAuthRejected(err) {
 		return
 	}
 	tl.evictCookie(inst.ID)
@@ -1299,7 +1291,7 @@ func (tl *TorLifecycle) reverifyControlAuth(inst *TorInstance) bool {
 func (tl *TorLifecycle) VerifyControls() error {
 	instances := tl.GetInstances()
 	if len(instances) == 0 {
-		return fmt.Errorf("tor control port not configured: no instances")
+		return ErrControlNotConfigured
 	}
 	for _, inst := range instances {
 		controlAddr := fmt.Sprintf("127.0.0.1:%d", inst.ControlPort)

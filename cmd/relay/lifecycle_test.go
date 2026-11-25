@@ -178,7 +178,7 @@ func TestMetricsServerTimeoutsAndShutdown(t *testing.T) {
 	_ = ln.Close()
 	cfg.Metrics.Address = addr
 
-	startMetricsServer(testCtx(t), cfg, nil, nil, logger)
+	startMetricsServer(testCtx(t), func() {}, cfg, nil, nil, logger)
 	deadline := time.Now().Add(3 * time.Second)
 	var srv *http.Server
 	for srv == nil && time.Now().Before(deadline) {
